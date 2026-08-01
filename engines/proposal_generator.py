@@ -621,6 +621,52 @@ _SBIR_PATTERNS = [
 ]
 
 
+def _visual_guidance(section_id: str) -> str:
+    """
+    Return section-specific instructions for embedding figure/Gantt markers.
+    These markers are rendered as styled placeholders in the exported DOCX/PDF.
+    """
+    sid = section_id.lower()
+    is_technical = any(kw in sid for kw in (
+        "technical_approach", "approach", "technical_merit",
+        "innovation", "research_plan", "methodology",
+    ))
+    is_schedule = any(kw in sid for kw in (
+        "schedule", "milestone", "timeline", "work_plan",
+        "project_management", "deliverable",
+    ))
+
+    if is_technical:
+        return """
+FIGURES — REQUIRED (the document export will render these as placeholder boxes):
+Place exactly two figure markers naturally within your text at the logical point
+where each visual would appear in a printed proposal:
+
+1. After your opening/overview paragraph insert:
+   [FIGURE 1: Process Flow Diagram — describe the end-to-end technical workflow]
+   Then write one sentence explaining what the diagram illustrates for the reviewer.
+
+2. Later, where a supporting image, schematic, or system diagram adds the most
+   value, insert:
+   [FIGURE 2: describe the type and subject of the diagram or image]
+   Then write one sentence describing what this figure shows.
+
+Do NOT use ** or ## around these markers — write them exactly as shown."""
+
+    if is_schedule:
+        return """
+GANTT CHART — REQUIRED (auto-generated from the phase descriptions you write):
+After your opening paragraph and before the first phase description, insert:
+   [GANTT: Project Schedule — [project name], [X]-Month Timeline]
+
+The system will automatically parse your phase text (e.g. "Phase Name (Months X-Y)")
+and render a colour-coded Gantt table. For this to work correctly, write every phase
+using the exact format:  Phase Name (Months X-Y)  — for example:
+  Construction and Infrastructure Development (Months 7-15)"""
+
+    return ""
+
+
 def _sanitize_sbir_content(content: str, grant_type: str, grant_label: str) -> str:
     """
     Post-process generated content to strip SBIR/STTR references for non-SBIR grants.
@@ -743,7 +789,8 @@ IMPORTANT:
 - Keep any [MISSING: ...] placeholders exactly as written if the required information was not provided above.
 - Write approximately {tw} words of rich, specific content.
 - Where you use facts about this grant program (regulations, eligibility rules, priorities), cite the source inline.
-"""
+
+{_visual_guidance(section_id)}"""
 
         try:
             response = await self.client.chat.completions.create(

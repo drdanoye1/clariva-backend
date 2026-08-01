@@ -163,14 +163,207 @@ def add_page_numbers(doc) -> None:
         _field_run(p, "NUMPAGES")
 
 
+def add_figure_placeholder(doc, caption: str, fig_num: int | str = 1) -> None:
+    """
+    Insert a styled figure placeholder box (dashed blue border, light blue fill)
+    followed by an italic caption.  Reviewers replace the box with the actual figure.
+    """
+    from docx.shared import Pt, RGBColor
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    # ── Placeholder box ──────────────────────────────────────────────────
+    box = doc.add_paragraph()
+    box.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _para_spacing(box, after=2, before=10)
+
+    pPr = box._p.get_or_add_pPr()
+    # Dashed blue border
+    pBdr = OxmlElement("w:pBdr")
+    for side in ("top", "left", "bottom", "right"):
+        bdr = OxmlElement(f"w:{side}")
+        bdr.set(qn("w:val"), "dashSmallGap")
+        bdr.set(qn("w:sz"), "12")
+        bdr.set(qn("w:space"), "4")
+        bdr.set(qn("w:color"), "2563EB")
+        pBdr.append(bdr)
+    pPr.append(pBdr)
+    # Light blue fill
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), "EFF6FF")
+    pPr.append(shd)
+
+    label = box.add_run(f"\n[ INSERT FIGURE {fig_num} HERE ]\n")
+    label.bold = True
+    label.font.size = Pt(10)
+    label.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
+
+    # ── Caption ──────────────────────────────────────────────────────────
+    cap = doc.add_paragraph()
+    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _para_spacing(cap, after=10, before=2)
+    cr = cap.add_run(f"Figure {fig_num}. {caption}")
+    cr.italic = True
+    cr.font.size = Pt(10)
+    _set_run_font(cr)
+
+
+def _set_run_font(run) -> None:
+    """Helper: force Times New Roman on a run's rFonts element."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    rPr = run._r.get_or_add_rPr()
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.insert(0, rFonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+        rFonts.set(qn(attr), FEDERAL_FONT)
+
+
+def add_gantt_table(doc, full_content: str, title: str = "Project Schedule") -> None:
+    """
+    Parse '(Months X-Y)' patterns from *full_content* and render a colour-coded
+    Gantt table.  Projects ≤ 12 months use individual month columns; longer
+    projects are grouped into quarters (Q1, Q2, …).
+
+    Falls back to a figure placeholder if no phase data is found.
+    """
+    import math
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    # ── Parse phases ─────────────────────────────────────────────────────
+    pattern = re.compile(
+        r'(?P<name>[A-Za-z][^\n(]{4,70}?)'
+        r'\s*\(\s*[Mm]onths?\s+(?P<s>\d+)\s*[-–—]\s*(?P<e>\d+)',
+    )
+    phases = []
+    seen = set()
+    for m in pattern.finditer(full_content):
+        name  = re.sub(r'\s+', ' ', m.group("name")).strip().rstrip(", ")
+        start = int(m.group("s"))
+        end   = int(m.group("e"))
+        key   = (name[:30], start, end)
+        if key not in seen:
+            seen.add(key)
+            phases.append((name, start, end))
+
+    if not phases:
+        add_figure_placeholder(doc, f"{title} — Gantt Chart (auto-generated from milestone text)", "G")
+        return
+
+    total = max(e for _, _, e in phases)
+    use_quarters = total > 12
+
+    if use_quarters:
+        n_cols = math.ceil(total / 3)
+        col_labels = [f"Q{i+1}" for i in range(n_cols)]
+        def is_active(ps, pe, ci):
+            qs = ci * 3 + 1; qe = ci * 3 + 3
+            return ps <= qe and pe >= qs
+    else:
+        n_cols = total
+        col_labels = [str(m) for m in range(1, n_cols + 1)]
+        def is_active(ps, pe, ci):
+            return ps <= ci + 1 <= pe
+
+    # ── Caption heading ───────────────────────────────────────────────────
+    cap = doc.add_paragraph()
+    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _para_spacing(cap, after=3, before=10)
+    cr = cap.add_run(f"Figure G. {title}")
+    cr.italic = True; cr.bold = True; cr.font.size = Pt(10)
+    _set_run_font(cr)
+
+    # ── Build table ───────────────────────────────────────────────────────
+    t = doc.add_table(rows=len(phases) + 1, cols=n_cols + 1)
+    t.style = "Table Grid"
+
+    # Column widths
+    usable_w = 6.5  # inches (1" margins each side)
+    name_w   = Inches(2.2)
+    col_w    = Inches((usable_w - 2.2) / n_cols)
+    for i, cell in enumerate(t.columns[0].cells):
+        cell.width = name_w
+    for ci in range(1, n_cols + 1):
+        for cell in t.columns[ci].cells:
+            cell.width = col_w
+
+    # Header row
+    hcells = t.rows[0].cells
+    hcells[0].text = "Phase / Task"
+    for ci, lbl in enumerate(col_labels):
+        hcells[ci + 1].text = lbl
+
+    for cell in hcells:
+        cp = cell.paragraphs[0]
+        cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _para_spacing(cp, after=1, before=1)
+        if cp.runs:
+            r = cp.runs[0]; r.bold = True; r.font.size = Pt(8)
+            _set_run_font(r)
+        # Dark header fill
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), "1F4E79")
+        tcPr.append(shd)
+        if cp.runs:
+            cp.runs[0].font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+
+    # Data rows
+    ACTIVE_FILL = "DBEAFE"   # blue-100
+    ALT_FILL    = "F0F9FF"   # lighter alt row
+
+    for ri, (name, ps, pe) in enumerate(phases):
+        row = t.rows[ri + 1]
+        # Phase name cell
+        nc = row.cells[0]
+        nc.text = name[:45]
+        np_ = nc.paragraphs[0]
+        _para_spacing(np_, after=1, before=1)
+        if np_.runs:
+            np_.runs[0].font.size = Pt(8)
+            _set_run_font(np_.runs[0])
+        # Row fill
+        row_fill = ALT_FILL if ri % 2 else "FFFFFF"
+
+        for ci in range(n_cols):
+            cell = row.cells[ci + 1]
+            tc   = cell._tc
+            tcPr = tc.get_or_add_tcPr()
+            shd  = OxmlElement("w:shd")
+            shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto")
+            active = is_active(ps, pe, ci)
+            shd.set(qn("w:fill"), ACTIVE_FILL if active else row_fill)
+            tcPr.append(shd)
+            if active:
+                cp = cell.paragraphs[0]
+                cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _para_spacing(cp, after=0, before=0)
+                r = cp.add_run("█")
+                r.font.size = Pt(7)
+                r.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
+
+    doc.add_paragraph()  # spacer after Gantt
+
+
 def render_content(doc, content: str) -> None:
     """
     Parse AI-generated text (may contain markdown) into *doc* using
     federal formatting.  Handles ## headings, A. section labels,
-    |table| rows, numbered items, **bold** inline.
+    |table| rows, numbered items, **bold** inline,
+    [FIGURE N: caption] placeholders, and [GANTT: title] Gantt charts.
     """
     lines = content.split("\n")
     tbl_buf: list = []   # list of list[str]
+    fig_counter = [0]    # mutable figure counter
 
     def flush_table():
         if not tbl_buf:
@@ -206,6 +399,26 @@ def render_content(doc, content: str) -> None:
             flush_table()
 
         if not s:
+            continue
+
+        # ── [FIGURE N: caption] ──────────────────────────────────────────
+        fig_m = re.match(r'^\[FIGURE\s*(\d*)\s*:\s*(.*?)\]$', s, re.IGNORECASE)
+        if fig_m:
+            fig_counter[0] += 1
+            add_figure_placeholder(doc, fig_m.group(2).strip(), fig_counter[0])
+            continue
+
+        # ── [GANTT: title] ───────────────────────────────────────────────
+        gantt_m = re.match(r'^\[GANTT:\s*(.*?)\]$', s, re.IGNORECASE)
+        if gantt_m:
+            add_gantt_table(doc, content, gantt_m.group(1).strip())
+            continue
+
+        # ── [IMAGE: caption] (alias for FIGURE) ─────────────────────────
+        img_m = re.match(r'^\[IMAGE\s*(\d*)\s*:\s*(.*?)\]$', s, re.IGNORECASE)
+        if img_m:
+            fig_counter[0] += 1
+            add_figure_placeholder(doc, img_m.group(2).strip(), fig_counter[0])
             continue
 
         md_h = re.match(r'^(#{1,3})\s+(.*)', s)
