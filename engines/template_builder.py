@@ -13,7 +13,7 @@ from models.schemas import Agency, FOASection, FOATemplate, Phase
 
 class FOATemplateBuilderEngine:
     """
-    The core differentiator of the AtiFixia platform.
+    The core differentiator of the Clariva platform.
     Transforms raw FOA parse output into a validated, ordered FOATemplate
     that drives all downstream engines.
     """

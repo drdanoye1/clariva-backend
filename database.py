@@ -1,5 +1,5 @@
 """
-AtiFixia SBIR Intelligence Platform — Database Setup
+Clariva Intelligent Grant Writing Platform — Database Setup
 Async SQLAlchemy engine + session factory.
 Primary: Neon PostgreSQL (asyncpg)
 Fallback: SQLite (local dev only)

@@ -1,5 +1,5 @@
 """
-AtiFixia SBIR Intelligence Platform — FastAPI Application
+Clariva Intelligent Grant Writing Platform — FastAPI Application
 Entry point: uvicorn main:app --reload
 """
 
@@ -62,7 +62,7 @@ async def _seed_superadmin() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting AtiFixia SBIR Intelligence Platform...")
+    logger.info("Starting Clariva Intelligent Grant Writing Platform...")
     await create_tables()
     logger.info("Database tables verified.")
     await _seed_superadmin()
@@ -71,7 +71,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AtiFixia SBIR Intelligence Platform",
+    title="Clariva Intelligent Grant Writing Platform",
     description="Governance-Driven AI Proposal Intelligence — Multi-Grant-Type Support",
     version="2.0.0",
     lifespan=lifespan,
@@ -109,14 +109,14 @@ async def health_check():
     return {
         "status": "ok",
         "version": "2.0.0",
-        "platform": "AtiFixia SBIR Intelligence Platform",
+        "platform": "Clariva Intelligent Grant Writing Platform",
     }
 
 
 @app.get("/", tags=["Root"])
 async def root():
     return {
-        "message": "AtiFixia SBIR Intelligence Platform API",
+        "message": "Clariva Intelligent Grant Writing Platform API",
         "docs": "/docs",
         "version": "2.0.0",
     }

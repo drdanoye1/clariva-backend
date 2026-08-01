@@ -210,7 +210,7 @@ async def parse_foa_url(
     # ── Fetch the URL ─────────────────────────────────────────────────────────
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (compatible; AtiFixia-GrantBot/1.0; "
+            "Mozilla/5.0 (compatible; Clariva-GrantBot/1.0; "
             "+https://ai-grant-generator.vercel.app)"
         ),
         "Accept": "text/html,application/xhtml+xml,application/pdf,text/plain,*/*",

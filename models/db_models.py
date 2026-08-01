@@ -1,5 +1,5 @@
 """
-AtiFixia SBIR Intelligence Platform — SQLAlchemy ORM Models
+Clariva Intelligent Grant Writing Platform — SQLAlchemy ORM Models
 """
 
 from __future__ import annotations

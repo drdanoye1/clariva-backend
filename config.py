@@ -1,5 +1,5 @@
 """
-AtiFixia SBIR Intelligence Platform — Configuration
+Clariva Intelligent Grant Writing Platform — Configuration
 Reads from environment variables / .env file.
 """
 
@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     SQUARE_PRODUCTION_ACCESS_TOKEN: str = ""
     SQUARE_SANDBOX_APPLICATION_ID: str = ""
     SQUARE_SANDBOX_ACCESS_TOKEN: str = ""
-    SQUARE_APP_NAME: str = "AtiFixia"
+    SQUARE_APP_NAME: str = "Clariva"
     # Optional: override the auto-detected Square location ID
     SQUARE_LOCATION_ID: str = ""
     # Webhook signature key (set in Square dashboard)

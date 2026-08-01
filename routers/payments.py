@@ -23,27 +23,27 @@ router = APIRouter()
 
 PLANS = {
     "builder": {
-        "name":        "AtiFixia Builder",
+        "name":        "Clariva Builder",
         "amount":      3900,
-        "description": "AtiFixia Builder Plan — 1,000 AI credits/month for grant proposal generation.",
+        "description": "Clariva Builder Plan — 1,000 AI credits/month for grant proposal generation.",
     },
     "innovator": {
-        "name":        "AtiFixia Innovator",
+        "name":        "Clariva Innovator",
         "amount":      12900,
-        "description": "AtiFixia Innovator Plan — 5,000 AI credits/month including SBIR Phase I & II.",
+        "description": "Clariva Innovator Plan — 5,000 AI credits/month including SBIR Phase I & II.",
     },
     "professional": {
-        "name":        "AtiFixia Professional",
+        "name":        "Clariva Professional",
         "amount":      24900,
-        "description": "AtiFixia Professional Plan — 10,000+ AI credits/month with priority support.",
+        "description": "Clariva Professional Plan — 10,000+ AI credits/month with priority support.",
     },
 }
 
 PAYGO_PACKS = {
-    "paygo_starter":      {"name": "100 Credits Pack",   "amount":  1000, "description": "AtiFixia — 100 pay-as-you-go AI credits."},
-    "paygo_builder":      {"name": "300 Credits Pack",   "amount":  2500, "description": "AtiFixia — 300 pay-as-you-go AI credits."},
-    "paygo_innovator":    {"name": "1,000 Credits Pack", "amount":  7500, "description": "AtiFixia — 1,000 pay-as-you-go AI credits."},
-    "paygo_professional": {"name": "2,500 Credits Pack", "amount": 15000, "description": "AtiFixia — 2,500 pay-as-you-go AI credits."},
+    "paygo_starter":      {"name": "100 Credits Pack",   "amount":  1000, "description": "Clariva — 100 pay-as-you-go AI credits."},
+    "paygo_builder":      {"name": "300 Credits Pack",   "amount":  2500, "description": "Clariva — 300 pay-as-you-go AI credits."},
+    "paygo_innovator":    {"name": "1,000 Credits Pack", "amount":  7500, "description": "Clariva — 1,000 pay-as-you-go AI credits."},
+    "paygo_professional": {"name": "2,500 Credits Pack", "amount": 15000, "description": "Clariva — 2,500 pay-as-you-go AI credits."},
 }
 
 ALL_PRODUCTS = {**PLANS, **PAYGO_PACKS}

@@ -1,5 +1,5 @@
 """
-AtiFixia SBIR Intelligence Platform — Pydantic Schemas
+Clariva Intelligent Grant Writing Platform — Pydantic Schemas
 """
 
 from __future__ import annotations
