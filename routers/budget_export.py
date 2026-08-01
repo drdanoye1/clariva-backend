@@ -279,28 +279,23 @@ async def export_budget_docx(
     months = rec.budget_months or 12
 
     from docx import Document
-    from docx.shared import Pt, Cm, RGBColor
+    from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.enum.table import WD_TABLE_ALIGNMENT
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
+    from utils.doc_utils import (
+        apply_federal_margins, add_federal_heading, add_page_numbers,
+        _make_run, _para_spacing, FEDERAL_FONT,
+    )
 
     doc = Document()
-
-    # Page margins
-    for sec in doc.sections:
-        sec.top_margin = Cm(2); sec.bottom_margin = Cm(2)
-        sec.left_margin = Cm(2.5); sec.right_margin = Cm(2.5)
+    apply_federal_margins(doc)
 
     def heading(text, level=1):
-        p = doc.add_heading(text, level=level)
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        return p
+        add_federal_heading(doc, text, level=level)
 
     def para(text, bold=False, italic=False):
         p = doc.add_paragraph()
-        run = p.add_run(text)
-        run.bold = bold; run.italic = italic
+        _para_spacing(p)
+        _make_run(p, text, bold=bold, italic=italic)
         return p
 
     def add_table(headers, rows_data):
@@ -310,15 +305,18 @@ async def export_budget_docx(
         hrow = t.rows[0]
         for i, h in enumerate(headers):
             c = hrow.cells[i]
-            c.text = h
-            c.paragraphs[0].runs[0].bold = True
-            c.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            c.text = ""
+            cp = c.paragraphs[0]
+            _make_run(cp, h, bold=True, pt=11)
+            cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
         for ri, rd in enumerate(rows_data, 1):
             for ci, val in enumerate(rd):
                 cell = t.rows[ri].cells[ci]
-                cell.text = str(val)
-                if ci > 1:
-                    cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                cell.text = ""
+                cp = cell.paragraphs[0]
+                _make_run(cp, str(val), pt=11)
+                if ci > 0:
+                    cp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         doc.add_paragraph()
         return t
 
@@ -395,6 +393,8 @@ async def export_budget_docx(
         ["L. TOTAL AMOUNT REQUESTED", _money(totals.get("total_requested", totals["total_cost"]))],
     ]
     add_table(["Category", "Amount"], summary_rows)
+
+    add_page_numbers(doc)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -574,48 +574,29 @@ async def export_justification_docx(
     await _get_proposal(proposal_id, current_user.id, db)
 
     from docx import Document
-    from docx.shared import Pt, Cm, RGBColor
+    from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from utils.doc_utils import (
+        apply_federal_margins, add_federal_heading, add_page_numbers,
+        render_content, _make_run, _para_spacing, H1_PT,
+    )
 
     doc = Document()
-    for sec in doc.sections:
-        sec.top_margin = Cm(2.5); sec.bottom_margin = Cm(2.5)
-        sec.left_margin = Cm(3); sec.right_margin = Cm(3)
+    apply_federal_margins(doc)
 
-    NAVY = RGBColor(0x1F, 0x4E, 0x79)
-    lines = body.text.split("\n")
+    # Cover heading
+    title_para = doc.add_paragraph()
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _para_spacing(title_para, after=4, before=0)
+    _make_run(title_para, body.title, bold=True, pt=H1_PT)
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            doc.add_paragraph()
-            continue
+    sub_para = doc.add_paragraph()
+    sub_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _para_spacing(sub_para, after=12)
+    _make_run(sub_para, "Budget Justification Narrative", pt=12)
 
-        # Section headers (A. through L. or "Executive Summary" etc.)
-        if re.match(r'^[A-L]\.\s', stripped) or stripped in ("Executive Summary", "Budget Summary") or re.match(r'^#{1,3}\s', stripped):
-            clean = re.sub(r'^#+\s', '', stripped)
-            h = doc.add_heading(clean, level=2)
-            for run in h.runs:
-                run.font.color.rgb = NAVY
-        # Numbered sub-items
-        elif re.match(r'^\d+\.\s', stripped):
-            p = doc.add_paragraph(style="List Number")
-            run = p.add_run(stripped[stripped.index(".")+2:])
-            run.bold = True
-        # Table rows (markdown)
-        elif stripped.startswith("|"):
-            cells = [c.strip() for c in stripped.split("|") if c.strip()]
-            if all(c.startswith("-") for c in cells):
-                continue  # separator row
-            t = doc.add_table(rows=1, cols=len(cells))
-            t.style = "Table Grid"
-            row_cells = t.rows[0].cells
-            for i, cell_text in enumerate(cells):
-                row_cells[i].text = cell_text
-                if i > 0:
-                    row_cells[i].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        else:
-            doc.add_paragraph(stripped)
+    render_content(doc, body.text)
+    add_page_numbers(doc)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -644,19 +625,26 @@ async def export_justification_pdf(
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
     from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT, TA_JUSTIFY
 
+    from utils.doc_utils import get_pdf_styles, pdf_page_number, strip_for_pdf
+
     buf = io.BytesIO()
     pdf_doc = SimpleDocTemplate(buf, pagesize=letter,
                                 leftMargin=inch, rightMargin=inch,
                                 topMargin=inch, bottomMargin=inch)
-    NAVY = colors.HexColor("#1F4E79")
-    LGRAY= colors.HexColor("#F0F4F8")
-
-    h1  = ParagraphStyle("h1",  fontSize=13, textColor=NAVY, fontName="Helvetica-Bold", spaceBefore=14, spaceAfter=4)
-    h2  = ParagraphStyle("h2",  fontSize=11, textColor=NAVY, fontName="Helvetica-Bold", spaceBefore=10, spaceAfter=3)
-    bod = ParagraphStyle("bod", fontSize=9.5, fontName="Helvetica", spaceAfter=5, leading=14, alignment=TA_JUSTIFY)
-    num = ParagraphStyle("num", fontSize=9.5, fontName="Helvetica-Bold", spaceAfter=4, leftIndent=12)
+    NAVY  = colors.HexColor("#1F4E79")
+    LGRAY = colors.HexColor("#F0F4F8")
+    S = get_pdf_styles()
+    num_style = ParagraphStyle("num_fed", fontName="Times-Roman", fontSize=12,
+                               spaceAfter=4, leftIndent=14)
 
     elements = []
+
+    # Title
+    elements.append(Paragraph(strip_for_pdf(body.title), S["title"]))
+    elements.append(Paragraph("Budget Justification Narrative", S["small"]))
+    elements.append(Spacer(1, 0.15 * inch))
+    elements.append(HRFlowable(width="100%", thickness=1, color=NAVY))
+    elements.append(Spacer(1, 0.1 * inch))
 
     lines = body.text.split("\n")
     i = 0
@@ -669,7 +657,6 @@ async def export_justification_pdf(
             i += 1
             continue
 
-        # Flush table buffer when we hit non-table line
         if table_buffer and not line.startswith("|"):
             _flush_table(elements, table_buffer, LGRAY, NAVY)
             table_buffer = []
@@ -686,20 +673,20 @@ async def export_justification_pdf(
         if is_md_h:
             clean = re.sub(r'^#+\s+', '', line)
             level = len(re.match(r'^(#+)', line).group(1))
-            elements.append(Paragraph(clean, h1 if level <= 2 else h2))
+            elements.append(Paragraph(strip_for_pdf(clean), S["h1"] if level <= 2 else S["h2"]))
         elif is_section_h:
             elements.append(HRFlowable(width="100%", thickness=0.5, color=NAVY, spaceAfter=2))
-            elements.append(Paragraph(line, h1))
+            elements.append(Paragraph(strip_for_pdf(line), S["h1"]))
         elif is_numbered:
-            elements.append(Paragraph(line, num))
+            elements.append(Paragraph(strip_for_pdf(line), num_style))
         else:
-            elements.append(Paragraph(line, bod))
+            elements.append(Paragraph(strip_for_pdf(line), S["body"]))
         i += 1
 
     if table_buffer:
         _flush_table(elements, table_buffer, LGRAY, NAVY)
 
-    pdf_doc.build(elements)
+    pdf_doc.build(elements, onFirstPage=pdf_page_number, onLaterPages=pdf_page_number)
     buf.seek(0)
     safe = re.sub(r"[^\w\-]", "_", body.title)[:40]
     return StreamingResponse(

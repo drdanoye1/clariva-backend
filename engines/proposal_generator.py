@@ -34,6 +34,13 @@ Rules:
   If this is a CDBG grant, write CDBG language. If NIH R01, write NIH language.
   Never substitute SBIR/STTR language unless the grant type is literally SBIR or STTR.
 
+FORMATTING — CRITICAL:
+- Output plain prose only. Do NOT use any markdown formatting.
+- No asterisks for bold (**text** or *text*), no pound signs for headings (## or ###),
+  no underscores for italic (__text__ or _text_), no backticks, no bullet hyphens.
+- The output is inserted directly into a federal Word document; markdown characters
+  will appear literally and disqualify the submission.
+
 References:
 - Where relevant, cite authoritative sources (program guidance documents, federal regulations,
   agency strategic plans, peer-reviewed literature) inline as (Source: [Title, URL or citation]).

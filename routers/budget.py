@@ -338,15 +338,21 @@ Write a complete, formal budget justification appropriate for the grant program 
 - J. Total Direct and Indirect Costs
 - K. Fee / Profit (if applicable to this grant type; omit if not allowed)
 - L. Total Amount Requested
-- Budget Summary Table (markdown table with all categories and amounts)
+- Budget Summary Table (plain text table listing all categories and dollar amounts)
 
-Write in formal grant language appropriate for {_grant_label}. Do NOT use SBIR-specific language unless this is actually an SBIR grant. State explicitly when categories are $0 and why. Be specific about hourly rates, hours, and cost calculations."""
+Write in formal grant language appropriate for {_grant_label}. Do NOT use SBIR-specific language unless this is actually an SBIR grant. State explicitly when categories are $0 and why. Be specific about hourly rates, hours, and cost calculations.
+
+CRITICAL FORMATTING RULES — the output will be inserted directly into a federal submission document:
+- Do NOT use any markdown formatting: no **, no *, no ##, no __, no backticks, no bullet hyphens
+- Write section labels as plain text (e.g. "A. Senior/Key Personnel:" not "**A. Senior/Key Personnel:**")
+- Use plain prose paragraphs. Use numbered sub-items (1. 2. 3.) only where a list genuinely aids clarity.
+- Write the budget summary table using plain pipe-delimited rows: Category | Amount (the exporter will format it)"""
 
     try:
         response = await _get_client().chat.completions.create(
             model=settings.OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": f"You are an expert grant writer specializing in {_grant_label} budget justifications. Write formal, precise, compliant budget narratives appropriate to this specific grant program."},
+                {"role": "system", "content": f"You are an expert grant writer specializing in {_grant_label} budget justifications. Write formal, precise, compliant budget narratives appropriate to this specific grant program. Output plain prose only — absolutely no markdown formatting (no **, no *, no ##, no backticks). Section labels like 'A. Senior/Key Personnel:' should appear as plain text."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,

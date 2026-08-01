@@ -108,96 +108,71 @@ class DocumentOutputEngine:
     def _export_docx(self, filepath: str, proposal: Any, sections: List[Any]) -> None:
         try:
             from docx import Document
-            from docx.shared import Inches, Pt, RGBColor
+            from docx.shared import Pt, RGBColor
+            from docx.oxml.ns import qn
+            from docx.oxml import OxmlElement
             from docx.enum.text import WD_ALIGN_PARAGRAPH
+            from utils.doc_utils import (
+                apply_federal_margins, add_federal_heading, add_body_para,
+                add_page_numbers, render_content, _make_run, _para_spacing,
+                FEDERAL_FONT, H1_PT,
+            )
 
             doc = Document()
+            apply_federal_margins(doc)
 
-            # Page margins
-            for section in doc.sections:
-                section.top_margin    = Inches(1)
-                section.bottom_margin = Inches(1)
-                section.left_margin   = Inches(1.25)
-                section.right_margin  = Inches(1.25)
-
-            # Title
+            # ── Title ─────────────────────────────────────────────────────────
             title_para = doc.add_paragraph()
             title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = title_para.add_run(proposal.title)
-            run.bold = True
-            run.font.size = Pt(16)
+            _para_spacing(title_para, after=4, before=0)
+            _make_run(title_para, proposal.title, bold=True, pt=H1_PT)
 
             # Metadata line
             meta = doc.add_paragraph()
             meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            meta.add_run(
-                f"Agency: {proposal.agency}  |  Phase: {proposal.phase.replace('_', ' ').title()}  "
-                f"|  Version: {proposal.version}"
-            ).font.size = Pt(10)
-
-            doc.add_paragraph()
+            _para_spacing(meta, after=6)
+            _make_run(meta,
+                      f"Agency: {proposal.agency}  |  "
+                      f"Phase: {proposal.phase.replace('_', ' ').title()}  |  "
+                      f"Version: {proposal.version}",
+                      pt=10)
 
             # ── AI Disclaimer box ─────────────────────────────────────────────
-            from docx.oxml.ns import qn
-            from docx.oxml import OxmlElement
             disclaimer_para = doc.add_paragraph()
-            disclaimer_run = disclaimer_para.add_run("⚠  AI-GENERATED CONTENT DISCLAIMER\n")
-            disclaimer_run.bold = True
-            disclaimer_run.font.size = Pt(9)
-            disclaimer_run.font.color.rgb = RGBColor(0x92, 0x40, 0x0E)
-            body_run = disclaimer_para.add_run(AI_DISCLAIMER)
-            body_run.font.size = Pt(9)
-            body_run.font.color.rgb = RGBColor(0x44, 0x33, 0x00)
-            # Shade background amber
+            _para_spacing(disclaimer_para, after=8)
+            dr = disclaimer_para.add_run("AI-GENERATED DRAFT — REQUIRES PROFESSIONAL REVIEW\n")
+            dr.bold = True; dr.font.size = Pt(9)
+            dr.font.color.rgb = RGBColor(0x92, 0x40, 0x0E)
+            br = disclaimer_para.add_run(AI_DISCLAIMER)
+            br.font.size = Pt(9)
+            br.font.color.rgb = RGBColor(0x44, 0x33, 0x00)
             pPr = disclaimer_para._p.get_or_add_pPr()
             shd = OxmlElement("w:shd")
-            shd.set(qn("w:val"), "clear")
-            shd.set(qn("w:color"), "auto")
+            shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto")
             shd.set(qn("w:fill"), "FFF3CD")
             pPr.append(shd)
-            # Border
             pBdr = OxmlElement("w:pBdr")
             for side in ("top", "left", "bottom", "right"):
                 bdr = OxmlElement(f"w:{side}")
-                bdr.set(qn("w:val"), "single")
-                bdr.set(qn("w:sz"), "6")
-                bdr.set(qn("w:space"), "4")
-                bdr.set(qn("w:color"), "D97706")
+                bdr.set(qn("w:val"), "single"); bdr.set(qn("w:sz"), "6")
+                bdr.set(qn("w:space"), "4"); bdr.set(qn("w:color"), "D97706")
                 pBdr.append(bdr)
             pPr.append(pBdr)
-            doc.add_paragraph()
             # ─────────────────────────────────────────────────────────────────
 
-            # Sections
+            # ── Sections ──────────────────────────────────────────────────────
             for sec in sections:
                 if not sec.content:
                     continue
-                # Section heading
-                heading = doc.add_paragraph(style="Heading 1")
-                heading.add_run(sec.title).bold = True
+                add_federal_heading(doc, sec.title, level=1)
+                render_content(doc, sec.content)
 
-                # Content paragraphs
-                for para_text in sec.content.split("\n\n"):
-                    para_text = para_text.strip()
-                    if para_text:
-                        doc.add_paragraph(para_text)
-
-                doc.add_paragraph()
-
-            # Footer
-            footer_para = doc.add_paragraph()
-            footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            footer_run = footer_para.add_run(
-                f"Generated by AtiFixia SBIR Intelligence Platform™  |  "
-                f"{datetime.utcnow().strftime('%Y-%m-%d')}"
-            )
-            footer_run.font.size = Pt(9)
-            footer_run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+            # ── Page numbers ──────────────────────────────────────────────────
+            add_page_numbers(doc)
 
             doc.save(filepath)
 
         except ImportError:
-            # Fallback to TXT if python-docx not installed
             txt_path = filepath.replace(".docx", ".txt")
             self._export_txt(txt_path, proposal, sections)
             import shutil
@@ -208,89 +183,82 @@ class DocumentOutputEngine:
     def _export_pdf(self, filepath: str, proposal: Any, sections: List[Any]) -> None:
         try:
             from reportlab.lib.pagesizes import LETTER
-            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.styles import ParagraphStyle
             from reportlab.lib.units import inch
-            from reportlab.platypus import (
-                SimpleDocTemplate, Paragraph, Spacer, HRFlowable
-            )
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
             from reportlab.lib import colors
+            from utils.doc_utils import get_pdf_styles, pdf_page_number, strip_for_pdf
 
-            doc_obj = SimpleDocTemplate(
-                filepath,
-                pagesize=LETTER,
-                rightMargin=1.25 * inch,
-                leftMargin=1.25 * inch,
-                topMargin=1 * inch,
-                bottomMargin=1 * inch,
-            )
-
-            styles = getSampleStyleSheet()
-            title_style = ParagraphStyle(
-                "TitleStyle", parent=styles["Title"],
-                fontSize=16, spaceAfter=6, textColor=colors.HexColor("#1a3a6b"),
-            )
-            heading_style = ParagraphStyle(
-                "HeadingStyle", parent=styles["Heading1"],
-                fontSize=12, spaceBefore=12, spaceAfter=4,
-                textColor=colors.HexColor("#1a3a6b"),
-            )
-            body_style = ParagraphStyle(
-                "BodyStyle", parent=styles["Normal"],
-                fontSize=10, leading=14, spaceAfter=6,
-            )
+            S = get_pdf_styles()
+            NAVY = colors.HexColor("#1F4E79")
 
             disclaimer_style = ParagraphStyle(
-                "DisclaimerStyle", parent=styles["Normal"],
-                fontSize=8.5, leading=12, spaceAfter=6,
+                "DisclaimerStyle", fontName="Times-Roman", fontSize=9,
+                leading=13, spaceAfter=6,
                 backColor=colors.HexColor("#FFF3CD"),
                 borderColor=colors.HexColor("#D97706"),
                 borderWidth=1, borderPadding=8,
                 textColor=colors.HexColor("#443300"),
             )
-            disclaimer_label_style = ParagraphStyle(
-                "DisclaimerLabel", parent=disclaimer_style,
-                fontName="Helvetica-Bold",
+            disclaimer_label = ParagraphStyle(
+                "DisclaimerLabel", fontName="Times-Bold", fontSize=9,
                 textColor=colors.HexColor("#92400E"),
+                backColor=colors.HexColor("#FFF3CD"),
+                borderPadding=8,
+            )
+
+            doc_obj = SimpleDocTemplate(
+                filepath, pagesize=LETTER,
+                leftMargin=inch, rightMargin=inch,
+                topMargin=inch, bottomMargin=inch,
             )
 
             story = [
-                Paragraph(proposal.title, title_style),
+                Paragraph(strip_for_pdf(proposal.title), S["title"]),
                 Paragraph(
-                    f"Agency: {proposal.agency}  |  Phase: {proposal.phase.replace('_', ' ').title()}",
-                    styles["Normal"],
+                    f"Agency: {proposal.agency}  |  "
+                    f"Phase: {proposal.phase.replace('_', ' ').title()}",
+                    S["small"],
                 ),
-                Spacer(1, 0.2 * inch),
-                HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1a3a6b")),
-                Spacer(1, 0.1 * inch),
-                Paragraph("⚠  AI-GENERATED CONTENT DISCLAIMER", disclaimer_label_style),
-                Paragraph(AI_DISCLAIMER.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"), disclaimer_style),
+                Spacer(1, 0.15 * inch),
+                HRFlowable(width="100%", thickness=1, color=NAVY),
+                Spacer(1, 0.08 * inch),
+                Paragraph("AI-GENERATED DRAFT — REQUIRES PROFESSIONAL REVIEW", disclaimer_label),
+                Paragraph(
+                    AI_DISCLAIMER.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"),
+                    disclaimer_style,
+                ),
                 Spacer(1, 0.15 * inch),
             ]
 
             for sec in sections:
                 if not sec.content:
                     continue
-                story.append(Paragraph(sec.title, heading_style))
+                story.append(Paragraph(strip_for_pdf(sec.title), S["h1"]))
                 for para_text in sec.content.split("\n\n"):
                     para_text = para_text.strip()
-                    if para_text:
-                        # Escape HTML special chars
-                        safe = para_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                        story.append(Paragraph(safe, body_style))
-                story.append(Spacer(1, 0.15 * inch))
+                    if not para_text:
+                        continue
+                    import re
+                    if re.match(r'^#{1,3}\s', para_text) or re.match(r'^[A-Z]\.\s', para_text):
+                        story.append(Paragraph(strip_for_pdf(para_text), S["h2"]))
+                    else:
+                        story.append(Paragraph(strip_for_pdf(para_text), S["body"]))
+                story.append(Spacer(1, 0.12 * inch))
 
             story += [
                 HRFlowable(width="100%", thickness=0.5, color=colors.grey),
                 Spacer(1, 0.05 * inch),
                 Paragraph(
-                    f"<i>Generated by AtiFixia SBIR Intelligence Platform™  |  "
+                    f"<i>Generated by Clariva SBIR Intelligence Platform  |  "
                     f"{datetime.utcnow().strftime('%Y-%m-%d')}</i>",
-                    styles["Normal"],
+                    S["small"],
                 ),
             ]
 
-            doc_obj.build(story)
+            doc_obj.build(story,
+                          onFirstPage=pdf_page_number,
+                          onLaterPages=pdf_page_number)
 
         except ImportError:
-            # Fallback to TXT
             self._export_txt(filepath.replace(".pdf", ".txt"), proposal, sections)
