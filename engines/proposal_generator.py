@@ -621,19 +621,19 @@ _SBIR_PATTERNS = [
 ]
 
 
-def _visual_guidance(section_id: str) -> str:
+def _visual_guidance(section_id: str, section_title: str = "") -> str:
     """
     Return section-specific instructions for embedding figure/Gantt markers.
     These markers are rendered as styled placeholders in the exported DOCX/PDF.
+    Matches against both section_id and section_title (normalised to lowercase, underscores→spaces).
     """
-    sid = section_id.lower()
-    is_technical = any(kw in sid for kw in (
-        "technical_approach", "approach", "technical_merit",
-        "innovation", "research_plan", "methodology",
+    combined = (section_id + " " + section_title).lower().replace("_", " ")
+    is_technical = any(kw in combined for kw in (
+        "technical", "approach", "innovation", "research plan", "methodology",
     ))
-    is_schedule = any(kw in sid for kw in (
-        "schedule", "milestone", "timeline", "work_plan",
-        "project_management", "deliverable",
+    is_schedule = any(kw in combined for kw in (
+        "schedule", "milestone", "timeline", "work plan",
+        "project management", "deliverable",
     ))
 
     if is_technical:
@@ -790,7 +790,7 @@ IMPORTANT:
 - Write approximately {tw} words of rich, specific content.
 - Where you use facts about this grant program (regulations, eligibility rules, priorities), cite the source inline.
 
-{_visual_guidance(section_id)}"""
+{_visual_guidance(section_id, section_title)}"""
 
         try:
             response = await self.client.chat.completions.create(
