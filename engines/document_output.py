@@ -42,8 +42,27 @@ class DocumentOutputEngine:
         include_reviewer: bool = False,
         include_compliance: bool = True,
         generate_figures: bool = False,
+        format_options: Any = None,   # ExportFormatOptions schema object or None
     ) -> Dict[str, Any]:
         """Route to format-specific exporter."""
+        from utils.doc_utils import FormatOptions
+
+        # Convert Pydantic schema → dataclass (None preserves all defaults)
+        opts: FormatOptions | None = None
+        if format_options is not None:
+            opts = FormatOptions(
+                font=format_options.font,
+                font_pt=format_options.font_pt,
+                alignment=format_options.alignment,
+                margins_in=format_options.margins_in,
+                page_num_position=format_options.page_num_position,
+                cover_page_number=format_options.cover_page_number,
+                page_break_h1=format_options.page_break_h1,
+                section_numbering=format_options.section_numbering,
+                space_after_pt=format_options.space_after_pt,
+                space_before_h1_pt=format_options.space_before_h1_pt,
+            )
+
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in proposal.title[:40])
         filename = f"{safe_title}_{timestamp}.{fmt}"
@@ -57,7 +76,7 @@ class DocumentOutputEngine:
         if fmt == "txt":
             self._export_txt(filepath, proposal, sections)
         elif fmt == "docx":
-            self._export_docx(filepath, proposal, sections, figures=figures)
+            self._export_docx(filepath, proposal, sections, figures=figures, opts=opts)
         elif fmt == "pdf":
             self._export_pdf(filepath, proposal, sections)
         else:
@@ -145,7 +164,8 @@ class DocumentOutputEngine:
 
     # ── DOCX ──────────────────────────────────────────────────────────────────
 
-    def _export_docx(self, filepath: str, proposal: Any, sections: List[Any], figures: Dict[str, bytes] = {}) -> None:
+    def _export_docx(self, filepath: str, proposal: Any, sections: List[Any],
+                     figures: Dict[str, bytes] = {}, opts=None) -> None:
         try:
             from docx import Document
             from docx.shared import Pt, RGBColor
@@ -158,14 +178,16 @@ class DocumentOutputEngine:
                 FEDERAL_FONT, H1_PT,
             )
 
+            font = opts.font if opts else FEDERAL_FONT
+
             doc = Document()
-            apply_federal_margins(doc)
+            apply_federal_margins(doc, opts=opts)
 
             # ── Title ─────────────────────────────────────────────────────────
             title_para = doc.add_paragraph()
             title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
             _para_spacing(title_para, after=4, before=0)
-            _make_run(title_para, proposal.title, bold=True, pt=H1_PT)
+            _make_run(title_para, proposal.title, bold=True, pt=H1_PT, font=font)
 
             # Metadata line
             meta = doc.add_paragraph()
@@ -175,7 +197,7 @@ class DocumentOutputEngine:
                       f"Agency: {proposal.agency}  |  "
                       f"Phase: {proposal.phase.replace('_', ' ').title()}  |  "
                       f"Version: {proposal.version}",
-                      pt=10)
+                      pt=10, font=font)
 
             # ── AI Disclaimer box ─────────────────────────────────────────────
             disclaimer_para = doc.add_paragraph()
@@ -204,11 +226,11 @@ class DocumentOutputEngine:
             for sec in sections:
                 if not sec.content:
                     continue
-                add_federal_heading(doc, sec.title, level=1)
-                render_content(doc, sec.content, figures=figures)
+                add_federal_heading(doc, sec.title, level=1, opts=opts)
+                render_content(doc, sec.content, figures=figures, opts=opts)
 
             # ── Page numbers ──────────────────────────────────────────────────
-            add_page_numbers(doc)
+            add_page_numbers(doc, opts=opts)
 
             doc.save(filepath)
 

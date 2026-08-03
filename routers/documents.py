@@ -47,6 +47,7 @@ async def export_proposal(
         include_reviewer=body.include_reviewer_feedback,
         include_compliance=body.include_compliance_status,
         generate_figures=body.generate_figures,
+        format_options=body.format_options,
     )
 
     return ExportResponse(

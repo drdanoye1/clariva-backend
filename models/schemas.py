@@ -324,6 +324,19 @@ class ComplianceReport(BaseModel):
 
 # ── Document Export ───────────────────────────────────────────────────────────
 
+class ExportFormatOptions(BaseModel):
+    """User-selectable formatting options at export time.  All default to the Federal Proposal Standard."""
+    font: str = "Times New Roman"
+    font_pt: int = 12                 # 12 or 11
+    alignment: str = "left"           # "left" | "justify"
+    margins_in: float = 1.0
+    page_num_position: str = "center" # "center" | "right"
+    cover_page_number: bool = False
+    page_break_h1: bool = False
+    section_numbering: bool = False
+    space_after_pt: int = 6
+    space_before_h1_pt: int = 12
+
 class ExportRequest(BaseModel):
     proposal_id: str
     format: DocumentFormat
@@ -331,6 +344,7 @@ class ExportRequest(BaseModel):
     include_reviewer_feedback: bool = False
     include_compliance_status: bool = True
     generate_figures: bool = False
+    format_options: Optional[ExportFormatOptions] = None
 
 class ExportResponse(BaseModel):
     proposal_id: str

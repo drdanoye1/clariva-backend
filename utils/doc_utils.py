@@ -9,7 +9,29 @@ three-level heading hierarchy (16 / 14 / 12 pt bold).
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from typing import List, Tuple
+
+
+# ─── Formatting options ───────────────────────────────────────────────────────
+
+@dataclass
+class FormatOptions:
+    """
+    User-selectable export formatting options.
+    All defaults match the established Federal Proposal Standard.
+    Passing opts=None anywhere preserves the existing default behaviour.
+    """
+    font: str = "Times New Roman"
+    font_pt: int = 12                   # 12 = broad compatibility; 11 = NSF minimum
+    alignment: str = "left"             # "left" | "justify"
+    margins_in: float = 1.0             # inches, applied to all four sides
+    page_num_position: str = "center"   # "center" | "right"
+    cover_page_number: bool = False     # Show page number on the first/cover page
+    page_break_h1: bool = False         # Force page break before every H1 heading
+    section_numbering: bool = False     # Auto-prefix headings: 1. / 1.1 / 1.1.1
+    space_after_pt: int = 6             # Points after each body paragraph
+    space_before_h1_pt: int = 12        # Points before H1 headings
 
 
 # ─── Markdown stripping ───────────────────────────────────────────────────────
@@ -49,14 +71,12 @@ SPACE_AFTER_PT  = 6
 SPACE_BEFORE_PT = 0
 
 
-def apply_federal_margins(doc) -> None:
-    """Set all section margins to 1 inch."""
+def apply_federal_margins(doc, opts: FormatOptions = None) -> None:
+    """Set all section margins (default 1 inch; user-selectable via opts)."""
     from docx.shared import Inches
+    m = Inches(opts.margins_in if opts else MARGIN_IN)
     for sec in doc.sections:
-        sec.top_margin    = Inches(MARGIN_IN)
-        sec.bottom_margin = Inches(MARGIN_IN)
-        sec.left_margin   = Inches(MARGIN_IN)
-        sec.right_margin  = Inches(MARGIN_IN)
+        sec.top_margin = sec.bottom_margin = sec.left_margin = sec.right_margin = m
 
 
 def _para_spacing(para, after: int = SPACE_AFTER_PT, before: int = SPACE_BEFORE_PT) -> None:
@@ -82,14 +102,14 @@ def _para_spacing(para, after: int = SPACE_AFTER_PT, before: int = SPACE_BEFORE_
 
 
 def _make_run(para, text: str, bold: bool = False, italic: bool = False,
-              pt: int = BODY_PT):
+              pt: int = BODY_PT, font: str = FEDERAL_FONT):
     from docx.shared import Pt
     from docx.oxml.ns import qn
     run = para.add_run(text)
     run.bold   = bold
     run.italic = italic
     run.font.size = Pt(pt)
-    # Force Times New Roman through rPr/rFonts so it overrides the style default
+    # Force font through rPr/rFonts so it overrides the style default
     rPr = run._r.get_or_add_rPr()
     rFonts = rPr.find(qn('w:rFonts'))
     if rFonts is None:
@@ -97,45 +117,66 @@ def _make_run(para, text: str, bold: bool = False, italic: bool = False,
         rFonts = OxmlElement('w:rFonts')
         rPr.insert(0, rFonts)
     for attr in ('w:ascii', 'w:hAnsi', 'w:cs'):
-        rFonts.set(qn(attr), FEDERAL_FONT)
+        rFonts.set(qn(attr), font)
     return run
 
 
-def add_body_para(doc, text: str) -> None:
+def add_body_para(doc, text: str, opts: FormatOptions = None) -> None:
     """Add a body paragraph, converting **bold** to bold runs. Skips blank text."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     text = text.strip()
     if not text:
         return
     text = re.sub(r'^#{1,6}\s+', '', text)   # strip stray heading markers
     para = doc.add_paragraph()
-    _para_spacing(para)
+    pt    = opts.font_pt      if opts else BODY_PT
+    font  = opts.font         if opts else FEDERAL_FONT
+    after = opts.space_after_pt if opts else SPACE_AFTER_PT
+    _para_spacing(para, after=after)
+    if opts and opts.alignment == "justify":
+        para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     for segment, is_bold in split_bold(text):
-        _make_run(para, segment, bold=is_bold)
+        _make_run(para, segment, bold=is_bold, pt=pt, font=font)
 
 
-def add_federal_heading(doc, text: str, level: int = 1) -> None:
-    """Add a heading at the given level with Times New Roman and federal sizes."""
+def add_federal_heading(doc, text: str, level: int = 1, opts: FormatOptions = None) -> None:
+    """Add a heading at the given level with federal sizes; honours opts."""
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
     text = re.sub(r'^#{1,6}\s+', '', text.strip())
     text = strip_markdown(text)
     pt_map = {1: H1_PT, 2: H2_PT, 3: H3_PT}
     pt     = pt_map.get(level, H2_PT)
+    font   = opts.font if opts else FEDERAL_FONT
+    before_pt = (opts.space_before_h1_pt if opts else 12) if level == 1 else 6
     try:
         para = doc.add_paragraph(style=f"Heading {min(level, 3)}")
     except Exception:
         para = doc.add_paragraph()
+    # Optional page break before H1
+    if level == 1 and opts and opts.page_break_h1:
+        pPr = para._p.get_or_add_pPr()
+        pb = OxmlElement('w:pageBreakBefore')
+        pb.set(qn('w:val'), '1')
+        pPr.append(pb)
     para.alignment = WD_ALIGN_PARAGRAPH.LEFT
     para.clear()
-    _para_spacing(para, after=6, before=(12 if level == 1 else 6))
-    _make_run(para, text, bold=True, pt=pt)
+    _para_spacing(para, after=6, before=before_pt)
+    _make_run(para, text, bold=True, pt=pt, font=font)
 
 
-def add_page_numbers(doc) -> None:
-    """Insert bottom-centre 'Page X of Y' into every section footer."""
+def add_page_numbers(doc, opts: FormatOptions = None) -> None:
+    """Insert 'Page X of Y' into every section footer; honours opts."""
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
     from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    pos = opts.page_num_position if opts else "center"
+    align = WD_ALIGN_PARAGRAPH.RIGHT if pos == "right" else WD_ALIGN_PARAGRAPH.CENTER
+    font  = opts.font if opts else FEDERAL_FONT
+    hide_first = opts and not opts.cover_page_number
 
     def _field_run(para, instr: str):
         run = para.add_run()
@@ -143,7 +184,7 @@ def add_page_numbers(doc) -> None:
         rPr = run._r.get_or_add_rPr()
         rFonts = OxmlElement('w:rFonts')
         for attr in ('w:ascii', 'w:hAnsi', 'w:cs'):
-            rFonts.set(qn(attr), FEDERAL_FONT)
+            rFonts.set(qn(attr), font)
         rPr.insert(0, rFonts)
         begin = OxmlElement('w:fldChar'); begin.set(qn('w:fldCharType'), 'begin')
         itext = OxmlElement('w:instrText'); itext.set(qn('xml:space'), 'preserve')
@@ -151,15 +192,18 @@ def add_page_numbers(doc) -> None:
         end = OxmlElement('w:fldChar'); end.set(qn('w:fldCharType'), 'end')
         run._r.extend([begin, itext, end])
 
-    for section in doc.sections:
+    for i, section in enumerate(doc.sections):
+        if i == 0 and hide_first:
+            section.different_first_page_header_footer = True
+            # first-page footer stays blank; skip to next section
         footer = section.footer
         footer.is_linked_to_previous = False
         p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
         p.clear()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        _make_run(p, "Page ", pt=10)
+        p.alignment = align
+        _make_run(p, "Page ", pt=10, font=font)
         _field_run(p, "PAGE")
-        _make_run(p, " of ", pt=10)
+        _make_run(p, " of ", pt=10, font=font)
         _field_run(p, "NUMPAGES")
 
 
@@ -201,10 +245,14 @@ def add_figure_placeholder(doc, caption: str, fig_num: int | str = 1) -> None:
     label.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
 
     # ── Caption ──────────────────────────────────────────────────────────
+    import re as _re
+    display_cap = _re.sub(r'^(?:FLOW|IMAGE)\s*\|(?:[^|]*\|\s*)?', '', caption, flags=_re.IGNORECASE).strip()
+    if not display_cap:
+        display_cap = caption
     cap = doc.add_paragraph()
     cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _para_spacing(cap, after=10, before=2)
-    cr = cap.add_run(f"Figure {fig_num}. {caption}")
+    cr = cap.add_run(f"Figure {fig_num}. {display_cap}")
     cr.italic = True
     cr.font.size = Pt(10)
     _set_run_font(cr)
@@ -235,7 +283,8 @@ def add_figure_image(doc, caption: str, fig_num, image_bytes: bytes) -> None:
     _para_spacing(cap, after=10, before=2)
     # Strip structured-marker prefix for display
     import re as _re
-    display_caption = _re.sub(r'^(FLOW|IMAGE)\s*\|[^|]*\|\s*', '', caption, flags=_re.IGNORECASE).strip()
+    # Strip "FLOW | steps | " (two-pipe) or "IMAGE | " (one-pipe) prefix from display caption
+    display_caption = _re.sub(r'^(?:FLOW|IMAGE)\s*\|(?:[^|]*\|\s*)?', '', caption, flags=_re.IGNORECASE).strip()
     if not display_caption:
         display_caption = caption
     cr = cap.add_run(f"Figure {fig_num}. {display_caption}")
@@ -388,7 +437,7 @@ def add_gantt_table(doc, full_content: str, title: str = "Project Schedule") -> 
     doc.add_paragraph()  # spacer after Gantt
 
 
-def render_content(doc, content: str, figures: dict = {}) -> None:
+def render_content(doc, content: str, figures: dict = {}, opts: FormatOptions = None) -> None:
     """
     Parse AI-generated text (may contain markdown) into *doc* using
     federal formatting.  Handles ## headings, A. section labels,
@@ -398,10 +447,12 @@ def render_content(doc, content: str, figures: dict = {}) -> None:
     and [GANTT: title] Gantt charts.
 
     figures: dict mapping caption string → PNG bytes (pre-generated by image_gen).
+    opts:    FormatOptions controlling font, alignment, numbering, etc.
     """
     lines = content.split("\n")
     tbl_buf: list = []   # list of list[str]
     fig_counter = [0]    # mutable figure counter
+    h_counters  = [0, 0, 0]   # for opts.section_numbering: H1 / H2 / H3
 
     def flush_table():
         if not tbl_buf:
@@ -414,11 +465,26 @@ def render_content(doc, content: str, figures: dict = {}) -> None:
                 cell = t.rows[ri].cells[ci]
                 cell.text = ""
                 cp = cell.paragraphs[0]
-                _make_run(cp, cell_text, bold=(ri == 0))
+                _make_run(cp, cell_text, bold=(ri == 0),
+                          font=(opts.font if opts else FEDERAL_FONT))
                 if ci > 0:
                     cp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         doc.add_paragraph()
         tbl_buf.clear()
+
+    def _num_prefix(level: int) -> str:
+        """Return auto-number prefix (e.g. '1. ' / '1.1 ') when section_numbering is on."""
+        if not (opts and opts.section_numbering):
+            return ""
+        if level == 1:
+            h_counters[0] += 1; h_counters[1] = 0; h_counters[2] = 0
+            return f"{h_counters[0]}. "
+        elif level == 2:
+            h_counters[1] += 1; h_counters[2] = 0
+            return f"{h_counters[0]}.{h_counters[1]} "
+        else:
+            h_counters[2] += 1
+            return f"{h_counters[0]}.{h_counters[1]}.{h_counters[2]} "
 
     for line in lines:
         s = line.strip()
@@ -471,23 +537,28 @@ def render_content(doc, content: str, figures: dict = {}) -> None:
 
         md_h = re.match(r'^(#{1,3})\s+(.*)', s)
         if md_h:
-            add_federal_heading(doc, md_h.group(2), level=len(md_h.group(1)))
+            level = len(md_h.group(1))
+            add_federal_heading(doc, _num_prefix(level) + md_h.group(2),
+                                level=level, opts=opts)
             continue
 
         if re.match(r'^[A-Z]\.\s', s):
-            add_federal_heading(doc, s, level=2)
+            add_federal_heading(doc, _num_prefix(2) + s, level=2, opts=opts)
             continue
 
         num_m = re.match(r'^(\d+)\.\s+(.*)', s)
         if num_m:
-            para = doc.add_paragraph()
-            _para_spacing(para)
-            _make_run(para, f"{num_m.group(1)}. ")
+            para  = doc.add_paragraph()
+            pt    = opts.font_pt      if opts else BODY_PT
+            font  = opts.font         if opts else FEDERAL_FONT
+            after = opts.space_after_pt if opts else SPACE_AFTER_PT
+            _para_spacing(para, after=after)
+            _make_run(para, f"{num_m.group(1)}. ", pt=pt, font=font)
             for seg, bold in split_bold(num_m.group(2)):
-                _make_run(para, seg, bold=bold)
+                _make_run(para, seg, bold=bold, pt=pt, font=font)
             continue
 
-        add_body_para(doc, s)
+        add_body_para(doc, s, opts=opts)
 
     flush_table()
 
