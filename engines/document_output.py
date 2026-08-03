@@ -41,6 +41,7 @@ class DocumentOutputEngine:
         include_scoring: bool = True,
         include_reviewer: bool = False,
         include_compliance: bool = True,
+        generate_figures: bool = False,
     ) -> Dict[str, Any]:
         """Route to format-specific exporter."""
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -48,10 +49,15 @@ class DocumentOutputEngine:
         filename = f"{safe_title}_{timestamp}.{fmt}"
         filepath = os.path.join(EXPORT_DIR, filename)
 
+        # Pre-generate figures for DOCX/PDF when requested
+        figures: Dict[str, bytes] = {}
+        if generate_figures and fmt in ("docx", "pdf"):
+            figures = await self._generate_figures(proposal, sections)
+
         if fmt == "txt":
             self._export_txt(filepath, proposal, sections)
         elif fmt == "docx":
-            self._export_docx(filepath, proposal, sections)
+            self._export_docx(filepath, proposal, sections, figures=figures)
         elif fmt == "pdf":
             self._export_pdf(filepath, proposal, sections)
         else:
@@ -65,6 +71,40 @@ class DocumentOutputEngine:
             "file_size": file_size,
             "exported_at": datetime.utcnow(),
         }
+
+    # ── Figure pre-generation ─────────────────────────────────────────────────
+
+    async def _generate_figures(self, proposal: Any, sections: List[Any]) -> Dict[str, bytes]:
+        """
+        Scan all section content for [FIGURE N: ...] and [IMAGE N: ...] markers,
+        generate an image for each unique caption, and return a caption→bytes dict.
+        """
+        import re
+        from engines import image_gen
+        from config import settings
+
+        MARKER_RE = re.compile(
+            r'\[(?:FIGURE|IMAGE)\s*\d*\s*:\s*(.*?)\]',
+            re.IGNORECASE,
+        )
+        captions: List[str] = []
+        seen: set = set()
+        for sec in sections:
+            if not sec.content:
+                continue
+            for m in MARKER_RE.finditer(sec.content):
+                cap = m.group(1).strip()
+                if cap and cap not in seen:
+                    seen.add(cap)
+                    captions.append(cap)
+
+        figures: Dict[str, bytes] = {}
+        for cap in captions:
+            img = await image_gen.generate_figure(cap, proposal.title, settings.OPENAI_API_KEY)
+            if img:
+                figures[cap] = img
+
+        return figures
 
     # ── TXT ───────────────────────────────────────────────────────────────────
 
@@ -105,7 +145,7 @@ class DocumentOutputEngine:
 
     # ── DOCX ──────────────────────────────────────────────────────────────────
 
-    def _export_docx(self, filepath: str, proposal: Any, sections: List[Any]) -> None:
+    def _export_docx(self, filepath: str, proposal: Any, sections: List[Any], figures: Dict[str, bytes] = {}) -> None:
         try:
             from docx import Document
             from docx.shared import Pt, RGBColor
@@ -165,7 +205,7 @@ class DocumentOutputEngine:
                 if not sec.content:
                     continue
                 add_federal_heading(doc, sec.title, level=1)
-                render_content(doc, sec.content)
+                render_content(doc, sec.content, figures=figures)
 
             # ── Page numbers ──────────────────────────────────────────────────
             add_page_numbers(doc)

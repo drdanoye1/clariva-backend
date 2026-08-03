@@ -330,6 +330,7 @@ class ExportRequest(BaseModel):
     include_scoring_summary: bool = True
     include_reviewer_feedback: bool = False
     include_compliance_status: bool = True
+    generate_figures: bool = False
 
 class ExportResponse(BaseModel):
     proposal_id: str

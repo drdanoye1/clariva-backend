@@ -638,20 +638,31 @@ def _visual_guidance(section_id: str, section_title: str = "") -> str:
 
     if is_technical:
         return """
-FIGURES — REQUIRED (the document export will render these as placeholder boxes):
-Place exactly two figure markers naturally within your text at the logical point
-where each visual would appear in a printed proposal:
+FIGURES — REQUIRED (exported as actual visual diagrams in DOCX/PDF):
+Place exactly two figure markers within your text at the natural point where each
+visual would appear in a printed proposal.
 
-1. After your opening/overview paragraph insert:
-   [FIGURE 1: Process Flow Diagram — describe the end-to-end technical workflow]
-   Then write one sentence explaining what the diagram illustrates for the reviewer.
+1. After your opening/overview paragraph, embed a process flow marker with the
+   SPECIFIC, ACTUAL steps of YOUR technical workflow — not generic labels:
 
-2. Later, where a supporting image, schematic, or system diagram adds the most
-   value, insert:
-   [FIGURE 2: describe the type and subject of the diagram or image]
+   [FIGURE 1: FLOW | Step1 Name → Step2 Name → Step3 Name → Step4 Name | Brief descriptive title]
+
+   Example:
+   [FIGURE 1: FLOW | Material Synthesis → Nanostructure Fabrication → Optical Characterisation → Field Demonstration | End-to-end adaptive camouflage development workflow]
+
+   Use 3–5 steps relevant to THIS specific proposal. Then write one sentence explaining
+   what the diagram illustrates for the reviewer.
+
+2. Later, where a schematic or system diagram would add the most value, embed:
+
+   [FIGURE 2: IMAGE | Very specific visual description of what this diagram or schematic shows for this technology]
+
+   Example:
+   [FIGURE 2: IMAGE | Cross-sectional schematic of the multi-layer adaptive material stack showing piezoelectric actuator layer, photonic crystal array, AI inference chip, and flexible substrate integration]
+
    Then write one sentence describing what this figure shows.
 
-Do NOT use ** or ## around these markers — write them exactly as shown."""
+Do NOT use ** or ## around these markers — write them exactly as shown with the pipe separators."""
 
     if is_schedule:
         return """
