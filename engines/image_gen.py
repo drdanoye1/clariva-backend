@@ -165,7 +165,125 @@ def generate_flowchart(steps: List[str], title: str = "") -> bytes:
     return buf.read()
 
 
-# ── DALL-E 3 image ────────────────────────────────────────────────────────────
+# ── Schematic / architecture diagram (matplotlib) ────────────────────────────
+
+def generate_schematic(description: str) -> bytes:
+    """
+    Generate a layered system architecture diagram from the figure description.
+    Parses comma/semicolon-separated component names from the description text
+    and renders them as stacked labelled layers (bottom → top).
+    Returns PNG bytes.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    # ── Extract components ────────────────────────────────────────────────
+    # Look for a list after "showing", "including", "depicting", "comprising", etc.
+    comp_match = re.search(
+        r'(?:showing|including|depicting|comprising|integrat\w+|with)\s+(.*?)\.?\s*$',
+        description, re.IGNORECASE,
+    )
+    components: List[str] = []
+    if comp_match:
+        raw = comp_match.group(1)
+        parts = re.split(r',|;|\band\b', raw)
+        components = [p.strip().title() for p in parts if p.strip() and len(p.strip()) > 2]
+        components = [c[:38] for c in components[:6]]
+
+    # Fallback generic if parsing failed
+    if len(components) < 2:
+        components = [
+            "System Input / Sensors",
+            "Core Processing Layer",
+            "Integration & Control Module",
+            "System Output / Actuation",
+        ]
+
+    NAVY   = "#1F4E79"
+    LAYER_COLORS = ["#1F4E79", "#2E75B6", "#4472C4", "#5B9BD5", "#2E75B6", "#1F4E79"]
+    WHITE  = "#FFFFFF"
+
+    n = len(components)
+    fig_h = max(4.5, n * 1.05 + 1.8)
+    fig, ax = plt.subplots(figsize=(8.5, fig_h))
+    ax.set_xlim(0, 8.5)
+    ax.set_ylim(0, fig_h)
+    ax.axis("off")
+    ax.set_facecolor("white")
+    fig.patch.set_facecolor("white")
+
+    LAYER_H = 0.75
+    LAYER_W = 6.0
+    X0 = (8.5 - LAYER_W) / 2
+    Y_GAP = 0.22
+    y_total = n * (LAYER_H + Y_GAP) - Y_GAP
+    Y0 = (fig_h - y_total) / 2 - 0.3
+
+    # Draw layers bottom-up (index 0 = bottom)
+    for i, comp in enumerate(components):
+        y = Y0 + i * (LAYER_H + Y_GAP)
+        color = LAYER_COLORS[i % len(LAYER_COLORS)]
+
+        # Shadow
+        ax.add_patch(FancyBboxPatch(
+            (X0 + 0.05, y - 0.05), LAYER_W, LAYER_H,
+            boxstyle="round,pad=0.06", linewidth=0,
+            facecolor="#CBD5E1", zorder=2,
+        ))
+        # Layer box
+        ax.add_patch(FancyBboxPatch(
+            (X0, y), LAYER_W, LAYER_H,
+            boxstyle="round,pad=0.06",
+            linewidth=1.5, edgecolor=NAVY,
+            facecolor=color, zorder=3,
+        ))
+        # Layer number badge
+        badge = plt.Circle((X0 + 0.30, y + LAYER_H / 2), 0.20, color=WHITE, zorder=4)
+        ax.add_patch(badge)
+        ax.text(X0 + 0.30, y + LAYER_H / 2, str(i + 1),
+                ha="center", va="center",
+                color=color, fontsize=8, fontweight="bold", zorder=5)
+        # Label
+        ax.text(X0 + LAYER_W / 2, y + LAYER_H / 2, comp,
+                ha="center", va="center",
+                color=WHITE, fontsize=8.5, fontweight="bold", zorder=4)
+
+        # Upward arrow between layers
+        if i < n - 1:
+            ax.annotate(
+                "",
+                xy=(X0 + LAYER_W / 2, y + LAYER_H + Y_GAP - 0.02),
+                xytext=(X0 + LAYER_W / 2, y + LAYER_H + 0.02),
+                arrowprops=dict(arrowstyle="->", color=NAVY, lw=1.8, mutation_scale=16),
+                zorder=6,
+            )
+
+    # "Layer 1 (Base)" annotation
+    ax.text(X0 - 0.15, Y0 + LAYER_H / 2, "Base\nLayer",
+            ha="right", va="center", fontsize=7, color="#888888",
+            rotation=90, style="italic")
+    ax.text(X0 - 0.15, Y0 + y_total - LAYER_H / 2, "Top\nLayer",
+            ha="right", va="center", fontsize=7, color="#888888",
+            rotation=90, style="italic")
+
+    # Title
+    title_text = re.sub(r'^(FLOW|IMAGE)\s*\|[^|]*\|\s*', '', description, flags=re.IGNORECASE).strip()
+    if not title_text:
+        title_text = description[:65]
+    fig.text(0.5, 0.97, title_text[:80], ha="center", va="top",
+             fontsize=8.5, color=NAVY, fontweight="bold", style="italic")
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight",
+                facecolor="white", edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+# ── DALL-E 3 image (future / explicit premium tier) ───────────────────────────
 
 async def generate_dalle_image(
     description: str,
@@ -174,23 +292,20 @@ async def generate_dalle_image(
 ) -> Optional[bytes]:
     """
     Call DALL-E 3 to generate a technical illustration.
+    Kept for future explicit DALL-E premium tier.
     Returns PNG bytes, or None if the call fails.
     """
     import httpx
     import openai
 
-    # Strip any leftover pipe segments
     desc = re.sub(r'^(FLOW|IMAGE)\s*\|', '', description, flags=re.IGNORECASE).strip()
     desc = desc[:380]
 
     prompt = (
-        f"A professional technical diagram or scientific illustration for a U.S. federal "
-        f"grant proposal titled '{proposal_title[:80]}'. "
-        f"Topic: {desc}. "
-        "Style: clean scientific/engineering diagram on plain white background, "
-        "suitable for submission to a U.S. government agency. "
-        "Navy blue and grey colour palette. Formal, precise, no watermarks, no handwriting. "
-        "Landscape orientation."
+        "A clean professional technical diagram or scientific illustration "
+        f"for a federal grant proposal. Topic: {desc}. "
+        "Style: scientific/engineering diagram, white background, navy blue and grey palette. "
+        "Formal, precise, no watermarks, no handwriting, landscape orientation."
     )
 
     try:
@@ -218,10 +333,16 @@ async def generate_figure(
     caption: str,
     proposal_title: str,
     api_key: str,
+    use_dalle: bool = False,
 ) -> Optional[bytes]:
     """
-    Main entry point.  Parse the caption, dispatch to flowchart or DALL-E.
-    Returns PNG bytes, or None on failure (caller should fall back to placeholder).
+    Main entry point.
+
+    FLOW markers  → matplotlib horizontal flowchart (steps extracted from marker).
+    IMAGE markers → matplotlib layered architecture diagram (components extracted from caption).
+    use_dalle=True → attempt DALL-E 3 for IMAGE type first; falls back to matplotlib.
+
+    Returns PNG bytes, or None on failure (caller falls back to placeholder).
     """
     fig_type, steps, description = _parse_marker(caption)
     _log.info("Figure generation: type=%s steps=%d desc=%.60s", fig_type, len(steps), description)
@@ -230,7 +351,17 @@ async def generate_figure(
         try:
             return generate_flowchart(steps, title=description[:80] if description else "")
         except Exception as exc:
-            _log.warning("Flowchart generation failed, trying DALL-E: %s", exc)
-            return await generate_dalle_image(description or caption, proposal_title, api_key)
+            _log.warning("Flowchart generation failed: %s", exc)
+            return None
     else:
-        return await generate_dalle_image(description, proposal_title, api_key)
+        # IMAGE type
+        if use_dalle:
+            img = await generate_dalle_image(description, proposal_title, api_key)
+            if img:
+                return img
+            _log.info("DALL-E failed; falling back to matplotlib schematic")
+        try:
+            return generate_schematic(description)
+        except Exception as exc:
+            _log.warning("Schematic generation failed: %s", exc)
+            return None
