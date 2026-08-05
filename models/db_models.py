@@ -35,6 +35,20 @@ class User(Base):
     is_superadmin     = Column(Boolean, default=False, nullable=False)
     role              = Column(String(30), default="user", nullable=False)  # user | admin | superadmin
     subscription_plan = Column(String(30), default="free", nullable=False)  # free | starter | pro | enterprise
+
+    # MFA (TOTP) — Clariva Enterprise™ PRD §18 "SSO/MFA required at enterprise tier".
+    # mfa_secret is set (but mfa_enabled stays False) during /auth/mfa/setup until
+    # the user confirms a code via /auth/mfa/verify.
+    mfa_enabled       = Column(Boolean, default=False, nullable=False)
+    mfa_secret        = Column(String(64), nullable=True)
+
+    # SSO — schema groundwork only (PRD §12/§18). No SAML/OIDC flow is wired up
+    # yet; there's no identity provider to integrate against. These columns
+    # exist so a future SSO login path has somewhere to record which provider
+    # and external subject ID a user is linked to, without a later migration.
+    sso_provider      = Column(String(50), nullable=True)   # e.g. "okta", "azure_ad"
+    sso_subject_id    = Column(String(255), nullable=True)  # the provider's stable user ID
+
     created_at        = Column(DateTime(timezone=True), server_default=func.now())
     updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -90,6 +104,13 @@ class OrgContextDB(Base):
 
 
 class FOARecord(Base):
+    """
+    The opportunity record — originally just an AI-parsed FOA upload, now
+    doubling as the pre-award pipeline entry (Clariva Enterprise™ PRD §15,
+    Phase 4). Existing upload/parse-text/parse-url flows keep working
+    unchanged: every new column below is nullable or defaulted, and
+    `org_id` stays null for a personal/solo-use record exactly like before.
+    """
     __tablename__ = "foa_records"
 
     id                  = Column(String(36), primary_key=True, default=new_uuid)
@@ -104,6 +125,34 @@ class FOARecord(Base):
     deadline            = Column(DateTime(timezone=True), nullable=True)
     uploaded_by         = Column(String(36), ForeignKey("users.id"))
     created_at          = Column(DateTime(timezone=True), server_default=func.now())
+
+    # --- Phase 4 — Funding Intelligence & Grant Tracking (PRD §15) ---------
+    # Nullable: a personal, unshared opportunity has no org workspace to
+    # stamp — same nullability rationale as WorkspaceTask.org_id (Phase 3).
+    org_id                  = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    # identified | qualifying | pursuing | submitted | awarded | declined | no_go
+    pipeline_stage          = Column(String(20), nullable=False, default="identified", index=True)
+    # manual | grants_gov | sam_gov — how this record entered the pipeline
+    source                  = Column(String(20), nullable=False, default="manual")
+    # Opportunity number/ID from the external source, for sync dedupe —
+    # unique together with `source` (enforced in the engine, not the DB,
+    # since SQLite's partial-unique-index support is limited).
+    external_id             = Column(String(100), nullable=True, index=True)
+    external_url            = Column(String(1000), nullable=True)
+    estimated_award_floor   = Column(Float, nullable=True)
+    estimated_award_ceiling = Column(Float, nullable=True)
+    eligibility_summary     = Column(Text, nullable=True)
+    # bid | no_go | undecided
+    bid_no_go_decision      = Column(String(20), nullable=True)
+    bid_no_go_rationale     = Column(Text, nullable=True)
+    assigned_to             = Column(String(36), ForeignKey("users.id"), nullable=True)
+    last_synced_at          = Column(DateTime(timezone=True), nullable=True)
+
+    # --- Phase 5 — Award & Project Management (PRD §17: renewals) ----------
+    # Set when this pipeline entry was created as a renewal/continuation of
+    # a prior Award (engines/award_engine.py::create_renewal_opportunity),
+    # so the funding pipeline can show "Renewal of <award>" provenance.
+    originating_award_id    = Column(String(36), ForeignKey("awards.id"), nullable=True)
 
     proposals = relationship("Proposal", back_populates="foa")
 
@@ -140,6 +189,7 @@ class Proposal(Base):
     reviews  = relationship("ReviewerRecord",  back_populates="proposal", cascade="all, delete-orphan")
     exports  = relationship("ExportRecord",    back_populates="proposal", cascade="all, delete-orphan")
     budget   = relationship("BudgetRecord",     back_populates="proposal", uselist=False, cascade="all, delete-orphan")
+    project_knowledge = relationship("ProjectKnowledge", back_populates="proposal", uselist=False, cascade="all, delete-orphan")
 
 
 class ProposalSection(Base):
@@ -216,6 +266,23 @@ class Organization(Base):
     created_by = Column(String(36), ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # Extension point for phased enterprise rollout (Clariva Enterprise™ PRD
+    # §6.2): lets a future module (RBAC, Scope of Work Engine, funding
+    # intelligence, etc.) be turned on per-organization without branching the
+    # codebase. Empty dict = no flags set = all-new-modules-off, so this is a
+    # pure no-op until something actually reads it.
+    feature_flags = Column(JSON, default=dict, nullable=True)
+
+    # --- Phase 6 — Integrations & Marketplace (PRD §20: white-label/reseller) --
+    # All nullable/defaulted — an org with none of these set renders exactly
+    # like today (Clariva-branded). `white_label_enabled` is the Enterprise-
+    # tier gate a future billing check can read; the fields themselves are
+    # harmless to set ahead of that gate existing.
+    white_label_enabled = Column(Boolean, default=False, nullable=False)
+    brand_name          = Column(String(255), nullable=True)
+    logo_url            = Column(String(1000), nullable=True)
+    primary_color       = Column(String(20), nullable=True)  # hex, e.g. "#1d4ed8"
+
     memberships      = relationship("OrgMembership", back_populates="organization", cascade="all, delete-orphan")
     shared_proposals = relationship("OrgProposal",   back_populates="organization", cascade="all, delete-orphan")
 
@@ -241,6 +308,10 @@ class OrgProposal(Base):
     org_id      = Column(String(36), ForeignKey("organizations.id"), nullable=False)
     proposal_id = Column(String(36), ForeignKey("proposals.id"), nullable=False)
     shared_by   = Column(String(36), ForeignKey("users.id"), nullable=False)
+    # Phase 3 — Collaboration (PRD §11): optional link to the Team (within
+    # this org) working on the proposal. See migrations.py for the
+    # column-add entry (org_proposals already existed before Phase 3).
+    team_id     = Column(String(36), ForeignKey("teams.id"), nullable=True)
     created_at  = Column(DateTime(timezone=True), server_default=func.now())
 
     organization = relationship("Organization", back_populates="shared_proposals")
@@ -299,3 +370,766 @@ class MemoryRecord(Base):
     lessons_learned = Column(JSON, default=list)
     embedding       = Column(JSON, nullable=True)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ── Phase 1 — Enterprise Foundations ───────────────────────────────────────────
+# (Clariva Enterprise™ PRD §12 RBAC, §13 Shared AI Credits, §18 Security)
+
+class AuditLog(Base):
+    """
+    Append-only record of permission-gated actions, per the PRD's Security
+    section (§18: "full audit logging of permission-gated actions"). org_id
+    is nullable because not every audited action is org-scoped (e.g. a user
+    enabling their own MFA).
+    """
+    __tablename__ = "audit_logs"
+
+    id          = Column(String(36), primary_key=True, default=new_uuid)
+    org_id      = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    actor_id    = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    action      = Column(String(100), nullable=False)        # e.g. "member.role_changed"
+    object_type = Column(String(50), nullable=True)          # e.g. "org_membership"
+    object_id   = Column(String(36), nullable=True)
+    detail      = Column(JSON, nullable=True)                # arbitrary structured context
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AICreditLedger(Base):
+    """
+    One row per organization: the shared AI credit pool balance (PRD §13).
+    """
+    __tablename__ = "ai_credit_ledgers"
+
+    id         = Column(String(36), primary_key=True, default=new_uuid)
+    org_id     = Column(String(36), ForeignKey("organizations.id"), unique=True, nullable=False)
+    balance    = Column(Float, default=100.0, nullable=False)  # starter free allotment
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class CreditTransaction(Base):
+    """
+    Immutable ledger entry for every credit debit (AI usage) or credit
+    (top-up/allotment) against an organization's AICreditLedger.
+    """
+    __tablename__ = "credit_transactions"
+
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    org_id        = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    user_id       = Column(String(36), ForeignKey("users.id"), nullable=True)  # who triggered it; null for top-ups
+    amount        = Column(Float, nullable=False)          # negative = debit, positive = credit/top-up
+    reason        = Column(String(255), nullable=False)    # e.g. "proposal_generation:section:<id>"
+    balance_after = Column(Float, nullable=False)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CreditAllocation(Base):
+    """
+    Optional per-member spending cap within an organization's shared pool
+    (PRD §13: "Organization Admins allocate credit budgets to departments/
+    teams and can cap per-user or per-project consumption"). user_id=None
+    represents the org-wide default cap applied to members with no
+    individual allocation row.
+    """
+    __tablename__ = "credit_allocations"
+
+    id         = Column(String(36), primary_key=True, default=new_uuid)
+    org_id     = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    user_id    = Column(String(36), ForeignKey("users.id"), nullable=True)
+    cap        = Column(Float, nullable=True)              # None = unlimited
+    period     = Column(String(20), default="monthly", nullable=False)  # "monthly" | "total"
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+# ── Phase 2 — Scope of Work Engine & Project Knowledge Base ────────────────────
+# (Clariva Enterprise™ PRD §9 Shared Project Knowledge Base, §10 Scope of Work
+# Engine). See docs/ARCHITECTURE.md §7 for the design rationale. One-to-one
+# chain: Proposal -> ProjectKnowledge -> ScopeOfWork -> WorkPackage -> Task,
+# with Milestone/Deliverable hanging off ScopeOfWork (optionally tagged to a
+# WorkPackage). Existing Proposal/ProposalSection/BudgetRecord rows are
+# untouched — this is an additive layer, exactly as the PRD specifies.
+
+class ProjectKnowledge(Base):
+    """
+    Project-level tier of the Shared Project Knowledge Base (PRD §9) — one
+    row per pursuit, one-to-one with a Proposal. The org-level tier already
+    exists as OrgContextDB (company profile).
+    """
+    __tablename__ = "project_knowledge"
+
+    id          = Column(String(36), primary_key=True, default=new_uuid)
+    proposal_id = Column(String(36), ForeignKey("proposals.id"), unique=True, nullable=False)
+
+    objectives      = Column(Text, nullable=True)
+    need_statement  = Column(Text, nullable=True)
+    evaluation_plan = Column(Text, nullable=True)
+    risks           = Column(JSON, default=list)   # [{risk, mitigation, likelihood, impact}]
+    outputs         = Column(Text, nullable=True)
+    outcomes        = Column(Text, nullable=True)
+    kpis            = Column(JSON, default=list)   # [{name, target, unit}]
+
+    # Smart Dependency Engine (PRD §10.1): a dict of downstream artifacts that
+    # need review after the last Scope of Work change, e.g.
+    # {"budget": true, "sections": ["technical_approach", "budget_justification"]}.
+    # Flagging only, not auto-regeneration — see docs/ARCHITECTURE.md §7.
+    stale_flags     = Column(JSON, default=dict)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    proposal      = relationship("Proposal", back_populates="project_knowledge")
+    scope_of_work = relationship("ScopeOfWork", back_populates="project_knowledge",
+                                  uselist=False, cascade="all, delete-orphan")
+
+
+class ScopeOfWork(Base):
+    """
+    The "digital twin" of the funded project (PRD §10): one row per
+    ProjectKnowledge, parent of the work-package/task/milestone/deliverable
+    hierarchy.
+    """
+    __tablename__ = "scope_of_work"
+
+    id                    = Column(String(36), primary_key=True, default=new_uuid)
+    project_knowledge_id  = Column(String(36), ForeignKey("project_knowledge.id"), unique=True, nullable=False)
+
+    period_of_performance_months = Column(Integer, nullable=True)
+    methodology_narrative        = Column(Text, nullable=True)
+    logic_model         = Column(JSON, default=dict)   # {inputs, activities, outputs, outcomes}
+    reporting_schedule  = Column(JSON, default=list)   # [{name, frequency, due_month}]
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    project_knowledge = relationship("ProjectKnowledge", back_populates="scope_of_work")
+    work_packages = relationship("WorkPackage", back_populates="scope_of_work",
+                                  cascade="all, delete-orphan", order_by="WorkPackage.order_index")
+    milestones    = relationship("Milestone", back_populates="scope_of_work",
+                                  cascade="all, delete-orphan", order_by="Milestone.due_month")
+    deliverables  = relationship("Deliverable", back_populates="scope_of_work",
+                                  cascade="all, delete-orphan", order_by="Deliverable.due_month")
+
+
+class WorkPackage(Base):
+    __tablename__ = "work_packages"
+
+    id               = Column(String(36), primary_key=True, default=new_uuid)
+    scope_of_work_id = Column(String(36), ForeignKey("scope_of_work.id"), nullable=False)
+    name             = Column(String(255), nullable=False)
+    description      = Column(Text, nullable=True)
+    lead             = Column(String(255), nullable=True)
+    start_month      = Column(Integer, nullable=True)
+    end_month        = Column(Integer, nullable=True)
+    # Total estimated cost for this work package — the unit the budget-sync
+    # (see engines/scope_of_work_engine.py::sync_budget_from_scope_of_work)
+    # merges into BudgetRecord.other_direct as one tagged line item.
+    estimated_cost   = Column(Float, nullable=True)
+    order_index      = Column(Integer, default=0)
+    created_at       = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at       = Column(DateTime(timezone=True), onupdate=func.now())
+
+    scope_of_work = relationship("ScopeOfWork", back_populates="work_packages")
+    tasks = relationship("Task", back_populates="work_package",
+                          cascade="all, delete-orphan", order_by="Task.order_index")
+
+
+class Task(Base):
+    __tablename__ = "sow_tasks"  # "sow_" prefix avoids ever colliding with an unrelated future "tasks" concept
+
+    id              = Column(String(36), primary_key=True, default=new_uuid)
+    work_package_id = Column(String(36), ForeignKey("work_packages.id"), nullable=False)
+    name            = Column(String(255), nullable=False)
+    description     = Column(Text, nullable=True)
+    owner           = Column(String(255), nullable=True)
+    start_month     = Column(Integer, nullable=True)
+    end_month       = Column(Integer, nullable=True)
+    status          = Column(String(20), default="not_started")  # not_started | in_progress | complete
+    order_index     = Column(Integer, default=0)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at      = Column(DateTime(timezone=True), onupdate=func.now())
+
+    work_package = relationship("WorkPackage", back_populates="tasks")
+
+
+class Milestone(Base):
+    __tablename__ = "milestones"
+
+    id               = Column(String(36), primary_key=True, default=new_uuid)
+    scope_of_work_id = Column(String(36), ForeignKey("scope_of_work.id"), nullable=False)
+    work_package_id  = Column(String(36), ForeignKey("work_packages.id"), nullable=True)
+    name             = Column(String(255), nullable=False)
+    description      = Column(Text, nullable=True)
+    due_month        = Column(Integer, nullable=True)
+    status           = Column(String(20), default="pending")  # pending | complete
+    created_at       = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at       = Column(DateTime(timezone=True), onupdate=func.now())
+
+    scope_of_work = relationship("ScopeOfWork", back_populates="milestones")
+
+
+class Deliverable(Base):
+    __tablename__ = "deliverables"
+
+    id                = Column(String(36), primary_key=True, default=new_uuid)
+    scope_of_work_id  = Column(String(36), ForeignKey("scope_of_work.id"), nullable=False)
+    work_package_id   = Column(String(36), ForeignKey("work_packages.id"), nullable=True)
+    name              = Column(String(255), nullable=False)
+    description       = Column(Text, nullable=True)
+    due_month         = Column(Integer, nullable=True)
+    deliverable_type  = Column(String(50), nullable=True)   # report | product | dataset | other
+    status            = Column(String(20), default="pending")  # pending | complete
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
+
+    scope_of_work = relationship("ScopeOfWork", back_populates="deliverables")
+
+
+# ── Phase 3 — Collaboration & Content Management ────────────────────────────────
+# (Clariva Enterprise™ PRD §11 Internal and External Collaboration, §14
+# Document Sharing). See docs/ARCHITECTURE.md §8 for the design rationale —
+# in particular why WorkspaceGuestAccess is deliberately NOT an OrgMembership
+# row, and why WorkspaceTask/Comment are separate from Phase 2's SOW Task.
+
+class Department(Base):
+    __tablename__ = "departments"
+
+    id         = Column(String(36), primary_key=True, default=new_uuid)
+    org_id     = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    name       = Column(String(255), nullable=False)
+    created_by = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    teams = relationship("Team", back_populates="department", cascade="all, delete-orphan")
+
+
+class Team(Base):
+    __tablename__ = "teams"
+
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    org_id        = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    department_id = Column(String(36), ForeignKey("departments.id"), nullable=True)
+    name          = Column(String(255), nullable=False)
+    created_by    = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+    department = relationship("Department", back_populates="teams")
+    members    = relationship("TeamMembership", back_populates="team", cascade="all, delete-orphan")
+
+
+class TeamMembership(Base):
+    __tablename__ = "team_memberships"
+
+    id         = Column(String(36), primary_key=True, default=new_uuid)
+    team_id    = Column(String(36), ForeignKey("teams.id"), nullable=False, index=True)
+    user_id    = Column(String(36), ForeignKey("users.id"), nullable=False)
+    role       = Column(String(20), default="member")  # member | lead
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    team = relationship("Team", back_populates="members")
+
+
+class WorkspaceTask(Base):
+    """
+    Generic task assignment (PRD §11) — distinct from the Scope of Work
+    Engine's project-plan Task (`sow_tasks`, Phase 2): this is a lightweight
+    to-do assignable to any org member on a proposal (or org-wide, if
+    proposal_id is null), not part of the funded project's formal work
+    breakdown.
+    """
+    __tablename__ = "workspace_tasks"
+
+    id          = Column(String(36), primary_key=True, default=new_uuid)
+    # Nullable: a task on a proposal that isn't (yet) shared to any org has
+    # no workspace to stamp — see workspace_access.py's ProposalAccess.org_id.
+    org_id      = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    proposal_id = Column(String(36), ForeignKey("proposals.id"), nullable=True, index=True)
+    title       = Column(String(500), nullable=False)
+    description = Column(Text, nullable=True)
+    assignee_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    status      = Column(String(20), default="open")  # open | in_progress | done
+    due_date    = Column(DateTime(timezone=True), nullable=True)
+    created_by  = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at  = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class Comment(Base):
+    """
+    Threaded comments on any object (proposal, proposal section, budget
+    line, Scope of Work task, workspace task, document, ...) per PRD §11.
+    Polymorphic via (object_type, object_id) rather than a FK per object
+    type, since the PRD explicitly calls for commenting on "any object."
+    """
+    __tablename__ = "comments"
+
+    id                = Column(String(36), primary_key=True, default=new_uuid)
+    # Nullable for the same reason as WorkspaceTask.org_id above.
+    org_id            = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    object_type       = Column(String(50), nullable=False, index=True)   # e.g. "proposal", "workspace_task"
+    object_id         = Column(String(36), nullable=False, index=True)
+    parent_comment_id = Column(String(36), ForeignKey("comments.id"), nullable=True)
+    author_id         = Column(String(36), ForeignKey("users.id"), nullable=False)
+    content           = Column(Text, nullable=False)
+    mentions          = Column(JSON, default=list)   # [user_id, ...] parsed from @mentions
+    edited            = Column(Boolean, default=False)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id          = Column(String(36), primary_key=True, default=new_uuid)
+    user_id     = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    type        = Column(String(50), nullable=False)   # mention | task_assigned | approval_requested | approval_decided | comment_reply
+    message     = Column(Text, nullable=False)
+    object_type = Column(String(50), nullable=True)
+    object_id   = Column(String(36), nullable=True)
+    read        = Column(Boolean, default=False)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ApprovalRequest(Base):
+    """
+    Configurable approval workflow (PRD §11), generalized beyond the
+    single-shot proposal approve/approval_notes flow already in
+    routers/proposals.py (left untouched, for backward compatibility) to
+    any object type.
+    """
+    __tablename__ = "approval_requests"
+
+    id             = Column(String(36), primary_key=True, default=new_uuid)
+    # Nullable for the same reason as WorkspaceTask.org_id / Comment.org_id.
+    org_id         = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    object_type    = Column(String(50), nullable=False)
+    object_id      = Column(String(36), nullable=False)
+    requested_by   = Column(String(36), ForeignKey("users.id"), nullable=False)
+    approver_id    = Column(String(36), ForeignKey("users.id"), nullable=True)  # None = any owner may decide
+    status         = Column(String(20), default="pending")  # pending | approved | rejected
+    notes          = Column(Text, nullable=True)             # requester's context
+    decision_notes = Column(Text, nullable=True)
+    decided_by     = Column(String(36), ForeignKey("users.id"), nullable=True)
+    decided_at     = Column(DateTime(timezone=True), nullable=True)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class WorkspaceGuestAccess(Base):
+    """
+    External guest tier (PRD §11): scoped to ONE proposal, never full org
+    visibility. Deliberately NOT an OrgMembership row — a guest never
+    appears in the org member list or gains any org-wide permission. See
+    workspace_access.py for how this is checked alongside ownership and
+    OrgMembership.
+    """
+    __tablename__ = "workspace_guest_access"
+
+    id          = Column(String(36), primary_key=True, default=new_uuid)
+    org_id      = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    proposal_id = Column(String(36), ForeignKey("proposals.id"), nullable=False, index=True)
+    user_id     = Column(String(36), ForeignKey("users.id"), nullable=False)
+    invited_by  = Column(String(36), ForeignKey("users.id"), nullable=False)
+    can_comment = Column(Boolean, default=True)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ── Phase 3 — Document Library (PRD §14) ────────────────────────────────────────
+
+class Document(Base):
+    """
+    One entry per library item (org- or proposal-scoped); content lives in
+    DocumentVersion rows, not here — this is the stable identity a version
+    history hangs off of. Deliberately has no `current_version_id` pointer
+    column (which would create a circular FK with document_versions,
+    fragile under SQLite's limited ALTER TABLE support) — "current version"
+    is just the row with the highest version_number for this document_id.
+    """
+    __tablename__ = "documents"
+
+    id           = Column(String(36), primary_key=True, default=new_uuid)
+    org_id       = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    proposal_id  = Column(String(36), ForeignKey("proposals.id"), nullable=True, index=True)
+    # document | knowledge | graphics | template | budget | evaluation | methodology | past_awards
+    library_type = Column(String(30), nullable=False, default="document")
+    title        = Column(String(500), nullable=False)
+    status       = Column(String(20), default="active")  # active | archived
+    created_by   = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at   = Column(DateTime(timezone=True), onupdate=func.now())
+
+    versions = relationship("DocumentVersion", back_populates="document", cascade="all, delete-orphan")
+    shares   = relationship("DocumentShare", back_populates="document", cascade="all, delete-orphan")
+
+
+class DocumentVersion(Base):
+    __tablename__ = "document_versions"
+
+    id             = Column(String(36), primary_key=True, default=new_uuid)
+    document_id    = Column(String(36), ForeignKey("documents.id"), nullable=False, index=True)
+    version_number = Column(Integer, nullable=False)
+    content        = Column(Text, nullable=True)          # rich text / generated content
+    file_url       = Column(String(1000), nullable=True)  # uploaded/exported file, if any
+    format         = Column(String(10), nullable=True)    # docx | pdf | txt | md
+    change_note    = Column(Text, nullable=True)
+    # Best-effort semantic-search embedding (PRD §14) — see
+    # document_library_engine.py. Null if generation failed or was skipped
+    # (e.g. OpenAI unreachable); search falls back to keyword matching for
+    # that version rather than blocking the save.
+    embedding      = Column(JSON, nullable=True)
+    created_by     = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+    document = relationship("Document", back_populates="versions")
+
+
+class DocumentShare(Base):
+    """
+    Internal share (shared_with_user_id set) or external share link
+    (external_email + share_token) with optional expiration — PRD §14
+    "external-share links with expiration for partner/funder distribution."
+    """
+    __tablename__ = "document_shares"
+
+    id                  = Column(String(36), primary_key=True, default=new_uuid)
+    document_id         = Column(String(36), ForeignKey("documents.id"), nullable=False, index=True)
+    shared_with_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    external_email      = Column(String(255), nullable=True)
+    share_token         = Column(String(64), unique=True, nullable=True, index=True)
+    permission          = Column(String(10), default="view")  # view | comment | edit
+    expires_at          = Column(DateTime(timezone=True), nullable=True)
+    created_by          = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+
+    document = relationship("Document", back_populates="shares")
+
+
+class RetentionPolicy(Base):
+    __tablename__ = "retention_policies"
+
+    id             = Column(String(36), primary_key=True, default=new_uuid)
+    org_id         = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    library_type   = Column(String(30), nullable=False)
+    retention_days = Column(Integer, nullable=True)  # None = keep forever
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at     = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+# ── Phase 4 — Funding Intelligence & Grant Tracking (PRD §15) ───────────────
+# Continuous opportunity monitoring, watchlists, and the pre-award pipeline,
+# extending FOARecord above as the opportunity record. See
+# engines/funding_intelligence_engine.py (Engine 15) and
+# docs/ARCHITECTURE.md §9 for the full design rationale.
+
+class PipelineStageEvent(Base):
+    """
+    One row per pipeline-stage transition on a FOARecord — the "formalized
+    status/stage history table" the PRD calls for, giving portfolio-level
+    win-rate/cycle-time reporting without inferring it from a single
+    current-stage column.
+    """
+    __tablename__ = "pipeline_stage_events"
+
+    id           = Column(String(36), primary_key=True, default=new_uuid)
+    foa_id       = Column(String(36), ForeignKey("foa_records.id"), nullable=False, index=True)
+    from_stage   = Column(String(20), nullable=True)   # null for the initial "identified" event
+    to_stage     = Column(String(20), nullable=False)
+    changed_by   = Column(String(36), ForeignKey("users.id"), nullable=True)  # null for sync-created records
+    notes        = Column(Text, nullable=True)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Watchlist(Base):
+    """
+    Saved search criteria for continuous monitoring (PRD §15) — every sync
+    checks new/updated FOARecords against each active watchlist and raises
+    a Notification (Phase 3's existing table) on a match, rather than a
+    simple bookmark list of specific opportunities.
+    """
+    __tablename__ = "watchlists"
+
+    id                = Column(String(36), primary_key=True, default=new_uuid)
+    # Nullable for the same reason as FOARecord.org_id — a personal
+    # watchlist has no org workspace to stamp.
+    org_id            = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    owner_id          = Column(String(36), ForeignKey("users.id"), nullable=False)
+    name              = Column(String(255), nullable=False)
+    keyword           = Column(String(500), nullable=True)
+    agencies          = Column(JSON, nullable=True)   # list[str] of agency codes, e.g. ["HHS", "NSF"]
+    funding_categories = Column(JSON, nullable=True)  # list[str] of Grants.gov funding category codes
+    min_award         = Column(Float, nullable=True)
+    max_award         = Column(Float, nullable=True)
+    active            = Column(Boolean, default=True, nullable=False)
+    last_run_at       = Column(DateTime(timezone=True), nullable=True)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ── Phase 5 — Award & Project Management (Clariva Enterprise™ PRD §16-17) ──────
+# A proposal that reaches FOARecord.pipeline_stage == "awarded" (Phase 4) may
+# be converted — explicitly, via the engine, never automatically — into an
+# Award: the "digital twin" (Phase 2's ScopeOfWork/WorkPackage/Task hierarchy)
+# now has an active, funded instance to execute against. Award is 1:1 with a
+# Proposal, same nullability pattern as FOARecord/Watchlist: org_id is null
+# for a personal/unshared award.
+
+class Award(Base):
+    """
+    The award record itself — agency-facing identifiers, period of
+    performance, and total value. Budget administration, compliance,
+    amendments, issues, performance, and closeout all hang off this row.
+    """
+    __tablename__ = "awards"
+
+    id                              = Column(String(36), primary_key=True, default=new_uuid)
+    proposal_id                     = Column(String(36), ForeignKey("proposals.id"), unique=True, nullable=False, index=True)
+    foa_id                          = Column(String(36), ForeignKey("foa_records.id"), nullable=True)
+    org_id                          = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    budget_record_id                = Column(String(36), ForeignKey("budget_records.id"), nullable=True)
+    award_number                    = Column(String(100), nullable=True)
+    funding_agency                  = Column(String(20), nullable=False)
+    period_of_performance_start     = Column(DateTime(timezone=True), nullable=True)
+    period_of_performance_end       = Column(DateTime(timezone=True), nullable=True)
+    total_award_value               = Column(Float, nullable=True)
+    terms                           = Column(Text, nullable=True)
+    # active | closed | terminated
+    status                          = Column(String(20), nullable=False, default="active", index=True)
+    created_by                      = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at                      = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at                      = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class AwardExpenditure(Base):
+    """
+    Actual spend recorded against an award's baseline budget (the referenced
+    BudgetRecord's total_cost/total_direct) — the input to burn-rate and
+    variance tracking (PRD §16). Deliberately NOT a full accounting ledger:
+    just enough structure (category + amount + date) to compare cumulative
+    actuals against the baseline and the elapsed period of performance.
+    """
+    __tablename__ = "award_expenditures"
+
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    award_id      = Column(String(36), ForeignKey("awards.id"), nullable=False, index=True)
+    category      = Column(String(50), nullable=False)   # personnel | equipment | travel | other_direct | subcontracts | indirect
+    description   = Column(Text, nullable=True)
+    amount        = Column(Float, nullable=False)
+    incurred_date = Column(DateTime(timezone=True), nullable=True)
+    recorded_by   = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AwardComplianceItem(Base):
+    """
+    Award terms/conditions & reporting-obligation checklist — the
+    analogous-but-distinct counterpart to engines/compliance_engine.py's
+    proposal page-limit checks (PRD §16: "reusing the existing Compliance
+    Engine pattern" — the rule/violation/checklist shape, not the same
+    proposal-specific engine, since award obligations are a different
+    domain entirely).
+    """
+    __tablename__ = "award_compliance_items"
+
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    award_id      = Column(String(36), ForeignKey("awards.id"), nullable=False, index=True)
+    obligation    = Column(String(500), nullable=False)
+    category      = Column(String(50), nullable=True)    # reporting | financial | regulatory | other
+    due_date      = Column(DateTime(timezone=True), nullable=True)
+    # pending | complete | overdue | waived
+    status        = Column(String(20), nullable=False, default="pending")
+    notes         = Column(Text, nullable=True)
+    completed_by  = Column(String(36), ForeignKey("users.id"), nullable=True)
+    completed_at  = Column(DateTime(timezone=True), nullable=True)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AwardAmendment(Base):
+    """
+    Structured change request (scope, budget, or period-of-performance) on
+    an active award (PRD §16), routed through Phase 3's generic
+    ApprovalRequest workflow rather than a parallel approval system —
+    `approval_request_id` links to that row, and this table's `status` is
+    kept in sync with it by the engine whenever the approval is decided.
+    `effective_changes` is applied to the Award record only once approved.
+    """
+    __tablename__ = "award_amendments"
+
+    id                  = Column(String(36), primary_key=True, default=new_uuid)
+    award_id            = Column(String(36), ForeignKey("awards.id"), nullable=False, index=True)
+    # scope | budget | period_of_performance | other
+    amendment_type      = Column(String(30), nullable=False)
+    description         = Column(Text, nullable=False)
+    # e.g. {"total_award_value": 250000, "period_of_performance_end": "2028-01-01"}
+    effective_changes   = Column(JSON, nullable=True)
+    requested_by        = Column(String(36), ForeignKey("users.id"), nullable=False)
+    approval_request_id = Column(String(36), ForeignKey("approval_requests.id"), nullable=True)
+    # pending | approved | rejected
+    status              = Column(String(20), nullable=False, default="pending")
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+    decided_at          = Column(DateTime(timezone=True), nullable=True)
+
+
+class ProjectIssue(Base):
+    """
+    Issue/risk tracking during project execution (PRD §17). Optionally tied
+    to a specific WorkPackage; feeds the Smart Dependency Engine indirectly —
+    resolving an issue that required a scope/budget change is expected to go
+    through an AwardAmendment, which is what actually marks ProjectKnowledge
+    stale, not the issue itself.
+    """
+    __tablename__ = "project_issues"
+
+    id              = Column(String(36), primary_key=True, default=new_uuid)
+    award_id        = Column(String(36), ForeignKey("awards.id"), nullable=False, index=True)
+    work_package_id = Column(String(36), ForeignKey("work_packages.id"), nullable=True)
+    title           = Column(String(500), nullable=False)
+    description     = Column(Text, nullable=True)
+    # low | medium | high | critical
+    severity        = Column(String(20), nullable=False, default="medium")
+    # open | resolved
+    status          = Column(String(20), nullable=False, default="open")
+    raised_by       = Column(String(36), ForeignKey("users.id"), nullable=True)
+    resolved_at     = Column(DateTime(timezone=True), nullable=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AwardPerformanceRecord(Base):
+    """
+    Actual measurement against a KPI target — extends the KPI *target*
+    already captured at ProjectKnowledge.kpis (Phase 2: [{name, target,
+    unit}]) with tracked *actuals* over time, project-level performance
+    management (PRD §17) built as a natural continuation of that existing
+    field rather than a duplicate target-setting mechanism.
+    """
+    __tablename__ = "award_performance_records"
+
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    award_id      = Column(String(36), ForeignKey("awards.id"), nullable=False, index=True)
+    kpi_name      = Column(String(255), nullable=False)
+    target        = Column(Float, nullable=True)
+    actual_value  = Column(Float, nullable=True)
+    unit          = Column(String(50), nullable=True)
+    period_label  = Column(String(100), nullable=True)   # e.g. "Q1 2027"
+    notes         = Column(Text, nullable=True)
+    recorded_by   = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AwardCloseout(Base):
+    """
+    Closeout record (PRD §17): deliverables reconciliation, equipment
+    disposition, and structured knowledge capture. Closing an award writes
+    a MemoryRecord (the existing Organizational Memory table, Phase 0) so
+    lessons learned feed the next pursuit's KPI dashboard and semantic
+    search exactly like a proposal outcome does today.
+    """
+    __tablename__ = "award_closeouts"
+
+    id                        = Column(String(36), primary_key=True, default=new_uuid)
+    award_id                  = Column(String(36), ForeignKey("awards.id"), unique=True, nullable=False)
+    deliverables_reconciled   = Column(Boolean, default=False, nullable=False)
+    deliverables_notes        = Column(Text, nullable=True)
+    equipment_disposition     = Column(Text, nullable=True)
+    final_report_submitted    = Column(Boolean, default=False, nullable=False)
+    lessons_learned           = Column(JSON, default=list)
+    memory_record_id          = Column(String(36), ForeignKey("memory_records.id"), nullable=True)
+    closed_by                 = Column(String(36), ForeignKey("users.id"), nullable=True)
+    closed_at                 = Column(DateTime(timezone=True), nullable=True)
+    created_at                = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ── Phase 6 — Integrations & Marketplace (Clariva Enterprise™ PRD §19-20) ──────
+# One uniform `ConnectorConnection` row represents any external integration —
+# a generic outbound webhook, a Slack/Teams incoming-webhook URL, or a
+# placeholder for an OAuth-based service (Microsoft 365, Google Workspace,
+# Salesforce, HubSpot, DocuSign, Adobe Sign, financial ERPs) this environment
+# has no real credentials for. See engines/connector_engine.py's
+# CONNECTOR_TYPES registry for which types actually dispatch vs. degrade to
+# "not configured" — the same graceful-degradation pattern SAM.gov
+# established in Phase 4. This table IS the "webhook engine for outbound
+# events" the PRD's platform-surface bullet calls for; there is no separate
+# webhook-subscription table.
+
+class ConnectorConnection(Base):
+    __tablename__ = "connector_connections"
+
+    id             = Column(String(36), primary_key=True, default=new_uuid)
+    org_id         = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    # webhook | slack | teams | ms365 | google_workspace | salesforce | hubspot | docusign | adobe_sign | financial_erp
+    connector_type = Column(String(30), nullable=False)
+    name           = Column(String(255), nullable=False)
+    # Type-specific settings — {"target_url", "secret"} for webhook,
+    # {"webhook_url"} for slack/teams. OAuth-based types store nothing
+    # meaningful here yet (no real credential flow to store).
+    config         = Column(JSON, default=dict, nullable=False)
+    # Which audit-log `action` strings (see audit.py::log_action) this
+    # connector fires on. Empty/null list = all events.
+    event_types    = Column(JSON, nullable=True)
+    active         = Column(Boolean, default=True, nullable=False)
+    last_tested_at = Column(DateTime(timezone=True), nullable=True)
+    last_error     = Column(Text, nullable=True)
+    created_by     = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at     = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class ConnectorEventLog(Base):
+    """Dispatch history — one row per attempted delivery, for observability
+    and debugging (was this webhook actually fired? did it succeed?)."""
+    __tablename__ = "connector_event_logs"
+
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    connector_id  = Column(String(36), ForeignKey("connector_connections.id"), nullable=False, index=True)
+    event_type    = Column(String(100), nullable=False)
+    payload       = Column(JSON, nullable=True)
+    success       = Column(Boolean, nullable=False, default=False)
+    status_code   = Column(Integer, nullable=True)
+    error         = Column(Text, nullable=True)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ApiKey(Base):
+    """
+    Public API credential (PRD §19: "a versioned public API... enabling a
+    partner/marketplace ecosystem"). Keys are org- and role-scoped — a key
+    created with role="viewer" gets exactly that role's rbac.py permissions
+    on the public API surface, never more than the issuing owner's own
+    access. Only `key_hash` (SHA-256, deterministic so it can be looked up
+    by equality) is ever stored; the plaintext key is shown to the user
+    exactly once, at creation.
+    """
+    __tablename__ = "api_keys"
+
+    id           = Column(String(36), primary_key=True, default=new_uuid)
+    org_id       = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    name         = Column(String(255), nullable=False)
+    key_prefix   = Column(String(12), nullable=False)   # shown alongside the name so a user can tell keys apart
+    key_hash     = Column(String(64), nullable=False, unique=True, index=True)
+    role         = Column(String(20), nullable=False, default="viewer")  # owner | editor | viewer — capped at creator's own role
+    created_by   = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at   = Column(DateTime(timezone=True), nullable=True)
+
+
+class MarketplaceListing(Base):
+    """
+    Listing groundwork only (PRD §20: Marketplace is explicitly framed as
+    "a future revenue channel") — browsable listings with no payment
+    processing or install flow yet, same scoping discipline as SSO's
+    schema-only Phase 1 treatment.
+    """
+    __tablename__ = "marketplace_listings"
+
+    id             = Column(String(36), primary_key=True, default=new_uuid)
+    # Null = a platform-provided listing rather than a third-party vendor's.
+    vendor_org_id  = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    # template_pack | connector | ai_capability
+    listing_type   = Column(String(30), nullable=False)
+    name           = Column(String(255), nullable=False)
+    description    = Column(Text, nullable=True)
+    price_cents    = Column(Integer, nullable=True)   # null = free/contact-for-pricing
+    currency       = Column(String(10), nullable=False, default="usd")
+    # draft | published | archived
+    status         = Column(String(20), nullable=False, default="draft")
+    created_by     = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at     = Column(DateTime(timezone=True), onupdate=func.now())

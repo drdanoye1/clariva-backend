@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     ANTHROPIC_API_KEY: str = ""
 
+    # Funding Intelligence (Phase 4, PRD §15/§19) — Grants.gov's search2/
+    # fetchOpportunity APIs are public and need no key. SAM.gov's opportunity
+    # API does; sync_sam_gov() gracefully no-ops (reports "not configured")
+    # when this is left blank, same "degrade gracefully" pattern as every
+    # other optional integration in this codebase.
+    SAM_GOV_API_KEY: str = ""
+
     # Database — Neon PostgreSQL (set in .env / Heroku config vars)
     DATABASE_URL: str = "sqlite+aiosqlite:///./sbir_platform.db"   # fallback for local-only dev
     SYNC_DATABASE_URL: str = ""

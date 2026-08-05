@@ -10,8 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from database import get_db
-from models.db_models import Organization, OrgMembership, OrgProposal, Proposal, User
+from models.db_models import AuditLog, Organization, OrgMembership, OrgProposal, Proposal, User
+from models.schemas import OrganizationBrandingOut, OrganizationBrandingUpdate
 from routers.auth import get_current_user
+from audit import log_action
+from rbac import ROLES, is_valid_role, roles_with_permission
 
 router = APIRouter()
 
@@ -41,6 +44,20 @@ class InviteRequest(BaseModel):
 
 class ShareProposalRequest(BaseModel):
     proposal_id: str
+
+class RoleUpdateRequest(BaseModel):
+    role: str  # owner | editor | viewer
+
+class AuditLogOut(BaseModel):
+    id: str
+    actor_id: str
+    actor_email: Optional[str] = None
+    actor_name: Optional[str] = None
+    action: str
+    object_type: Optional[str] = None
+    object_id: Optional[str] = None
+    detail: Optional[dict] = None
+    created_at: Optional[str] = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -72,6 +89,10 @@ async def create_organization(
     )
     db.add(membership)
     await db.flush()
+
+    await log_action(db, actor_id=current_user.id, action="org.created",
+                      org_id=org.id, object_type="organization", object_id=org.id,
+                      detail={"name": org.name})
 
     return {"id": org.id, "name": org.name, "role": "owner"}
 
@@ -154,11 +175,10 @@ async def invite_member(
     current_user: User = Depends(get_current_user),
 ):
     """Invite a registered user to the organization by email."""
-    await _assert_role(org_id, current_user.id, ["owner", "editor"], db)
+    await _assert_permission(org_id, current_user.id, "invite_members", db)
 
-    VALID_ROLES = {"owner", "editor", "viewer"}
-    if body.role not in VALID_ROLES:
-        raise HTTPException(status_code=400, detail=f"Invalid role. Choose: {', '.join(VALID_ROLES)}")
+    if not is_valid_role(body.role):
+        raise HTTPException(status_code=400, detail=f"Invalid role. Choose: {', '.join(ROLES)}")
 
     # Look up the invitee
     target_result = await db.execute(select(User).where(User.email == body.email))
@@ -183,6 +203,10 @@ async def invite_member(
     db.add(membership)
     await db.flush()
 
+    await log_action(db, actor_id=current_user.id, action="member.invited",
+                      org_id=org_id, object_type="user", object_id=target.id,
+                      detail={"role": body.role, "email": target.email})
+
     return {"message": f"{target.full_name} added as {body.role}.", "user_id": target.id}
 
 
@@ -193,7 +217,7 @@ async def remove_member(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _assert_role(org_id, current_user.id, ["owner"], db)
+    await _assert_permission(org_id, current_user.id, "remove_members", db)
     if user_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot remove yourself. Transfer ownership first.")
     result = await db.execute(
@@ -204,6 +228,88 @@ async def remove_member(
         raise HTTPException(status_code=404, detail="Member not found.")
     await db.delete(m)
 
+    await log_action(db, actor_id=current_user.id, action="member.removed",
+                      org_id=org_id, object_type="user", object_id=user_id)
+
+
+@router.patch("/{org_id}/members/{user_id}/role")
+async def update_member_role(
+    org_id: str,
+    user_id: str,
+    body: RoleUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Change a member's role. Requires manage_roles (owner today)."""
+    await _assert_permission(org_id, current_user.id, "manage_roles", db)
+
+    if not is_valid_role(body.role):
+        raise HTTPException(status_code=400, detail=f"Invalid role. Choose: {', '.join(ROLES)}")
+
+    target = await _get_membership(org_id, user_id, db)
+    if target.role == body.role:
+        return {"message": "No change.", "user_id": user_id, "role": body.role}
+
+    if target.role == "owner" and body.role != "owner":
+        # Never allow the last owner to be demoted — an org must always
+        # have at least one owner able to manage it.
+        owners_result = await db.execute(
+            select(OrgMembership).where(OrgMembership.org_id == org_id, OrgMembership.role == "owner")
+        )
+        if len(owners_result.scalars().all()) <= 1:
+            raise HTTPException(status_code=400, detail="Cannot demote the only owner. Promote another member to owner first.")
+
+    previous_role = target.role
+    target.role = body.role
+    await db.flush()
+
+    await log_action(db, actor_id=current_user.id, action="member.role_changed",
+                      org_id=org_id, object_type="user", object_id=user_id,
+                      detail={"from": previous_role, "to": body.role})
+
+    return {"message": f"Role updated to {body.role}.", "user_id": user_id, "role": body.role}
+
+
+@router.get("/{org_id}/audit-log", response_model=List[AuditLogOut])
+async def get_audit_log(
+    org_id: str,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _assert_permission(org_id, current_user.id, "view_audit_log", db)
+
+    result = await db.execute(
+        select(AuditLog)
+        .where(AuditLog.org_id == org_id)
+        .order_by(AuditLog.created_at.desc())
+        .limit(min(limit, 500))
+    )
+    entries = result.scalars().all()
+
+    # Join actor email/name for display without a separate frontend round-trip.
+    actor_ids = {e.actor_id for e in entries}
+    actors: dict = {}
+    if actor_ids:
+        u_result = await db.execute(select(User).where(User.id.in_(actor_ids)))
+        actors = {u.id: u for u in u_result.scalars().all()}
+
+    out = []
+    for e in entries:
+        actor = actors.get(e.actor_id)
+        out.append(AuditLogOut(
+            id=e.id,
+            actor_id=e.actor_id,
+            actor_email=actor.email if actor else None,
+            actor_name=actor.full_name if actor else None,
+            action=e.action,
+            object_type=e.object_type,
+            object_id=e.object_id,
+            detail=e.detail,
+            created_at=e.created_at.isoformat() if e.created_at else None,
+        ))
+    return out
+
 
 @router.post("/{org_id}/proposals")
 async def share_proposal(
@@ -213,7 +319,7 @@ async def share_proposal(
     current_user: User = Depends(get_current_user),
 ):
     """Share one of the user's proposals with the organization."""
-    await _assert_role(org_id, current_user.id, ["owner", "editor"], db)
+    await _assert_permission(org_id, current_user.id, "share_proposals", db)
 
     # Verify proposal belongs to user
     p_result = await db.execute(
@@ -237,6 +343,10 @@ async def share_proposal(
     )
     db.add(link)
     await db.flush()
+
+    await log_action(db, actor_id=current_user.id, action="proposal.shared",
+                      org_id=org_id, object_type="proposal", object_id=body.proposal_id)
+
     return {"message": "Proposal shared successfully."}
 
 
@@ -287,3 +397,57 @@ async def _assert_role(org_id: str, user_id: str, allowed_roles: List[str], db: 
     if m.role not in allowed_roles:
         raise HTTPException(status_code=403, detail=f"Requires role: {' or '.join(allowed_roles)}.")
     return m
+
+async def _assert_permission(org_id: str, user_id: str, permission: str, db: AsyncSession) -> OrgMembership:
+    """RBAC entry point (see rbac.py) — resolves a permission to its allowed
+    roles and delegates to _assert_role, so every permission check in this
+    router reads from the one registry instead of a hardcoded role list."""
+    return await _assert_role(org_id, user_id, roles_with_permission(permission), db)
+
+
+# ── White-label branding (Phase 6, PRD §20) ─────────────────────────────────
+# Any member may view an org's branding (it's what the org looks like to
+# everyone in it); only "manage_branding" (owner-only, see rbac.py) may
+# change it — it's part of the org's identity, not day-to-day
+# collaboration work.
+
+async def _get_org_or_404(org_id: str, db: AsyncSession) -> Organization:
+    result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return org
+
+
+@router.get("/{org_id}/branding", response_model=OrganizationBrandingOut)
+async def get_branding(
+    org_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    await _assert_member(org_id, current_user.id, db)
+    org = await _get_org_or_404(org_id, db)
+    return OrganizationBrandingOut(
+        org_id=org.id, white_label_enabled=org.white_label_enabled,
+        brand_name=org.brand_name, logo_url=org.logo_url, primary_color=org.primary_color,
+    )
+
+
+@router.patch("/{org_id}/branding", response_model=OrganizationBrandingOut)
+async def update_branding(
+    org_id: str, body: OrganizationBrandingUpdate,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    await _assert_permission(org_id, current_user.id, "manage_branding", db)
+    org = await _get_org_or_404(org_id, db)
+    for field in ("white_label_enabled", "brand_name", "logo_url", "primary_color"):
+        value = getattr(body, field)
+        if value is not None:
+            setattr(org, field, value)
+    await db.flush()
+    await db.refresh(org)
+    await log_action(db, actor_id=current_user.id, action="org.branding_updated", org_id=org_id,
+                      object_type="organization", object_id=org_id)
+    await db.commit()
+    return OrganizationBrandingOut(
+        org_id=org.id, white_label_enabled=org.white_label_enabled,
+        brand_name=org.brand_name, logo_url=org.logo_url, primary_color=org.primary_color,
+    )

@@ -29,7 +29,15 @@ class FOATemplateBuilderEngine:
         raw_sections = parsed.get("ordered_sections", [])
         weights      = parsed.get("weights", {})
 
-        # Build FOASection objects with enriched metadata
+        # Build FOASection objects with enriched metadata.
+        # Raw weights come from FOA parsing (often GPT-4o's JSON output) and
+        # aren't guaranteed to be well-formed fractions — e.g. a weight
+        # meant as "20%" occasionally comes back as 20 instead of 0.2.
+        # FOASection.evaluation_weight is constrained to [0, 1], so an
+        # out-of-range raw value would otherwise raise a ValidationError and
+        # abort proposal creation entirely, before _normalize_weights() ever
+        # gets a chance to fix the proportions below. Clamp defensively here;
+        # normalization still restores correct relative weighting afterward.
         sections = [
             FOASection(
                 section_id=s.get("section_id", f"section_{i}"),
@@ -37,9 +45,9 @@ class FOATemplateBuilderEngine:
                 required=s.get("required", True),
                 page_limit=s.get("page_limit"),
                 guidance=self._enrich_guidance(s, agency, phase),
-                evaluation_weight=weights.get(
+                evaluation_weight=max(0.0, min(1.0, weights.get(
                     s.get("section_id", ""), s.get("evaluation_weight", 0.1)
-                ),
+                ))),
             )
             for i, s in enumerate(raw_sections)
         ]

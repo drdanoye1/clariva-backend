@@ -14,6 +14,7 @@ from sqlalchemy import create_engine
 
 from config import settings
 from models.db_models import Base
+from migrations import COLUMN_MIGRATIONS, POSTGRES_ONLY_STATEMENTS
 
 
 _db_url = settings.DATABASE_URL
@@ -75,38 +76,31 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def create_tables() -> None:
-    """Create all tables on startup."""
+    """
+    Create all tables on startup, then bring existing tables up to date.
+
+    This is the single, standing schema-migration path for Clariva (Clariva
+    Enterprise™ PRD, Phase 0 — Foundation Hardening): it runs automatically
+    on every boot in every environment (local SQLite, Railway/Heroku
+    PostgreSQL), and migrate_db.py is a manual CLI wrapper around this exact
+    function for offline/one-off use. The column list itself lives in
+    migrations.py — add new columns there, not here.
+    """
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
         if _is_sqlite:
-            # SQLite: add columns introduced after initial schema
-            await _sqlite_add_column_if_missing(
-                conn, "proposals", "grant_type", "VARCHAR(30) DEFAULT 'sbir'"
-            )
+            for table, column, sqlite_def, _pg_def in COLUMN_MIGRATIONS:
+                await _sqlite_add_column_if_missing(conn, table, column, sqlite_def)
         else:
             # PostgreSQL: idempotent column migrations
-            for col_sql in [
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_superadmin BOOLEAN NOT NULL DEFAULT FALSE",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(30) NOT NULL DEFAULT 'user'",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_plan VARCHAR(30) NOT NULL DEFAULT 'free'",
-                # Taxonomy ground truth — grant wizard Steps 1/2/3
-                "ALTER TABLE proposals ADD COLUMN IF NOT EXISTS beneficiary_type VARCHAR(100)",
-                "ALTER TABLE proposals ADD COLUMN IF NOT EXISTS funder_class VARCHAR(100)",
-                "ALTER TABLE proposals ADD COLUMN IF NOT EXISTS program_label VARCHAR(300)",
-                "ALTER TABLE proposals ADD COLUMN IF NOT EXISTS program_size VARCHAR(50)",
-                "ALTER TABLE proposals ADD COLUMN IF NOT EXISTS grantor_name VARCHAR(200)",
-                # Widen agency column to accommodate non-SBIR agency codes
-                "ALTER TABLE proposals ALTER COLUMN agency TYPE VARCHAR(30)",
-                # FOA records — grant_type added after initial schema
-                "ALTER TABLE foa_records ADD COLUMN IF NOT EXISTS grant_type VARCHAR(30) NOT NULL DEFAULT 'sbir'",
-                # Budget records — fee_rate and cached totals may be missing from older schema
-                "ALTER TABLE budget_records ADD COLUMN IF NOT EXISTS fee_rate FLOAT DEFAULT 7.0",
-                "ALTER TABLE budget_records ADD COLUMN IF NOT EXISTS total_direct FLOAT DEFAULT 0.0",
-                "ALTER TABLE budget_records ADD COLUMN IF NOT EXISTS total_indirect FLOAT DEFAULT 0.0",
-                "ALTER TABLE budget_records ADD COLUMN IF NOT EXISTS total_cost FLOAT DEFAULT 0.0",
-            ]:
-                await _pg_exec(conn, col_sql)
+            for table, column, _sqlite_def, pg_def in COLUMN_MIGRATIONS:
+                await _pg_exec(
+                    conn,
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {pg_def}",
+                )
+            for stmt in POSTGRES_ONLY_STATEMENTS:
+                await _pg_exec(conn, stmt)
 
 
 async def _pg_exec(conn, sql: str) -> None:

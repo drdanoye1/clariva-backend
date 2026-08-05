@@ -19,6 +19,9 @@ from engines.grant_templates import get_sections as get_grant_sections, list_gra
 from routers.auth import get_current_user
 from engines.proposal_generator import ProposalGeneratorEngine
 from engines.workflow_engine import WorkflowEngine
+from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
+from routers.organizations import _assert_member
+from audit import log_action
 
 
 class ProposalUpdate(BaseModel):
@@ -39,9 +42,10 @@ class SectionEdit(BaseModel):
     content: str
 
 
-router    = APIRouter()
-generator = ProposalGeneratorEngine()
-workflow  = WorkflowEngine()
+router        = APIRouter()
+generator     = ProposalGeneratorEngine()
+workflow      = WorkflowEngine()
+credit_engine = CreditEngine()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -267,10 +271,22 @@ async def get_proposal(
 async def generate_section(
     proposal_id: str,
     body: SectionGenerateRequest,
+    org_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """
+    org_id is optional and additive: pass it to meter this generation call
+    against that organization's shared AI credit pool (Clariva Enterprise™
+    PRD §13). Omit it (as every existing caller does today) and generation
+    behaves exactly as before — unmetered personal use. Not automatically
+    tied to org-shared proposals; the caller decides which pool to charge.
+    """
     proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
+    if org_id:
+        await _assert_member(org_id, current_user.id, db)
+        await debit_or_402(credit_engine, db, org_id, current_user.id, GENERATION_COST,
+                            reason=f"proposal_generation:section:{body.section_id}")
     company_profile = await _load_company_profile(current_user.id, db)
 
     sec_result = await db.execute(
@@ -310,9 +326,11 @@ async def generate_section(
 @router.post("/{proposal_id}/generate-all", response_model=ProposalOut)
 async def generate_all_sections(
     proposal_id: str,
+    org_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """See generate_section() for the org_id / credit-metering contract."""
     proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
     company_profile = await _load_company_profile(current_user.id, db)
 
@@ -325,6 +343,12 @@ async def generate_all_sections(
 
     # Only generate sections that are empty — skip already-filled ones
     empty_sections = [s for s in sections if not (s.content and s.content.strip())]
+
+    if empty_sections and org_id:
+        await _assert_member(org_id, current_user.id, db)
+        await debit_or_402(credit_engine, db, org_id, current_user.id,
+                            GENERATION_COST * len(empty_sections),
+                            reason=f"proposal_generation:all:{proposal_id}")
 
     if empty_sections:
         # Fire all AI calls in parallel — reduces total time from O(n*15s) to O(15s)
@@ -438,6 +462,9 @@ async def delete_proposal(
     current_user: User = Depends(get_current_user),
 ):
     proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
+    await log_action(db, actor_id=current_user.id, action="proposal.deleted",
+                      object_type="proposal", object_id=proposal_id,
+                      detail={"title": proposal.title})
     await db.delete(proposal)
 
 
@@ -520,6 +547,9 @@ async def approve_proposal(
         )
 
     proposal.status = "approved"
+    await log_action(db, actor_id=current_user.id, action="proposal.approved",
+                      object_type="proposal", object_id=proposal_id,
+                      detail={"approver": body.approver_name})
     await db.commit()
     return {
         "proposal_id": proposal_id,

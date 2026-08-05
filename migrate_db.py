@@ -1,51 +1,41 @@
 """
-Database migration script — safe to run multiple times (idempotent).
-Adds new columns to org_contexts table introduced in the profile expansion.
+Clariva — Manual database migration CLI.
+
+This is the manual/offline entry point into the SAME idempotent migration
+logic that runs automatically every time the app boots (see
+database.py::create_tables()). It is safe to run at any time, any number of
+times, against SQLite (local dev) or PostgreSQL (staging/production) — it
+only creates missing tables/columns and never drops or overwrites data.
 
 Usage:
     cd backend
-    python3 migrate_db.py
+    python migrate_db.py                                    # local — uses DATABASE_URL from .env
+    heroku run python migrate_db.py --app atifixia-api       # apply against production without a redeploy
+
+All schema changes are defined in migrations.py (COLUMN_MIGRATIONS /
+POSTGRES_ONLY_STATEMENTS) — add a new entry there, not in this file.
 """
-import sqlite3
-import os
+from __future__ import annotations
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "sbir_platform.db")
+import asyncio
+import logging
 
-MIGRATIONS = [
-    ("company_capabilities",  "ALTER TABLE org_contexts ADD COLUMN company_capabilities TEXT"),
-    ("pi_orcid",              "ALTER TABLE org_contexts ADD COLUMN pi_orcid VARCHAR(25)"),
-    ("pi_degree",             "ALTER TABLE org_contexts ADD COLUMN pi_degree VARCHAR(100)"),
-    ("pi_affiliation",        "ALTER TABLE org_contexts ADD COLUMN pi_affiliation VARCHAR(255)"),
-    ("pi_publications",       "ALTER TABLE org_contexts ADD COLUMN pi_publications INTEGER"),
-    ("pi_prior_sbir_awards",  "ALTER TABLE org_contexts ADD COLUMN pi_prior_sbir_awards INTEGER"),
-    ("team_members",          "ALTER TABLE org_contexts ADD COLUMN team_members JSON DEFAULT '[]'"),
-    ("facilities",            "ALTER TABLE org_contexts ADD COLUMN facilities JSON DEFAULT '[]'"),
-    ("partners",              "ALTER TABLE org_contexts ADD COLUMN partners JSON DEFAULT '[]'"),
-    ("past_performance",      "ALTER TABLE org_contexts ADD COLUMN past_performance JSON DEFAULT '[]'"),
-    # Organizations tables (safe to skip if already exist — handled by SQLAlchemy CREATE IF NOT EXISTS)
-]
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-def migrate():
-    print(f"Connecting to: {DB_PATH}")
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
 
-    c.execute("PRAGMA table_info(org_contexts)")
-    existing_cols = {row[1] for row in c.fetchall()}
+async def main() -> None:
+    # Imported inside main() so `python migrate_db.py --help`-style tooling
+    # doesn't need the full app dependency stack importable at parse time.
+    from database import create_tables, settings
 
-    for col_name, sql in MIGRATIONS:
-        if col_name not in existing_cols:
-            c.execute(sql)
-            print(f"  ✓ Added column: {col_name}")
-        else:
-            print(f"  - Already exists: {col_name}")
+    target = settings.DATABASE_URL
+    if "@" in target:  # don't print credentials embedded in a Postgres URL
+        target = target.split("@", 1)[1]
 
-    conn.commit()
+    print(f"Clariva schema migration — target database: {target}")
+    await create_tables()
+    print("Migration complete — schema is up to date.")
 
-    c.execute("PRAGMA table_info(org_contexts)")
-    final_cols = [row[1] for row in c.fetchall()]
-    print(f"\n✓ Migration complete. org_contexts now has {len(final_cols)} columns.")
-    conn.close()
 
 if __name__ == "__main__":
-    migrate()
+    asyncio.run(main())

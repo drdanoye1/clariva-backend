@@ -18,7 +18,8 @@ from routers import (
     documents, memory, organizations, profile,
     extract, budget, budget_export, payments, admin,
 )
-from routers import suggest
+from routers import suggest, credits, scope_of_work, collaboration, documents_library, funding_intelligence, awards
+from routers import connectors, api_keys, public_api, marketplace
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -90,11 +91,13 @@ app.add_middleware(
 app.include_router(auth.router,          prefix="/api/v1/auth",          tags=["Auth"])
 app.include_router(foa.router,           prefix="/api/v1/foa",           tags=["FOA"])
 app.include_router(proposals.router,     prefix="/api/v1/proposals",     tags=["Proposals"])
+app.include_router(scope_of_work.router, prefix="/api/v1/proposals",     tags=["Scope of Work"])
 app.include_router(scoring.router,       prefix="/api/v1/scoring",       tags=["Scoring"])
 app.include_router(reviewer.router,      prefix="/api/v1/reviewer",      tags=["Reviewer Simulation"])
 app.include_router(documents.router,     prefix="/api/v1/documents",     tags=["Document Export"])
 app.include_router(memory.router,        prefix="/api/v1/memory",        tags=["Memory & KPI"])
 app.include_router(organizations.router, prefix="/api/v1/organizations", tags=["Organizations"])
+app.include_router(credits.router,       prefix="/api/v1/organizations", tags=["AI Credits"])
 app.include_router(profile.router,       prefix="/api/v1/profile",       tags=["Company Profile"])
 app.include_router(extract.router,       prefix="/api/v1/extract",       tags=["Document Extraction"])
 app.include_router(budget.router,        prefix="/api/v1/budget",        tags=["Budget Builder"])
@@ -102,6 +105,14 @@ app.include_router(budget_export.router, prefix="/api/v1/budget",        tags=["
 app.include_router(payments.router,      prefix="/api/v1/payments",      tags=["Payments"])
 app.include_router(admin.router,         prefix="/api/v1/admin",         tags=["Admin"])
 app.include_router(suggest.router,       prefix="/api/v1/suggest",       tags=["AI Suggestions"])
+app.include_router(collaboration.router, prefix="/api/v1",               tags=["Collaboration"])
+app.include_router(documents_library.router, prefix="/api/v1",           tags=["Document Library"])
+app.include_router(funding_intelligence.router, prefix="/api/v1/funding", tags=["Funding Intelligence"])
+app.include_router(awards.router,        prefix="/api/v1/awards",        tags=["Award & Project Management"])
+app.include_router(connectors.router,    prefix="/api/v1/connectors",    tags=["Connectors & Webhooks"])
+app.include_router(api_keys.router,      prefix="/api/v1/organizations", tags=["API Keys"])
+app.include_router(public_api.router,    prefix="/api/v1/public",        tags=["Public API"])
+app.include_router(marketplace.router,   prefix="/api/v1/marketplace",   tags=["Marketplace"])
 
 
 @app.get("/health", tags=["Health"])

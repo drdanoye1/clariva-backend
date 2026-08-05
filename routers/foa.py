@@ -1,28 +1,87 @@
-"""FOA router — upload, parse, retrieve funding opportunity announcements."""
+"""
+FOA router — upload, parse, retrieve funding opportunity announcements.
+
+Phase 4 (Clariva Enterprise™ PRD §15) extends this router additively with
+the pre-award pipeline surface — pipeline-stage transitions, Bid/No-Go
+decisions, org-sharing, filtered listing, solicitation comparison, and
+"enrich" (AI-parse a lightweight Grants.gov-synced record into a full
+template on demand). The three existing creation endpoints below
+(upload/parse-text/parse-url) are untouched: every new FOARecord column is
+nullable/defaulted at the model layer, so they keep inserting exactly as
+before. See engines/funding_intelligence_engine.py (Engine 15) and
+routers/funding_intelligence.py for sync/watchlists/reporting.
+"""
 
 from __future__ import annotations
 
 import re
 import uuid
+from datetime import datetime
 from html.parser import HTMLParser
-from typing import List
+from typing import List, Optional
 
 import httpx
 import openai
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from database import get_db
 from models.db_models import FOARecord, User
-from models.schemas import FOATemplate, FOAUploadResponse
+from models.schemas import (
+    BidNoGoRequest, FOARecordOut, FOATemplate, FOAUploadResponse,
+    PipelineStageEventOut, PipelineStageUpdateRequest,
+)
 from routers.auth import get_current_user
+from routers.organizations import _assert_member, _assert_permission
 from engines.foa_parser import FOAParserEngine
 from engines.template_builder import FOATemplateBuilderEngine
+from engines.funding_intelligence_engine import FundingIntelligenceEngine
 
 router = APIRouter()
 parser  = FOAParserEngine()
 builder = FOATemplateBuilderEngine()
+funding = FundingIntelligenceEngine()
+
+
+def _to_foa_out(record: FOARecord) -> FOARecordOut:
+    return FOARecordOut(
+        id=record.id, org_id=record.org_id, agency=record.agency, program_title=record.program_title,
+        solicitation_number=record.solicitation_number, phase=record.phase, grant_type=record.grant_type,
+        total_page_limit=record.total_page_limit, deadline=record.deadline, source=record.source,
+        external_id=record.external_id, external_url=record.external_url,
+        estimated_award_floor=record.estimated_award_floor, estimated_award_ceiling=record.estimated_award_ceiling,
+        eligibility_summary=record.eligibility_summary, pipeline_stage=record.pipeline_stage,
+        bid_no_go_decision=record.bid_no_go_decision, bid_no_go_rationale=record.bid_no_go_rationale,
+        assigned_to=record.assigned_to, uploaded_by=record.uploaded_by, last_synced_at=record.last_synced_at,
+        created_at=record.created_at, has_parsed_template=record.parsed_template is not None,
+    )
+
+
+async def _get_foa_or_404(db: AsyncSession, foa_id: str) -> FOARecord:
+    result = await db.execute(select(FOARecord).where(FOARecord.id == foa_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    return record
+
+
+async def _assert_foa_access(record: FOARecord, current_user: User, db: AsyncSession, permission: Optional[str] = None) -> None:
+    """
+    The uploader always has access — this preserves today's personal-use
+    behavior unchanged. For an org-shared record (org_id set), any org
+    member may view it; pass `permission` to additionally require a
+    specific rbac permission (e.g. "manage_pipeline") for mutating actions.
+    """
+    if record.uploaded_by == current_user.id:
+        return
+    if record.org_id:
+        if permission:
+            await _assert_permission(record.org_id, current_user.id, permission, db)
+        else:
+            await _assert_member(record.org_id, current_user.id, db)
+        return
+    raise HTTPException(status_code=404, detail="Opportunity not found")
 
 
 def _clean_parse_error(exc: Exception) -> HTTPException:
@@ -281,16 +340,64 @@ async def parse_foa_url(
     )
 
 
+@router.get("/pipeline", response_model=List[FOARecordOut])
+async def list_pipeline(
+    org_id: Optional[str] = None, pipeline_stage: Optional[str] = None,
+    source: Optional[str] = None, assigned_to: Optional[str] = None,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """
+    The pipeline view (PRD §15) — distinct from the legacy `GET /` list
+    above, which only ever returned the current user's own uploads as bare
+    dicts. This returns the full FOARecordOut shape (pipeline stage,
+    Bid/No-Go, sync metadata) and, when `org_id` is given, the whole org's
+    shared pipeline rather than just "my" records.
+    """
+    if org_id:
+        await _assert_member(org_id, current_user.id, db)
+    records = await funding.list_pipeline(
+        db, org_id=org_id, uploaded_by=None if org_id else current_user.id,
+        pipeline_stage=pipeline_stage, source=source, assigned_to=assigned_to,
+    )
+    return [_to_foa_out(r) for r in records]
+
+
+@router.get("/compare", response_model=List[FOARecordOut])
+async def compare_foas(
+    ids: str = Query(..., description="Comma-separated FOA record IDs"),
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Solicitation comparison (PRD §15) — fetch several opportunity
+    records side by side in one call."""
+    foa_ids = [i.strip() for i in ids.split(",") if i.strip()]
+    if not foa_ids:
+        raise HTTPException(status_code=400, detail="Provide at least one FOA id via ?ids=")
+    records = await funding.compare(db, foa_ids)
+    accessible = []
+    for r in records:
+        try:
+            await _assert_foa_access(r, current_user, db)
+            accessible.append(r)
+        except HTTPException:
+            continue  # silently skip records this user can't see, rather than 403ing the whole comparison
+    return [_to_foa_out(r) for r in accessible]
+
+
 @router.get("/{foa_id}", response_model=FOATemplate)
 async def get_foa(
     foa_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(select(FOARecord).where(FOARecord.id == foa_id))
-    record = result.scalar_one_or_none()
-    if not record:
-        raise HTTPException(status_code=404, detail="FOA not found")
+    record = await _get_foa_or_404(db, foa_id)
+    await _assert_foa_access(record, current_user, db)
+    if record.parsed_template is None:
+        raise HTTPException(
+            status_code=400,
+            detail="This opportunity hasn't been AI-parsed into a template yet. "
+                   "Use POST /foa/{foa_id}/enrich (or the compare/pipeline endpoints "
+                   "for its metadata) first.",
+        )
     return FOATemplate(**record.parsed_template)
 
 
@@ -317,3 +424,119 @@ async def list_foas(
         }
         for r in rows
     ]
+
+
+# ── Phase 4 — Pre-award pipeline (PRD §15) ───────────────────────────────────
+
+@router.patch("/{foa_id}/pipeline-stage", response_model=FOARecordOut)
+async def update_pipeline_stage(
+    foa_id: str, body: PipelineStageUpdateRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    record = await _get_foa_or_404(db, foa_id)
+    await _assert_foa_access(record, current_user, db, permission="manage_pipeline")
+    updated = await funding.update_pipeline_stage(db, foa_id, body.stage, current_user.id, body.notes)
+    return _to_foa_out(updated)
+
+
+@router.patch("/{foa_id}/bid-no-go", response_model=FOARecordOut)
+async def set_bid_no_go(
+    foa_id: str, body: BidNoGoRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    record = await _get_foa_or_404(db, foa_id)
+    await _assert_foa_access(record, current_user, db, permission="manage_pipeline")
+    updated = await funding.set_bid_no_go(db, foa_id, body.decision, body.rationale, current_user.id)
+    return _to_foa_out(updated)
+
+
+@router.patch("/{foa_id}/assign", response_model=FOARecordOut)
+async def assign_opportunity(
+    foa_id: str, assigned_to: Optional[str] = Body(None, embed=True),
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    record = await _get_foa_or_404(db, foa_id)
+    await _assert_foa_access(record, current_user, db, permission="manage_pipeline")
+    record.assigned_to = assigned_to
+    await db.flush()
+    await db.refresh(record)
+    return _to_foa_out(record)
+
+
+@router.post("/{foa_id}/share", response_model=FOARecordOut)
+async def share_opportunity(
+    foa_id: str, org_id: str = Body(..., embed=True),
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Share a personal opportunity record into an org-wide pipeline —
+    same "must be the owner + hold share_proposals on the target org"
+    contract as organizations.py::share_proposal."""
+    record = await _get_foa_or_404(db, foa_id)
+    if record.uploaded_by != current_user.id:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    if record.org_id:
+        raise HTTPException(status_code=409, detail="This opportunity is already shared with an organization.")
+    await _assert_permission(org_id, current_user.id, "share_proposals", db)
+    record.org_id = org_id
+    await db.flush()
+    await db.refresh(record)
+    return _to_foa_out(record)
+
+
+@router.get("/{foa_id}/stage-history", response_model=List[PipelineStageEventOut])
+async def get_stage_history(
+    foa_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    record = await _get_foa_or_404(db, foa_id)
+    await _assert_foa_access(record, current_user, db)
+    events = await funding.list_stage_events(db, foa_id)
+    return events
+
+
+@router.post("/{foa_id}/enrich", response_model=FOATemplate)
+async def enrich_opportunity(
+    foa_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """
+    Upgrade a lightweight, sync-created opportunity record (source =
+    grants_gov, no parsed_template yet) into a fully AI-parsed template —
+    fetches the opportunity's full synopsis from Grants.gov's public
+    fetchOpportunity API, then runs it through the same parser/builder
+    pipeline as upload/parse-text/parse-url. Updates the existing record
+    in place rather than creating a duplicate.
+    """
+    record = await _get_foa_or_404(db, foa_id)
+    await _assert_foa_access(record, current_user, db, permission="manage_pipeline")
+    if record.source != "grants_gov":
+        raise HTTPException(status_code=400, detail="Enrichment is only available for Grants.gov-synced opportunities.")
+    if not record.external_url:
+        raise HTTPException(status_code=400, detail="This record has no Grants.gov link to enrich from.")
+
+    try:
+        opp_id = record.external_url.rstrip("/").split("/")[-1]
+        detail = await funding.fetch_grants_gov_detail(opp_id)
+        synopsis = detail.get("synopsis") or {}
+        raw_text = _html_to_text(synopsis.get("synopsisDesc") or "") or record.program_title
+        parsed   = await parser.parse(raw_text)
+        template = builder.build(parsed)
+
+        record.raw_text = raw_text[:50000]
+        record.parsed_template = template.model_dump(mode="json")
+        record.total_page_limit = template.total_page_limit
+        if template.deadline:
+            record.deadline = template.deadline
+        record.eligibility_summary = ", ".join(
+            a.get("description", "") for a in (synopsis.get("applicantTypes") or []) if a.get("description")
+        ) or record.eligibility_summary
+        try:
+            record.estimated_award_floor = float(synopsis.get("awardFloor")) if synopsis.get("awardFloor") else record.estimated_award_floor
+            record.estimated_award_ceiling = float(synopsis.get("awardCeiling")) if synopsis.get("awardCeiling") else record.estimated_award_ceiling
+        except (TypeError, ValueError):
+            pass
+        await db.flush()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _clean_parse_error(exc)
+
+    return FOATemplate(**record.parsed_template)
