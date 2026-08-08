@@ -32,7 +32,9 @@ from models.schemas import (
     AwardComplianceItemUpdate, AwardConditionCreate, AwardConditionOut,
     AwardConditionUpdate, AwardCreate, AwardExpenditureCreate, AwardExpenditureOut,
     AwardIntelligenceApplyRequest, AwardIntelligenceDraftOut, AwardOut,
-    AwardPerformanceRecordCreate, AwardPerformanceRecordOut, AwardReportOut,
+    AwardPerformanceRecordCreate, AwardPerformanceRecordOut,
+    AwardReportCreateRequest, AwardReportEditRequest, AwardReportExportOut,
+    AwardReportOut, AwardReportRecordOut, AwardReportSubmitRequest,
     AwardUpdate, BudgetStatusOut, DocumentOut, FOARecordOut, PlannedVsActualOut,
     ProjectBaselineOut, ProjectExecutionStatusOut, ProjectIssueCreate, ProjectIssueOut,
     ProjectIssueUpdate, QuickAwardIntakeRequest, RenewalCreate, ReportNarrativeRequest,
@@ -689,6 +691,82 @@ async def generate_report_narrative(
     narrative = await engine.generate_report_narrative(report, access.proposal, payload.additional_context)
     await db.commit()
     return {"narrative": narrative}
+
+
+# ── Persisted, human-reviewed reports ───────────────────────────────────────
+# GET/POST .../report and .../report/narrative above are an ephemeral
+# preview only — nothing there is saved. Everything below is the actual
+# review workflow: a generated draft must be saved, can be edited, then
+# goes through Phase 3's generic approval flow (POST /api/v1/approvals/
+# {id}/decide in routers/collaboration.py, exactly like amendments — see
+# engines/collaboration_engine.py::decide_approval_request), and only an
+# *approved* report can be exported to a downloadable file.
+
+@router.post("/{award_id}/reports", response_model=AwardReportRecordOut, status_code=201)
+async def create_report_draft(
+    award_id: str, payload: AwardReportCreateRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    award, access = await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    await _meter(access.org_id, current_user.id, db, reason="award_report_draft")
+    report = await engine.create_report_draft(
+        db, award_id, payload.report_type, payload.additional_context,
+        _to_award_out(award, proposal_title=access.proposal.title), requested_by=current_user.id,
+    )
+    await db.commit()
+    await db.refresh(report)
+    return report
+
+
+@router.get("/{award_id}/reports", response_model=List[AwardReportRecordOut])
+async def list_reports(award_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    await _get_award_and_access(award_id, current_user, db, require_edit=False)
+    return await engine.list_award_reports(db, award_id)
+
+
+@router.get("/{award_id}/reports/{report_id}", response_model=AwardReportRecordOut)
+async def get_report_record(
+    award_id: str, report_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    await _get_award_and_access(award_id, current_user, db, require_edit=False)
+    return await engine.get_award_report_or_404(db, report_id)
+
+
+@router.patch("/{award_id}/reports/{report_id}", response_model=AwardReportRecordOut)
+async def edit_report_draft(
+    award_id: str, report_id: str, payload: AwardReportEditRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    report = await engine.update_report_draft(db, report_id, payload.narrative)
+    await db.commit()
+    await db.refresh(report)
+    return report
+
+
+@router.post("/{award_id}/reports/{report_id}/submit", response_model=AwardReportRecordOut)
+async def submit_report_for_approval(
+    award_id: str, report_id: str, payload: AwardReportSubmitRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    award, access = await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    report = await engine.submit_report_for_approval(
+        db, report_id, requested_by=current_user.id, approver_id=payload.approver_id,
+        notes=payload.notes, org_id=access.org_id,
+    )
+    await db.commit()
+    await db.refresh(report)
+    return report
+
+
+@router.post("/{award_id}/reports/{report_id}/export", response_model=AwardReportExportOut)
+async def export_report(
+    award_id: str, report_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    award, access = await _get_award_and_access(award_id, current_user, db, require_edit=False)
+    result = await engine.export_report(db, report_id, created_by=current_user.id, org_id=access.org_id)
+    await db.commit()
+    return result
 
 
 # ── Closeout ─────────────────────────────────────────────────────────────────

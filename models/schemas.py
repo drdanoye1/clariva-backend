@@ -1281,6 +1281,45 @@ class AwardReportOut(BaseModel):
 class ReportNarrativeRequest(BaseModel):
     additional_context: Optional[str] = None
 
+# ── Persisted, human-reviewed reports (see models.db_models.AwardReport) ──────
+# The live AwardReportOut/ReportNarrativeRequest pair above stays as-is for
+# an ephemeral preview (GET .../report, POST .../report/narrative); these
+# cover the actual draft → edit → submit → approve/reject → export
+# workflow so a generated narrative is never exportable without a human
+# reviewing and approving it first.
+
+class AwardReportCreateRequest(BaseModel):
+    report_type: str  # technical | financial | progress | final | commercialization
+    additional_context: Optional[str] = None
+
+class AwardReportEditRequest(BaseModel):
+    narrative: str
+
+class AwardReportSubmitRequest(BaseModel):
+    approver_id: Optional[str] = None  # None = any org member with manage_approvals may decide
+    notes: Optional[str] = None
+
+class AwardReportRecordOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    award_id: str
+    report_type: str
+    status: str  # draft | pending_approval | approved | rejected
+    narrative: str
+    ai_generated_narrative: Optional[str] = None
+    report_data: Optional[Dict[str, Any]] = None
+    requested_by: str
+    approval_request_id: Optional[str] = None
+    exported_file_id: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    decided_at: Optional[datetime] = None
+
+class AwardReportExportOut(BaseModel):
+    download_url: str
+    file_size: int
+    exported_at: datetime
+
 class AwardCloseoutRequest(BaseModel):
     deliverables_reconciled: bool = False
     deliverables_notes: Optional[str] = None

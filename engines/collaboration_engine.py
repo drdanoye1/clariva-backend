@@ -33,8 +33,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.db_models import (
-    ApprovalRequest, Award, AwardAmendment, Comment, Department, Notification,
-    Team, TeamMembership, User, WorkspaceGuestAccess, WorkspaceTask, new_uuid,
+    ApprovalRequest, Award, AwardAmendment, AwardReport, Comment, Department,
+    Notification, Team, TeamMembership, User, WorkspaceGuestAccess, WorkspaceTask,
+    new_uuid,
 )
 
 # Simplest unambiguous @mention syntax: @user@example.com. Matching on
@@ -393,6 +394,19 @@ class CollaborationEngine:
                         for field, value in amendment.effective_changes.items():
                             if hasattr(award, field):
                                 setattr(award, field, value)
+
+        # Phase 5 (cont'd) — Human-in-the-loop post-award reports (PRD §17):
+        # deciding the ApprovalRequest is also what decides the AwardReport,
+        # exactly like award_amendment above. Approval is the only thing
+        # that unlocks AwardEngine.export_report() — a rejected report just
+        # goes back to the requester as a rejected draft-in-spirit; there is
+        # no automatic re-submission.
+        if req.object_type == "award_report":
+            report_result = await db.execute(select(AwardReport).where(AwardReport.id == req.object_id))
+            report = report_result.scalar_one_or_none()
+            if report and report.status == "pending_approval":
+                report.status = req.status
+                report.decided_at = req.decided_at
 
         await db.flush()
         await db.refresh(req)

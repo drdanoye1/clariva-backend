@@ -307,6 +307,150 @@ def test_report_endpoint_returns_structured_view(client, registered_user):
     assert body["narrative"] is None
 
 
+# ── Persisted, human-reviewed reports ───────────────────────────────────────
+# POST .../reports (create_report_draft) makes the same real OpenAI call as
+# POST .../report/narrative above, so — same policy as every other
+# AI-generation endpoint in this suite — the AI call itself is monkeypatched
+# at the shared router-module engine instance (see
+# test_funding_intelligence_api.py for the identical pattern) rather than
+# skipped outright: everything downstream of that call (persistence, edit,
+# submit-for-approval, the existing generic approvals/decide endpoint,
+# and the export gate) is this phase's actual new code and needs coverage.
+
+def _fake_narrative(monkeypatch, text: str = "A fine report narrative.") -> None:
+    import routers.awards as awards_router
+
+    async def fake_generate_report_narrative(report, proposal, additional_context=None):
+        return text
+
+    monkeypatch.setattr(awards_router.engine, "generate_report_narrative", fake_generate_report_narrative)
+
+
+def test_report_draft_edit_submit_approve_export_lifecycle(client, registered_user, monkeypatch):
+    _fake_narrative(monkeypatch, "Draft narrative from the AI.")
+
+    org_id = _create_org(client, registered_user["headers"])
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    _share_proposal(client, org_id, proposal_id, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    approver = _register_and_login(client, "report-approver")
+    _invite_member(client, org_id, registered_user["headers"], approver["email"], "owner")
+
+    # 1. Generating a report persists a draft, not an ephemeral response.
+    create_resp = client.post(
+        f"/api/v1/awards/{award['id']}/reports", json={"report_type": "progress"}, headers=registered_user["headers"],
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    report = create_resp.json()
+    assert report["status"] == "draft"
+    assert report["narrative"] == "Draft narrative from the AI."
+    assert report["ai_generated_narrative"] == "Draft narrative from the AI."
+
+    # 2. Human-in-the-loop: nothing is exportable while still a draft.
+    export_resp = client.post(f"/api/v1/awards/{award['id']}/reports/{report['id']}/export", headers=registered_user["headers"])
+    assert export_resp.status_code == 400
+
+    # 3. A human can edit the AI's narrative before submitting it.
+    edit_resp = client.patch(
+        f"/api/v1/awards/{award['id']}/reports/{report['id']}", json={"narrative": "Human-edited narrative."},
+        headers=registered_user["headers"],
+    )
+    assert edit_resp.status_code == 200, edit_resp.text
+    assert edit_resp.json()["narrative"] == "Human-edited narrative."
+    assert edit_resp.json()["ai_generated_narrative"] == "Draft narrative from the AI."  # original preserved for audit
+
+    # 4. Submit for approval — routes through the same generic ApprovalRequest
+    # workflow amendments use, not a parallel system.
+    submit_resp = client.post(
+        f"/api/v1/awards/{award['id']}/reports/{report['id']}/submit",
+        json={"approver_id": approver["user_id"]}, headers=registered_user["headers"],
+    )
+    assert submit_resp.status_code == 200, submit_resp.text
+    submitted = submit_resp.json()
+    assert submitted["status"] == "pending_approval"
+    approval_request_id = submitted["approval_request_id"]
+    assert approval_request_id
+
+    # A pending report's narrative can no longer be edited.
+    late_edit_resp = client.patch(
+        f"/api/v1/awards/{award['id']}/reports/{report['id']}", json={"narrative": "Too late."},
+        headers=registered_user["headers"],
+    )
+    assert late_edit_resp.status_code == 400
+
+    # Still not exportable while pending.
+    export_resp = client.post(f"/api/v1/awards/{award['id']}/reports/{report['id']}/export", headers=registered_user["headers"])
+    assert export_resp.status_code == 400
+
+    # 5. Decide the approval through the existing generic endpoint.
+    decide_resp = client.post(
+        f"/api/v1/approvals/{approval_request_id}/decide",
+        json={"approved": True, "decision_notes": "Looks good."}, headers=approver["headers"],
+    )
+    assert decide_resp.status_code == 200, decide_resp.text
+
+    record_resp = client.get(f"/api/v1/awards/{award['id']}/reports/{report['id']}", headers=registered_user["headers"])
+    assert record_resp.json()["status"] == "approved"
+
+    # 6. Only now can it be exported.
+    export_resp = client.post(f"/api/v1/awards/{award['id']}/reports/{report['id']}/export", headers=registered_user["headers"])
+    assert export_resp.status_code == 200, export_resp.text
+    exported = export_resp.json()
+    assert exported["download_url"]
+    assert exported["file_size"] > 0
+
+    reports_resp = client.get(f"/api/v1/awards/{award['id']}/reports", headers=registered_user["headers"])
+    assert len(reports_resp.json()) == 1
+
+
+def test_report_rejected_via_approvals_endpoint_stays_unexportable(client, registered_user, monkeypatch):
+    _fake_narrative(monkeypatch)
+
+    org_id = _create_org(client, registered_user["headers"])
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    _share_proposal(client, org_id, proposal_id, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    approver = _register_and_login(client, "report-rejector")
+    _invite_member(client, org_id, registered_user["headers"], approver["email"], "owner")
+
+    report = client.post(
+        f"/api/v1/awards/{award['id']}/reports", json={"report_type": "final"}, headers=registered_user["headers"],
+    ).json()
+    submitted = client.post(
+        f"/api/v1/awards/{award['id']}/reports/{report['id']}/submit",
+        json={"approver_id": approver["user_id"]}, headers=registered_user["headers"],
+    ).json()
+
+    decide_resp = client.post(
+        f"/api/v1/approvals/{submitted['approval_request_id']}/decide",
+        json={"approved": False, "decision_notes": "Needs more detail."}, headers=approver["headers"],
+    )
+    assert decide_resp.status_code == 200, decide_resp.text
+
+    record_resp = client.get(f"/api/v1/awards/{award['id']}/reports/{report['id']}", headers=registered_user["headers"])
+    assert record_resp.json()["status"] == "rejected"
+
+    export_resp = client.post(f"/api/v1/awards/{award['id']}/reports/{report['id']}/export", headers=registered_user["headers"])
+    assert export_resp.status_code == 400
+
+
+def test_report_draft_creation_requires_edit_access(client, registered_user, monkeypatch):
+    _fake_narrative(monkeypatch)
+
+    org_id = _create_org(client, registered_user["headers"])
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    _share_proposal(client, org_id, proposal_id, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    viewer = _register_and_login(client, "report-viewer")
+    _invite_member(client, org_id, registered_user["headers"], viewer["email"], "viewer")
+
+    resp = client.post(f"/api/v1/awards/{award['id']}/reports", json={"report_type": "progress"}, headers=viewer["headers"])
+    assert resp.status_code == 403
+
+
 # ── Closeout ─────────────────────────────────────────────────────────────────
 
 def test_closeout_lifecycle(client, registered_user):

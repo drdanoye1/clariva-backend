@@ -40,6 +40,7 @@ engines/collaboration_engine.py):
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import re
@@ -52,13 +53,14 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import storage
 from config import settings
 from models.db_models import (
     ApprovalRequest, Award, AwardAmendment, AwardCloseout, AwardComplianceItem,
-    AwardCondition, AwardExpenditure, AwardPerformanceRecord, BudgetRecord,
+    AwardCondition, AwardExpenditure, AwardPerformanceRecord, AwardReport, BudgetRecord,
     Deliverable, Document, DocumentVersion, FOARecord, MemoryRecord, Milestone,
     Notification, ProjectBaseline, ProjectIssue, ProjectKnowledge, Proposal,
-    ScopeOfWork, Task, WorkPackage, new_uuid,
+    ScopeOfWork, StoredFile, Task, WorkPackage, new_uuid,
 )
 from models.schemas import AwardReportOut, BudgetStatusOut, PlannedVsActualOut, ProjectExecutionStatusOut
 
@@ -108,6 +110,53 @@ def _naive(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is not None and dt.tzinfo is not None:
         return dt.replace(tzinfo=None)
     return dt
+
+
+def _build_report_docx(buffer: "io.BytesIO", award: Award, report: "AwardReport") -> None:
+    """Renders an *approved* AwardReport to a DOCX buffer — reuses
+    utils/doc_utils.py's federal-style helpers (same look as every other
+    exported document in this codebase) rather than a one-off style, but
+    is otherwise deliberately simple: a report is a narrative plus a
+    handful of frozen stats, not a multi-section proposal with figures/
+    TOC, so it doesn't need document_output.py's heavier machinery."""
+    from docx import Document as DocxDocument
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from utils.doc_utils import (
+        FEDERAL_FONT, H1_PT, add_body_para, add_federal_heading,
+        apply_federal_margins, _make_run, _para_spacing,
+    )
+
+    doc = DocxDocument()
+    apply_federal_margins(doc)
+
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _para_spacing(title, after=4, before=0)
+    _make_run(title, f"{report.report_type.replace('_', ' ').title()} Report", bold=True, pt=H1_PT, font=FEDERAL_FONT)
+
+    meta = doc.add_paragraph()
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _para_spacing(meta, after=12)
+    _make_run(meta, f"Award: {award.award_number or award.funding_agency}  |  Approved and exported {datetime.utcnow().strftime('%Y-%m-%d')}", pt=10, font=FEDERAL_FONT)
+
+    add_federal_heading(doc, "Narrative", level=2)
+    for paragraph in report.narrative.split("\n"):
+        add_body_para(doc, paragraph)
+
+    data = report.report_data or {}
+    budget_status = data.get("budget_status") or {}
+    execution_status = data.get("execution_status") or {}
+    add_federal_heading(doc, "Summary Statistics (as of report generation)", level=2)
+    stats_lines = [
+        f"Burn rate: {budget_status.get('burn_rate_pct', 'N/A')}%",
+        f"Work packages: {execution_status.get('total_work_packages', 'N/A')}",
+        f"Open issues: {execution_status.get('open_issues', 'N/A')}",
+        f"KPI records: {len(data.get('performance') or [])}",
+    ]
+    for line in stats_lines:
+        add_body_para(doc, line)
+
+    doc.save(buffer)
 
 
 class AwardEngine:
@@ -941,6 +990,119 @@ fabricate figures, dates, or results not given above.
         except Exception as exc:
             raise _ai_error(exc)
         return response.choices[0].message.content.strip()
+
+    # ── Persisted, human-reviewed reports (see models/db_models.py's
+    # AwardReport docstring — the generate_report/generate_report_narrative
+    # pair above stays as an ephemeral live-preview pair; everything below
+    # is the actual draft → edit → submit → approve/reject → export
+    # workflow, routed through Phase 3's ApprovalRequest exactly like
+    # amendments above, with collaboration_engine.py::decide_approval_request
+    # applying the decision.) ───────────────────────────────────────────────
+
+    async def get_award_report_or_404(self, db: AsyncSession, report_id: str) -> AwardReport:
+        result = await db.execute(select(AwardReport).where(AwardReport.id == report_id))
+        report = result.scalar_one_or_none()
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+        return report
+
+    async def create_report_draft(
+        self, db: AsyncSession, award_id: str, report_type: str, additional_context: Optional[str],
+        award_out: Any, requested_by: str,
+    ) -> AwardReport:
+        """Runs the same generate_report/generate_report_narrative pipeline
+        the ephemeral preview endpoints use, but persists the result as a
+        draft instead of just handing it back — this is step one of the
+        human-in-the-loop workflow. Nothing produced here is exportable
+        until a person has reviewed (optionally edited) this draft and it
+        has been approved."""
+        report_view = await self.generate_report(db, award_id, report_type, award_out)
+
+        award = await self.get_award_or_404(db, award_id)
+        proposal_result = await db.execute(select(Proposal).where(Proposal.id == award.proposal_id))
+        proposal = proposal_result.scalar_one_or_none()
+        narrative = await self.generate_report_narrative(report_view, proposal, additional_context)
+
+        report_data = json.loads(report_view.model_dump_json(exclude={"narrative", "award"}))
+        report = AwardReport(
+            id=new_uuid(), award_id=award_id, report_type=report_type, status="draft",
+            narrative=narrative, ai_generated_narrative=narrative, report_data=report_data,
+            requested_by=requested_by,
+        )
+        db.add(report)
+        await db.flush()
+        await db.refresh(report)
+        return report
+
+    async def update_report_draft(self, db: AsyncSession, report_id: str, narrative: str) -> AwardReport:
+        report = await self.get_award_report_or_404(db, report_id)
+        if report.status != "draft":
+            raise HTTPException(status_code=400, detail="Only a draft report's narrative can be edited — this one has already been submitted for approval.")
+        report.narrative = narrative
+        await db.flush()
+        await db.refresh(report)
+        return report
+
+    async def list_award_reports(self, db: AsyncSession, award_id: str) -> List[AwardReport]:
+        result = await db.execute(
+            select(AwardReport).where(AwardReport.award_id == award_id).order_by(AwardReport.created_at.desc())
+        )
+        return list(result.scalars().all())
+
+    async def submit_report_for_approval(
+        self, db: AsyncSession, report_id: str, requested_by: str, approver_id: Optional[str],
+        notes: Optional[str], org_id: Optional[str],
+    ) -> AwardReport:
+        report = await self.get_award_report_or_404(db, report_id)
+        if report.status != "draft":
+            raise HTTPException(status_code=400, detail="This report has already been submitted for approval.")
+
+        approval = ApprovalRequest(
+            id=new_uuid(), org_id=org_id, object_type="award_report", object_id=report.id,
+            requested_by=requested_by, approver_id=approver_id, notes=notes,
+        )
+        db.add(approval)
+        await db.flush()
+        await db.refresh(approval)
+        report.approval_request_id = approval.id
+        report.status = "pending_approval"
+        await db.flush()
+        await db.refresh(report)
+
+        if approver_id:
+            await self._notify(db, approver_id, "approval_requested", "A post-award report needs your review and decision.",
+                                object_type="award_report", object_id=report.id)
+        return report
+
+    async def export_report(self, db: AsyncSession, report_id: str, created_by: str, org_id: Optional[str]) -> Dict[str, Any]:
+        """Human-in-the-loop gate: a report can only become a downloadable
+        file once a person has approved it (see models/db_models.py's
+        AwardReport docstring) — there is no path from AI generation
+        straight to a file."""
+        report = await self.get_award_report_or_404(db, report_id)
+        if report.status != "approved":
+            raise HTTPException(status_code=400, detail="This report must be reviewed and approved before it can be exported.")
+
+        award = await self.get_award_or_404(db, report.award_id)
+        buffer = io.BytesIO()
+        _build_report_docx(buffer, award, report)
+        content = buffer.getvalue()
+        filename = f"{report.report_type}_report_{report.id[:8]}.docx"
+        content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+        storage_key = await storage.upload_file(org_id, "award_report_export", content, filename, content_type)
+        stored_file = StoredFile(
+            id=new_uuid(), org_id=org_id, object_type="award_report_export", object_id=report.id,
+            storage_key=storage_key, original_filename=filename, content_type=content_type,
+            size_bytes=len(content), checksum=storage.sha256_hex(content), created_by=created_by,
+        )
+        db.add(stored_file)
+        await db.flush()
+        await db.refresh(stored_file)
+        report.exported_file_id = stored_file.id
+        await db.flush()
+        download_url = await storage.get_download_url(storage_key, filename=filename)
+        return {"download_url": download_url, "file_size": len(content), "exported_at": datetime.utcnow()}
 
     # ── Closeout (PRD §17 — feeds Organizational Memory) ────────────────────
 
