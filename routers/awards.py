@@ -359,6 +359,19 @@ async def apply_award_intelligence(
                 award.budget_record_id = budget_record.id
 
         await db.commit()
+        # Root cause of the actual MissingGreenlet (confirmed via Heroku
+        # logs): `Award.updated_at` uses onupdate=func.now(), so once this
+        # endpoint's edits above make `award` dirty, committing leaves
+        # `updated_at` "expired" server-side regardless of
+        # expire_on_commit=False — that flag only stops the *session* from
+        # blanket-expiring everything, it doesn't cover a column whose new
+        # value only the server knows. Reading it unrefreshed in
+        # _to_award_out() below forced a synchronous reload, which the async
+        # ORM can't do outside an awaited call. This is this codebase's
+        # already-documented "Async ORM pitfall" (see credit_engine.py,
+        # Phase 1, and the note earlier in this file) — the fix is the same
+        # one used everywhere else: refresh after flush/commit, every time.
+        await db.refresh(award)
         # Also inside the try: `award`'s own attributes are safe to read
         # post-commit (expire_on_commit=False), but keeping this here means
         # any future surprise on this path gets our detailed error message
