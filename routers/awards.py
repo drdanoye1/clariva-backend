@@ -324,6 +324,16 @@ async def apply_award_intelligence(
     log = logging.getLogger(__name__)
 
     award, access = await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    # Captured now, before any writes/commit below — this is the actual bug
+    # that was crashing this endpoint (confirmed via Heroku logs:
+    # sqlalchemy.exc.MissingGreenlet). `award`'s own plain columns stay safe
+    # to read after commit because database.py sets expire_on_commit=False,
+    # but that doesn't extend to reaching into a *different* object
+    # (access.proposal) — doing that post-commit forced SQLAlchemy to
+    # silently try to refresh it, which requires IO the async ORM can't run
+    # outside an awaited call, hence MissingGreenlet. Grabbing the plain
+    # string now sidesteps the whole class of bug.
+    proposal_title = access.proposal.title
 
     try:
         if body.total_award_value is not None and award.total_award_value is None:
@@ -349,6 +359,13 @@ async def apply_award_intelligence(
                 award.budget_record_id = budget_record.id
 
         await db.commit()
+        # Also inside the try: `award`'s own attributes are safe to read
+        # post-commit (expire_on_commit=False), but keeping this here means
+        # any future surprise on this path gets our detailed error message
+        # instead of leaking out as FastAPI's generic, undiagnosable 500 —
+        # which is exactly what let the real bug above hide from the
+        # detailed logging this try/except was added for in the first place.
+        return _to_award_out(award, proposal_title=proposal_title)
     except HTTPException:
         raise
     except Exception as exc:
@@ -357,7 +374,6 @@ async def apply_award_intelligence(
             status_code=500,
             detail=f"Could not apply these details: {type(exc).__name__}: {exc}",
         )
-    return _to_award_out(award, proposal_title=access.proposal.title)
 
 
 @router.get("/by-proposal/{proposal_id}", response_model=AwardOut)
