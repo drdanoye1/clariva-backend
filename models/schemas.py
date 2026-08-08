@@ -1344,12 +1344,22 @@ class AwardIntelligenceDraftOut(BaseModel):
     exactly (name/description/start_month/end_month/tasks/milestones/
     deliverables); `budget` matches extract_budget_from_file()'s
     {"extracted": {...}, "totals": {...}} shape, or is null if the uploaded
-    document(s) didn't contain budget-worthy content."""
+    document(s) didn't contain budget-worthy content. objectives/
+    need_statement/outputs/outcomes/kpis (Phase D.3) mirror ProjectKnowledge's
+    own columns and derive_project_knowledge_from_proposal()'s field set —
+    read from the customer's *uploaded* documents instead of AI-*generated*
+    proposal sections, since a Quick-Award-Intake/Award-page-upload proposal
+    has no generated sections for that feature to derive from."""
     total_award_value: Optional[float] = None
     period_of_performance_start: Optional[datetime] = None
     period_of_performance_end: Optional[datetime] = None
     work_packages: List[Dict[str, Any]] = Field(default_factory=list)
     budget: Optional[Dict[str, Any]] = None
+    objectives: Optional[str] = None
+    need_statement: Optional[str] = None
+    outputs: Optional[str] = None
+    outcomes: Optional[str] = None
+    kpis: List[Dict[str, Any]] = Field(default_factory=list)
     extraction_notes: Optional[str] = None
     source_document_count: int = 0
 
@@ -1361,6 +1371,11 @@ class AwardIntelligenceApplyRequest(BaseModel):
     period_of_performance_end: Optional[datetime] = None
     work_packages: List[Dict[str, Any]] = Field(default_factory=list)
     budget: Optional[Dict[str, Any]] = None
+    objectives: Optional[str] = None
+    need_statement: Optional[str] = None
+    outputs: Optional[str] = None
+    outcomes: Optional[str] = None
+    kpis: List[Dict[str, Any]] = Field(default_factory=list)
 
 class AwardConditionCreate(BaseModel):
     description: str

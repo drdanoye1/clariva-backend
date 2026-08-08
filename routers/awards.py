@@ -17,7 +17,7 @@ engines/collaboration_engine.py::decide_approval_request).
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import select
@@ -301,6 +301,11 @@ async def extract_award_intelligence(
         period_of_performance_end=scope_result.get("period_of_performance_end"),
         work_packages=scope_result.get("work_packages") or [],
         budget=budget_result,
+        objectives=scope_result.get("objectives"),
+        need_statement=scope_result.get("need_statement"),
+        outputs=scope_result.get("outputs"),
+        outcomes=scope_result.get("outcomes"),
+        kpis=scope_result.get("kpis") or [],
         extraction_notes=scope_result.get("extraction_notes"),
         source_document_count=source_document_count,
     )
@@ -357,6 +362,26 @@ async def apply_award_intelligence(
             budget_record = await apply_budget_dict(db, access.proposal.id, body.budget["extracted"])
             if not award.budget_record_id:
                 award.budget_record_id = budget_record.id
+
+        # Project Knowledge (Phase D.3): same blank-only-fill rule as
+        # award value/dates above — a proposal that went through the normal
+        # Pre-Award pipeline may already have objectives/need_statement/etc.
+        # hand-written or set via Scope of Work's own "Derive from Proposal";
+        # this must never clobber that. kpis is all-or-nothing (only applied
+        # if the proposal doesn't have any yet) rather than field-by-field,
+        # since a partial/duplicated KPI list is worse than none.
+        pk_text_fields = ("objectives", "need_statement", "outputs", "outcomes")
+        if any(getattr(body, f) for f in pk_text_fields) or body.kpis:
+            pk = await scope_engine.get_or_create_project_knowledge(db, access.proposal.id)
+            pk_updates: Dict[str, Any] = {}
+            for f in pk_text_fields:
+                value = getattr(body, f)
+                if value and not (getattr(pk, f) or "").strip():
+                    pk_updates[f] = value
+            if body.kpis and not (pk.kpis or []):
+                pk_updates["kpis"] = body.kpis
+            if pk_updates:
+                await scope_engine.update_project_knowledge(db, access.proposal.id, pk_updates)
 
         await db.commit()
         # Root cause of the actual MissingGreenlet (confirmed via Heroku

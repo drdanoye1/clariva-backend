@@ -990,3 +990,57 @@ def test_apply_intelligence_requires_edit_access(client, registered_user):
         headers=other["headers"],
     )
     assert resp.status_code == 403
+
+
+def test_apply_intelligence_fills_blank_project_knowledge_fields_only(client, registered_user):
+    """Phase D.3: objectives/need_statement/outputs/outcomes/kpis extracted
+    from uploaded documents apply the same 'never overwrite what's already
+    there' rule as award value/dates — see the two award-value tests above."""
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Project Knowledge Apply Test", "funding_agency": "DOE"},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/apply-intelligence",
+        json={
+            "work_packages": [],
+            "objectives": "Train 250 participants in clean energy careers.",
+            "need_statement": "The region lacks technical workforce training capacity.",
+            "outputs": "Workforce training curriculum and virtual laboratory.",
+            "outcomes": "A highly skilled regional clean energy workforce.",
+            "kpis": [{"name": "Participants Trained", "target": "250", "unit": "participants"}],
+        },
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = client.get(f"/api/v1/proposals/{award['proposal_id']}/knowledge", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    pk = resp.json()
+    assert pk["objectives"] == "Train 250 participants in clean energy careers."
+    assert pk["need_statement"] == "The region lacks technical workforce training capacity."
+    assert pk["outcomes"] == "A highly skilled regional clean energy workforce."
+    assert len(pk["kpis"]) == 1
+    assert pk["kpis"][0]["name"] == "Participants Trained"
+
+    # Calling it again with different content must NOT overwrite what's
+    # already there — same blank-only-fill rule as award value/dates, and
+    # kpis is all-or-nothing rather than merged/duplicated.
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/apply-intelligence",
+        json={
+            "work_packages": [],
+            "objectives": "A completely different objective.",
+            "kpis": [{"name": "Different KPI", "target": "999", "unit": "widgets"}],
+        },
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    resp = client.get(f"/api/v1/proposals/{award['proposal_id']}/knowledge", headers=registered_user["headers"])
+    pk = resp.json()
+    assert pk["objectives"] == "Train 250 participants in clean energy careers."
+    assert len(pk["kpis"]) == 1
+    assert pk["kpis"][0]["name"] == "Participants Trained"

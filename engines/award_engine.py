@@ -394,12 +394,22 @@ class AwardEngine:
         return "\n\n".join(blocks)
 
     async def extract_scope_and_award_fields(self, proposal: Any, document_text: str) -> Dict[str, Any]:
-        """AI extraction of award value, period of performance, and a work
-        breakdown from the customer's uploaded document text. Mirrors
-        scope_of_work_engine.py's generate_work_breakdown() work_packages
-        shape exactly, so the result can be persisted via that engine's
-        apply_generated_work_breakdown() unchanged. Returns an unpersisted
-        dict for the caller to show for review — nothing is saved here.
+        """AI extraction of award value, period of performance, a work
+        breakdown, and Project Knowledge fields from the customer's uploaded
+        document text. work_packages mirrors scope_of_work_engine.py's
+        generate_work_breakdown() shape exactly, so it can be persisted via
+        that engine's apply_generated_work_breakdown() unchanged;
+        objectives/need_statement/outputs/outcomes/kpis mirror
+        ProjectKnowledge's own columns (see models/db_models.py) and
+        scope_of_work_engine.py's derive_project_knowledge_from_proposal()'s
+        field set — the same summary that feature derives from AI-*generated*
+        ProposalSection content, derived here instead from the customer's
+        *uploaded* documents, since a Quick-Award-Intake or normal-Award-page
+        upload has no generated sections to derive from (see
+        ScopeOfWorkEngine.derive_project_knowledge_from_proposal's 400 when a
+        proposal has none — this method exists so that path isn't a dead end
+        for these proposals). Returns an unpersisted dict for the caller to
+        show for review — nothing is saved here.
 
         Truncates document_text at 100k chars, not the ~16k this originally
         shipped with — a real funded proposal easily runs 30-50k+ characters,
@@ -440,17 +450,37 @@ Return JSON matching exactly this shape:
       "deliverables": ["string", "..."]
     }}
   ],
+  "objectives": "string or null",
+  "need_statement": "string or null",
+  "outputs": "string or null",
+  "outcomes": "string or null",
+  "kpis": [
+    {{"name": "string", "target": "string", "unit": "string"}}
+  ],
   "extraction_notes": "string"
 }}
 
 Only extract what the document(s) actually state. Use null for
-total_award_value/dates if not stated, and an empty work_packages array if
-the document doesn't describe a work plan — a short award notice letter
-often only states the amount and dates with no work breakdown, and that's
-fine; don't invent one. Month numbers in work packages are 1-indexed from
-project start. For extraction_notes, write a specific one- or two-sentence
-summary referencing what this particular document actually contains (cite
-the title or a phrase from it) — not a generic template sentence.
+total_award_value/dates/objectives/need_statement/outputs/outcomes if not
+stated, and empty arrays for work_packages/kpis if the document doesn't
+describe a work plan or performance measures — a short award notice letter
+often only states the amount and dates with nothing else, and that's fine;
+don't invent any of it. Month numbers in work packages are 1-indexed from
+project start.
+
+For objectives/need_statement/outputs/outcomes, write plain prose (no
+markdown, no bullets) summarizing what the document(s) actually say —
+objectives is what the project aims to achieve, need_statement is the
+problem/gap it addresses, outputs are concrete things produced, outcomes
+are longer-term changes/results. For kpis, extract each named performance
+indicator with its stated numeric or quantitative target and unit exactly
+as written (e.g. a table row "Participants Trained: 250" becomes
+{{"name": "Participants Trained", "target": "250", "unit": "participants"}});
+leave target/unit as empty strings if the document names an indicator
+without a stated target. For extraction_notes, write a specific one- or
+two-sentence summary referencing what this particular document actually
+contains (cite the title or a phrase from it) — not a generic template
+sentence.
 """.strip()
         try:
             response = await self.client.chat.completions.create(
