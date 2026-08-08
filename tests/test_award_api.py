@@ -9,6 +9,12 @@ checklist, amendments decided through the existing generic
 /api/v1/approvals/{id}/decide endpoint, issues, execution status, KPI
 performance, the deterministic report view, closeout, and renewal — is
 covered through the real router.
+
+Phase D's POST /extract-intelligence also needs a real OpenAI call (twice,
+in fact — award/scope extraction and budget extraction) and gets the same
+treatment: only its pre-AI-call validation paths (no documents uploaded yet;
+access control) are covered below. POST /apply-intelligence makes no AI call
+at all — it just persists a given draft — so it's covered fully.
 """
 from __future__ import annotations
 
@@ -824,4 +830,163 @@ def test_list_award_files_requires_view_access(client, registered_user):
 
     other = _register_and_login(client, "files-outsider")
     resp = client.get(f"/api/v1/awards/{award['id']}/files", headers=other["headers"])
+    assert resp.status_code == 403
+
+
+# ── Phase D: Award Intake Intelligence ───────────────────────────────────────
+
+def test_extract_intelligence_400s_with_no_documents_uploaded(client, registered_user):
+    """Short-circuits before any OpenAI call — safe to test without
+    mocking anything (see module docstring)."""
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "No Documents Yet Test", "funding_agency": "NSF"},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+    resp = client.post(f"/api/v1/awards/{award['id']}/extract-intelligence", headers=registered_user["headers"])
+    assert resp.status_code == 400
+    assert "no documents" in resp.json()["detail"].lower()
+
+
+def test_extract_intelligence_requires_edit_access(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Extract Access Control Test", "funding_agency": "NSF"},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    other = _register_and_login(client, "extract-outsider")
+    resp = client.post(f"/api/v1/awards/{award['id']}/extract-intelligence", headers=other["headers"])
+    assert resp.status_code == 403  # access denied before the (missing-documents) 400 would even apply
+
+
+def test_apply_intelligence_fills_blank_award_value_and_dates_only(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Blank Fields Test", "funding_agency": "NSF"},  # no total_award_value / dates
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+    assert award["total_award_value"] is None
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/apply-intelligence",
+        json={
+            "total_award_value": 500000,
+            "period_of_performance_start": "2026-01-01T00:00:00",
+            "period_of_performance_end": "2026-12-31T00:00:00",
+            "work_packages": [],
+        },
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    updated = resp.json()
+    assert updated["total_award_value"] == 500000
+    assert updated["period_of_performance_start"] is not None
+
+    # Calling it again with a different value must NOT overwrite what's now set.
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/apply-intelligence",
+        json={"total_award_value": 999999, "work_packages": []},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total_award_value"] == 500000
+
+
+def test_apply_intelligence_never_overwrites_a_prefilled_award_value(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Prefilled Value Test", "funding_agency": "NSF", "total_award_value": 250000},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+    assert award["total_award_value"] == 250000
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/apply-intelligence",
+        json={"total_award_value": 999999, "work_packages": []},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total_award_value"] == 250000
+
+
+def test_apply_intelligence_creates_work_packages_via_scope_engine(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Work Breakdown Apply Test", "funding_agency": "DOE"},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/apply-intelligence",
+        json={"work_packages": [
+            {
+                "name": "Phase 1: Requirements", "description": "Initial requirements gathering",
+                "start_month": 1, "end_month": 3,
+                "tasks": ["Stakeholder interviews"], "milestones": ["Requirements sign-off"],
+                "deliverables": ["Requirements document"],
+            },
+        ]},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = client.get(f"/api/v1/proposals/{award['proposal_id']}/scope-of-work", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    sow = resp.json()
+    assert len(sow["work_packages"]) == 1
+    assert sow["work_packages"][0]["name"] == "Phase 1: Requirements"
+    assert len(sow["milestones"]) == 1
+    assert len(sow["deliverables"]) == 1
+
+
+def test_apply_intelligence_creates_budget_and_links_it_to_the_award(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Budget Apply Test", "funding_agency": "EPA"},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+    assert award["budget_record_id"] is None
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/apply-intelligence",
+        json={"work_packages": [], "budget": {"extracted": {
+            "budget_months": 12, "indirect_rate": 25.0, "indirect_base": "mtdc", "fee_rate": 7.0,
+            "personnel": [{"name": "Dr. Smith", "role": "PI", "annual_salary": 120000, "fringe_rate": 30, "effort_pct": 20}],
+            "consultants": [], "equipment": [], "travel": [], "other_direct": [], "subcontracts": [],
+        }}},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    updated = resp.json()
+    assert updated["budget_record_id"] is not None
+
+    resp = client.get(f"/api/v1/budget/{award['proposal_id']}", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    budget = resp.json()
+    assert len(budget["personnel"]) == 1
+    assert budget["personnel"][0]["name"] == "Dr. Smith"
+    assert budget["total_direct"] > 0
+
+
+def test_apply_intelligence_requires_edit_access(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Apply Access Control Test", "funding_agency": "NSF"},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    other = _register_and_login(client, "apply-outsider")
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/apply-intelligence",
+        json={"work_packages": []},
+        headers=other["headers"],
+    )
     assert resp.status_code == 403

@@ -25,13 +25,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import storage
 from database import get_db
-from models.db_models import Award, OrgMembership, StoredFile, User, new_uuid
+from models.db_models import Award, Document, OrgMembership, StoredFile, User, new_uuid
 from models.schemas import (
     ActivateProjectRequest, AwardAmendmentCreate, AwardAmendmentOut, AwardCloseoutOut,
     AwardCloseoutRequest, AwardComplianceItemCreate, AwardComplianceItemOut,
     AwardComplianceItemUpdate, AwardConditionCreate, AwardConditionOut,
     AwardConditionUpdate, AwardCreate, AwardExpenditureCreate, AwardExpenditureOut,
-    AwardOut, AwardPerformanceRecordCreate, AwardPerformanceRecordOut, AwardReportOut,
+    AwardIntelligenceApplyRequest, AwardIntelligenceDraftOut, AwardOut,
+    AwardPerformanceRecordCreate, AwardPerformanceRecordOut, AwardReportOut,
     AwardUpdate, BudgetStatusOut, DocumentOut, FOARecordOut, PlannedVsActualOut,
     ProjectBaselineOut, ProjectExecutionStatusOut, ProjectIssueCreate, ProjectIssueOut,
     ProjectIssueUpdate, QuickAwardIntakeRequest, RenewalCreate, ReportNarrativeRequest,
@@ -41,15 +42,18 @@ from routers.auth import get_current_user
 from routers.organizations import _assert_member, _assert_permission
 from routers.documents_library import _to_document_out
 from routers.extract import _extract_text_from_docx, _extract_text_from_pdf
+from routers.budget import _extract_budget_from_text, apply_budget_dict
 from workspace_access import ProposalAccess, assert_can_edit, assert_can_view
 from engines.award_engine import AwardEngine
 from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
 from engines.document_library_engine import DocumentLibraryEngine
+from engines.scope_of_work_engine import ScopeOfWorkEngine
 
 router = APIRouter()
 engine = AwardEngine()
 credit_engine = CreditEngine()
 document_engine = DocumentLibraryEngine()
+scope_engine = ScopeOfWorkEngine()
 
 
 def _to_award_out(award: Award, proposal_title: Optional[str] = None) -> AwardOut:
@@ -246,6 +250,97 @@ async def list_award_files(
             size_bytes=f.size_bytes, created_at=f.created_at, download_url=download_url,
         ))
     return out
+
+
+@router.post("/{award_id}/extract-intelligence", response_model=AwardIntelligenceDraftOut)
+async def extract_award_intelligence(
+    award_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Version 3.0 upgrade, Phase D — 'Award Intake Intelligence'. Reads
+    whatever Quick Award Intake documents have been uploaded so far (see
+    intake_award_document above) and proposes award value/dates, a work
+    breakdown, and budget line items via AI — filling the gap left by
+    skipping Pre-Award entirely (see engines/award_engine.py's Award Intake
+    Intelligence section for why activate_award()'s baseline snapshot is
+    otherwise permanently empty for these awards). Returns an unpersisted
+    draft for review — nothing is saved until POST /awards/{award_id}/
+    apply-intelligence. Safe to call again after uploading another
+    document: each call re-reads everything currently attached, it doesn't
+    accumulate incrementally."""
+    award, access = await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    document_text = await engine.gather_intake_document_text(db, access.proposal.id)
+    if not document_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="No documents have been uploaded for this award yet — attach the award notice or funded proposal first.",
+        )
+    await _meter(award.org_id, current_user.id, db, reason=f"award:extract_intelligence:{award_id}")
+
+    scope_result = await engine.extract_scope_and_award_fields(access.proposal, document_text)
+    # Budget extraction is best-effort and separate from scope/award fields
+    # above — a short award notice letter often has nothing budget-shaped in
+    # it at all, and that shouldn't block the (usually more reliable)
+    # award value/dates/work-plan extraction from returning.
+    try:
+        budget_result = await _extract_budget_from_text(document_text)
+    except HTTPException:
+        budget_result = None
+
+    doc_count_result = await db.execute(
+        select(Document).where(
+            Document.proposal_id == access.proposal.id,
+            Document.library_type.in_(["funded_proposal", "award_notice"]),
+            Document.status == "active",
+        )
+    )
+    source_document_count = len(doc_count_result.scalars().all())
+
+    return AwardIntelligenceDraftOut(
+        total_award_value=scope_result.get("total_award_value"),
+        period_of_performance_start=scope_result.get("period_of_performance_start"),
+        period_of_performance_end=scope_result.get("period_of_performance_end"),
+        work_packages=scope_result.get("work_packages") or [],
+        budget=budget_result,
+        extraction_notes=scope_result.get("extraction_notes"),
+        source_document_count=source_document_count,
+    )
+
+
+@router.post("/{award_id}/apply-intelligence", response_model=AwardOut)
+async def apply_award_intelligence(
+    award_id: str, body: AwardIntelligenceApplyRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Persists a (possibly hand-edited) draft from POST /awards/{award_id}/
+    extract-intelligence. Award value/dates only fill in blanks — never
+    overwrite a value already entered at intake or edited manually since, so
+    running this is always safe even if the customer already typed in an
+    award value themselves. Work packages/budget are additive: calling this
+    more than once with overlapping content will duplicate it, the same
+    caveat Scope of Work's own 'Derive from Proposal' onramp already has —
+    intended for the one-time "just imported this award" moment, not
+    repeated re-application."""
+    award, access = await _get_award_and_access(award_id, current_user, db, require_edit=True)
+
+    if body.total_award_value is not None and award.total_award_value is None:
+        award.total_award_value = body.total_award_value
+    if body.period_of_performance_start is not None and award.period_of_performance_start is None:
+        award.period_of_performance_start = body.period_of_performance_start
+    if body.period_of_performance_end is not None and award.period_of_performance_end is None:
+        award.period_of_performance_end = body.period_of_performance_end
+
+    if body.work_packages:
+        await scope_engine.apply_generated_work_breakdown(
+            db, access.proposal.id, {"work_packages": body.work_packages}
+        )
+
+    if body.budget and body.budget.get("extracted"):
+        budget_record = await apply_budget_dict(db, access.proposal.id, body.budget["extracted"])
+        if not award.budget_record_id:
+            award.budget_record_id = budget_record.id
+
+    await db.commit()
+    return _to_award_out(award, proposal_title=access.proposal.title)
 
 
 @router.get("/by-proposal/{proposal_id}", response_model=AwardOut)

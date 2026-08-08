@@ -144,6 +144,42 @@ async def _get_proposal(proposal_id: str, owner_id: str, db: AsyncSession) -> Pr
     return p
 
 
+async def apply_budget_dict(db: AsyncSession, proposal_id: str, body: Dict[str, Any]) -> BudgetRecord:
+    """Get-or-create the proposal's BudgetRecord and write `body`'s fields
+    onto it, exactly like save_budget()'s PUT handler below — factored out
+    (Version 3.0 upgrade, Phase D — Award Intake Intelligence) so routers/
+    awards.py's apply-intelligence endpoint can persist an AI-extracted
+    budget the same way a human-edited one is saved, without duplicating
+    this field-by-field assignment. Does NOT commit — caller's responsibility,
+    matching this codebase's "engines flush, routers commit" convention
+    (this is a router-level helper, not an engine, but the same rule holds:
+    it flushes so `rec.id`/totals are usable immediately, the caller commits)."""
+    r = await db.execute(select(BudgetRecord).where(BudgetRecord.proposal_id == proposal_id))
+    rec = r.scalar_one_or_none()
+    if not rec:
+        rec = BudgetRecord(id=str(uuid.uuid4()), proposal_id=proposal_id)
+        db.add(rec)
+
+    rec.budget_months = int(body.get("budget_months") or 12)
+    rec.indirect_rate = float(body.get("indirect_rate") or 0)
+    rec.indirect_base = body.get("indirect_base") or "mtdc"
+    rec.fee_rate      = float(body.get("fee_rate") or 7.0)
+    rec.personnel     = body.get("personnel") or []
+    rec.consultants   = body.get("consultants") or []
+    rec.equipment     = body.get("equipment") or []
+    rec.travel        = body.get("travel") or []
+    rec.other_direct  = body.get("other_direct") or []
+    rec.subcontracts  = body.get("subcontracts") or []
+
+    totals = _calc_totals({**body})
+    rec.total_direct   = totals["total_direct"]
+    rec.total_indirect = totals["total_indirect"]
+    rec.total_cost     = totals["total_cost"]
+    await db.flush()
+    await db.refresh(rec)
+    return rec
+
+
 # ── GET ───────────────────────────────────────────────────────────────────────
 
 @router.get("/{proposal_id}")
@@ -435,6 +471,17 @@ async def extract_budget_from_file(
     if not text.strip():
         raise HTTPException(status_code=422, detail="File appears to be empty or unreadable.")
 
+    return await _extract_budget_from_text(text)
+
+
+# Factored out of extract_budget_from_file() above (Version 3.0 upgrade,
+# Phase D — Award Intake Intelligence) so routers/awards.py's
+# extract-intelligence endpoint can run this exact same AI extraction
+# against text that's ALREADY been extracted from an uploaded Quick Award
+# Intake document (Document Library), without needing the raw file bytes
+# again or duplicating this prompt. Behavior is byte-for-byte identical to
+# what extract_budget_from_file() did inline before this refactor.
+async def _extract_budget_from_text(text: str) -> Dict[str, Any]:
     extract_prompt = f"""Extract budget line items from this document and return ONLY valid JSON matching this schema exactly:
 
 {{

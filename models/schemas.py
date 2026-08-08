@@ -1335,6 +1335,33 @@ class ProjectBaselineOut(BaseModel):
     created_by: Optional[str] = None
     created_at: datetime
 
+class AwardIntelligenceDraftOut(BaseModel):
+    """Version 3.0 upgrade, Phase D — 'Award Intake Intelligence'. Unpersisted
+    result of AwardEngine.extract_scope_and_award_fields() + routers/
+    budget.py's _extract_budget_from_text(), returned by POST /awards/
+    {award_id}/extract-intelligence for the user to review before anything
+    is saved. `work_packages` matches generate_work_breakdown()'s shape
+    exactly (name/description/start_month/end_month/tasks/milestones/
+    deliverables); `budget` matches extract_budget_from_file()'s
+    {"extracted": {...}, "totals": {...}} shape, or is null if the uploaded
+    document(s) didn't contain budget-worthy content."""
+    total_award_value: Optional[float] = None
+    period_of_performance_start: Optional[datetime] = None
+    period_of_performance_end: Optional[datetime] = None
+    work_packages: List[Dict[str, Any]] = Field(default_factory=list)
+    budget: Optional[Dict[str, Any]] = None
+    extraction_notes: Optional[str] = None
+    source_document_count: int = 0
+
+class AwardIntelligenceApplyRequest(BaseModel):
+    """Body for POST /awards/{award_id}/apply-intelligence — the draft above,
+    possibly hand-edited by the user first, sent back to be persisted."""
+    total_award_value: Optional[float] = None
+    period_of_performance_start: Optional[datetime] = None
+    period_of_performance_end: Optional[datetime] = None
+    work_packages: List[Dict[str, Any]] = Field(default_factory=list)
+    budget: Optional[Dict[str, Any]] = None
+
 class AwardConditionCreate(BaseModel):
     description: str
     category: Optional[str] = None  # reporting | financial | regulatory | programmatic | other

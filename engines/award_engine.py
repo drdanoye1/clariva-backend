@@ -40,7 +40,9 @@ engines/collaboration_engine.py):
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -54,8 +56,9 @@ from config import settings
 from models.db_models import (
     ApprovalRequest, Award, AwardAmendment, AwardCloseout, AwardComplianceItem,
     AwardCondition, AwardExpenditure, AwardPerformanceRecord, BudgetRecord,
-    Deliverable, FOARecord, MemoryRecord, Milestone, Notification, ProjectBaseline,
-    ProjectIssue, ProjectKnowledge, Proposal, ScopeOfWork, Task, WorkPackage, new_uuid,
+    Deliverable, Document, DocumentVersion, FOARecord, MemoryRecord, Milestone,
+    Notification, ProjectBaseline, ProjectIssue, ProjectKnowledge, Proposal,
+    ScopeOfWork, Task, WorkPackage, new_uuid,
 )
 from models.schemas import AwardReportOut, BudgetStatusOut, PlannedVsActualOut, ProjectExecutionStatusOut
 
@@ -80,6 +83,23 @@ def _ai_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=503, detail="The AI writing service returned an unexpected error. Please try again.")
     _log.error("Unexpected report-narrative generation error:\n%s", traceback.format_exc())
     return HTTPException(status_code=500, detail="Content generation failed. Please try again or contact support.")
+
+
+def _parse_json_response(raw: str) -> Dict[str, Any]:
+    """Strip markdown fences and parse JSON, with a brace-scan fallback —
+    mirrors engines/scope_of_work_engine.py's helper of the same name
+    exactly (this codebase's convention is a local copy per module rather
+    than a shared import — see that module's near-identical docstring)."""
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start, end = cleaned.find("{"), cleaned.rfind("}") + 1
+        try:
+            return json.loads(cleaned[start:end])
+        except Exception:
+            raise HTTPException(status_code=500, detail="Could not parse the AI-extracted award information.")
 
 
 def _naive(dt: Optional[datetime]) -> Optional[datetime]:
@@ -336,6 +356,103 @@ class AwardEngine:
             select(ProjectBaseline).where(ProjectBaseline.award_id == award_id).order_by(ProjectBaseline.version.desc())
         )
         return list(result.scalars().all())
+
+    # ── Award Intake Intelligence (Version 3.0 upgrade, Phase D) ────────────
+    # Quick Award Intake (Phase 15) never touches Scope of Work or Budget —
+    # a customer skipping Pre-Award has neither by design. That means
+    # activate_award()'s baseline snapshot above (_build_snapshot) captures
+    # nothing, and Planned vs. Actual/Budget Status stay permanently blank,
+    # even though the customer's uploaded award notice/funded proposal often
+    # already states the award value, dates, and sometimes a work plan. This
+    # reads that already-uploaded document TEXT (Document Library, populated
+    # by routers/awards.py::intake_award_document) and proposes structured
+    # data to fill the gap — reviewed and applied explicitly via
+    # POST /awards/{award_id}/apply-intelligence, never silently.
+
+    async def gather_intake_document_text(self, db: AsyncSession, proposal_id: str) -> str:
+        """Concatenates the extracted text of every Quick Award Intake
+        document attached to this proposal (funded_proposal + award_notice
+        library types). Uses each Document's highest-version_number
+        DocumentVersion — normally there's exactly one version per intake
+        upload, but this stays correct if a document is ever replaced."""
+        docs_result = await db.execute(
+            select(Document).where(
+                Document.proposal_id == proposal_id,
+                Document.library_type.in_(["funded_proposal", "award_notice"]),
+                Document.status == "active",
+            )
+        )
+        blocks: List[str] = []
+        for doc in docs_result.scalars().all():
+            v_result = await db.execute(
+                select(DocumentVersion).where(DocumentVersion.document_id == doc.id)
+                .order_by(DocumentVersion.version_number.desc())
+            )
+            latest = v_result.scalars().first()
+            if latest and (latest.content or "").strip():
+                blocks.append(f"### {doc.title}\n{latest.content.strip()}")
+        return "\n\n".join(blocks)
+
+    async def extract_scope_and_award_fields(self, proposal: Any, document_text: str) -> Dict[str, Any]:
+        """AI extraction of award value, period of performance, and a work
+        breakdown from the customer's uploaded document text. Mirrors
+        scope_of_work_engine.py's generate_work_breakdown() work_packages
+        shape exactly, so the result can be persisted via that engine's
+        apply_generated_work_breakdown() unchanged. Returns an unpersisted
+        dict for the caller to show for review — nothing is saved here."""
+        prompt = f"""
+Read the following award-related document(s) and extract structured project
+information as JSON only (no markdown fences, no commentary — just the JSON
+object).
+
+Project title: {getattr(proposal, "title", "")}
+Funding agency: {getattr(proposal, "agency", "")}
+
+--- DOCUMENT(S) ---
+{document_text[:16000]}
+--- END DOCUMENT(S) ---
+
+Return JSON matching exactly this shape:
+{{
+  "total_award_value": number or null,
+  "period_of_performance_start": "YYYY-MM-DD" or null,
+  "period_of_performance_end": "YYYY-MM-DD" or null,
+  "work_packages": [
+    {{
+      "name": "string",
+      "description": "string",
+      "start_month": 1,
+      "end_month": 6,
+      "tasks": ["string", "..."],
+      "milestones": ["string", "..."],
+      "deliverables": ["string", "..."]
+    }}
+  ],
+  "extraction_notes": "string"
+}}
+
+Only extract what the document(s) actually state. Use null for
+total_award_value/dates if not stated, and an empty work_packages array if
+the document doesn't describe a work plan — a short award notice letter
+often only states the amount and dates with no work breakdown, and that's
+fine; don't invent one. Month numbers in work packages are 1-indexed from
+project start. Set extraction_notes to a one- or two-sentence summary of
+what was found and what was not (e.g. "Award value and dates found; no
+work plan was described in the uploaded document(s).").
+""".strip()
+        try:
+            response = await self.client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert grant analyst extracting structured award information from funder documents. Respond with a single JSON object only. Never invent data the document doesn't support."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=2000,
+            )
+        except Exception as exc:
+            raise _ai_error(exc)
+        return _parse_json_response(response.choices[0].message.content or "")
 
     # ── Award Received: sponsor conditions (Phase 7 data model) ────────────
 
