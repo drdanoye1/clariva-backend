@@ -5,6 +5,9 @@ exercised at the engine level in their own test files, not here).
 """
 from __future__ import annotations
 
+from database import AsyncSessionLocal
+from models.db_models import FOARecord, new_uuid
+
 
 def _org_context() -> dict:
     return {
@@ -45,6 +48,41 @@ def test_create_proposal_scaffolds_sections(client, registered_user):
 def test_create_proposal_requires_auth(client):
     resp = client.post("/api/v1/proposals/", json=_proposal_payload())
     assert resp.status_code == 401
+
+
+async def _insert_foa(**overrides) -> str:
+    defaults = dict(
+        id=new_uuid(), agency="NSF", program_title="Test Opportunity", phase="phase_i",
+        grant_type="sbir",
+    )
+    defaults.update(overrides)
+    async with AsyncSessionLocal() as db:
+        db.add(FOARecord(**defaults))
+        await db.commit()
+    return defaults["id"]
+
+
+def _insert_foa_sync(**overrides) -> str:
+    import asyncio
+    return asyncio.run(_insert_foa(**overrides))
+
+
+def test_create_proposal_from_foa_with_no_parsed_template(client, registered_user):
+    """Regression test: FOARecord.parsed_template is None for any FOA that
+    didn't come through the upload/parse-text/parse-url flow — e.g. rows
+    created by the Grants.gov/SAM.gov sync (funding_intelligence_engine.py),
+    award renewals (award_engine.py), or the public API (routers/public_api.py).
+    create_proposal used to call `.get()` directly on parsed_template and
+    500'd with AttributeError for every one of those FOAs; it must fall back
+    to treating a missing template as empty instead."""
+    foa_id = _insert_foa_sync()  # parsed_template left unset -> None
+    resp = client.post(
+        "/api/v1/proposals/",
+        json=_proposal_payload(foa_id=foa_id),
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(resp.json()["sections"]) > 0
 
 
 def test_list_proposals_only_returns_own_proposals(client, registered_user):

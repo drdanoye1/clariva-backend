@@ -23,7 +23,8 @@ from database import get_db
 from models.db_models import User
 from models.schemas import (
     BudgetSyncOut, DeliverableCreate, DeliverableOut, DeliverableUpdate,
-    EvaluationPlanGenerateOut, MethodologyGenerateOut, MethodologyGenerateRequest,
+    DeriveFromProposalOut, EvaluationPlanGenerateOut, FieldSuggestOut,
+    FieldSuggestRequest, MethodologyGenerateOut, MethodologyGenerateRequest,
     MilestoneCreate, MilestoneOut, MilestoneUpdate, ProjectKnowledgeOut,
     ProjectKnowledgeUpdate, ScopeOfWorkFull, ScopeOfWorkOut, ScopeOfWorkUpdate,
     TaskCreate, TaskOut, TaskUpdate, WorkBreakdownGenerateOut,
@@ -287,6 +288,45 @@ async def generate_work_breakdown(
         milestones=[MilestoneOut.model_validate(m) for m in created["milestones"]],
         deliverables=[DeliverableOut.model_validate(d) for d in created["deliverables"]],
     )
+
+
+@router.post("/{proposal_id}/scope-of-work/derive-from-proposal", response_model=DeriveFromProposalOut)
+async def derive_from_proposal(
+    proposal_id: str, org_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """One-click alternative to typing Project Knowledge/Scope of Work by
+    hand, or to drafting from proposal metadata alone (see
+    generate_methodology/generate_evaluation_plan above): reads the
+    proposal's already-generated section content and extracts a draft
+    summary from it. Returned for review — nothing is persisted here; the
+    user saves each field via the existing PATCH endpoints, same as every
+    other AI-draft action in this router. 400s if the proposal has no
+    generated section content yet."""
+    proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
+    await _meter(org_id, current_user.id, db, reason=f"scope_of_work:derive_from_proposal:{proposal_id}")
+    pk = await engine.get_or_create_project_knowledge(db, proposal_id)
+    draft = await engine.derive_project_knowledge_from_proposal(db, proposal, pk)
+    return DeriveFromProposalOut(**draft)
+
+
+@router.post("/{proposal_id}/scope-of-work/suggest-field", response_model=FieldSuggestOut)
+async def suggest_field(
+    proposal_id: str, body: FieldSuggestRequest, org_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Powers the inline "Suggest" button next to a manually-edited Project
+    Knowledge field (objectives/need_statement/outputs/outcomes) — factors in
+    whatever the user has already typed rather than drafting from scratch."""
+    proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
+    await _meter(org_id, current_user.id, db, reason=f"scope_of_work:suggest_field:{proposal_id}:{body.field}")
+    pk = await engine.get_or_create_project_knowledge(db, proposal_id)
+    company_profile = await _load_company_profile(current_user.id, db)
+    suggestion = await engine.suggest_project_knowledge_field(
+        proposal, pk, company_profile, body.field,
+        current_value=body.current_value, additional_context=body.additional_context,
+    )
+    return FieldSuggestOut(field=body.field, suggestion=suggestion)
 
 
 # ── Budget sync ──────────────────────────────────────────────────────────────

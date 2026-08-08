@@ -25,6 +25,16 @@ def _ctx_to_dict(ctx: OrgContextDB) -> Dict[str, Any]:
         "uei_number":           ctx.uei_number,
         "cage_code":            ctx.cage_code,
         "company_capabilities": ctx.company_capabilities,
+        # Firm identity & address
+        "ein_tax_id":           ctx.ein_tax_id,
+        "duns_number":          ctx.duns_number,
+        "firm_street":          ctx.firm_street,
+        "firm_apt_suite":       ctx.firm_apt_suite,
+        "firm_city":            ctx.firm_city,
+        "firm_state":           ctx.firm_state,
+        "firm_zip":             ctx.firm_zip,
+        "firm_phone":           ctx.firm_phone,
+        # Principal Investigator
         "pi_name":              ctx.pi_name,
         "pi_credentials":       ctx.pi_credentials,
         "pi_orcid":             ctx.pi_orcid,
@@ -32,6 +42,18 @@ def _ctx_to_dict(ctx: OrgContextDB) -> Dict[str, Any]:
         "pi_affiliation":       ctx.pi_affiliation,
         "pi_publications":      ctx.pi_publications,
         "pi_prior_sbir_awards": ctx.pi_prior_sbir_awards,
+        "pi_email":             ctx.pi_email,
+        "pi_phone":             ctx.pi_phone,
+        # Business Official
+        "bo_name":              ctx.bo_name,
+        "bo_title":             ctx.bo_title,
+        "bo_phone":             ctx.bo_phone,
+        "bo_email":             ctx.bo_email,
+        # Authorized Contract Negotiator
+        "acn_name":             ctx.acn_name,
+        "acn_title":            ctx.acn_title,
+        "acn_phone":            ctx.acn_phone,
+        "acn_email":            ctx.acn_email,
         "team_members":         ctx.team_members or [],
         "facilities":           ctx.facilities or [],
         "partners":             ctx.partners or [],
@@ -57,9 +79,15 @@ async def get_profile(
             "industry": "", "core_technologies": [],
             "prior_sbir_experience": False,
             "uei_number": None, "cage_code": None, "company_capabilities": None,
+            "ein_tax_id": None, "duns_number": None,
+            "firm_street": None, "firm_apt_suite": None, "firm_city": None,
+            "firm_state": None, "firm_zip": None, "firm_phone": None,
             "pi_name": None, "pi_credentials": None, "pi_orcid": None,
             "pi_degree": None, "pi_affiliation": None,
             "pi_publications": None, "pi_prior_sbir_awards": None,
+            "pi_email": None, "pi_phone": None,
+            "bo_name": None, "bo_title": None, "bo_phone": None, "bo_email": None,
+            "acn_name": None, "acn_title": None, "acn_phone": None, "acn_email": None,
             "team_members": [], "facilities": [], "partners": [], "past_performance": [],
             "updated_at": None,
         }
@@ -91,6 +119,16 @@ async def save_profile(
     ctx.cage_code             = body.get("cage_code") or None
     ctx.company_capabilities  = body.get("company_capabilities") or None
 
+    # Firm identity & address
+    ctx.ein_tax_id      = body.get("ein_tax_id") or None
+    ctx.duns_number     = body.get("duns_number") or None
+    ctx.firm_street     = body.get("firm_street") or None
+    ctx.firm_apt_suite  = body.get("firm_apt_suite") or None
+    ctx.firm_city       = body.get("firm_city") or None
+    ctx.firm_state      = body.get("firm_state") or None
+    ctx.firm_zip        = body.get("firm_zip") or None
+    ctx.firm_phone      = body.get("firm_phone") or None
+
     # PI
     ctx.pi_name              = body.get("pi_name") or None
     ctx.pi_credentials       = body.get("pi_credentials") or None
@@ -99,6 +137,20 @@ async def save_profile(
     ctx.pi_affiliation       = body.get("pi_affiliation") or None
     ctx.pi_publications      = body.get("pi_publications") or None
     ctx.pi_prior_sbir_awards = body.get("pi_prior_sbir_awards") or None
+    ctx.pi_email             = body.get("pi_email") or None
+    ctx.pi_phone             = body.get("pi_phone") or None
+
+    # Business Official
+    ctx.bo_name   = body.get("bo_name") or None
+    ctx.bo_title  = body.get("bo_title") or None
+    ctx.bo_phone  = body.get("bo_phone") or None
+    ctx.bo_email  = body.get("bo_email") or None
+
+    # Authorized Contract Negotiator
+    ctx.acn_name   = body.get("acn_name") or None
+    ctx.acn_title  = body.get("acn_title") or None
+    ctx.acn_phone  = body.get("acn_phone") or None
+    ctx.acn_email  = body.get("acn_email") or None
 
     # Arrays
     ctx.team_members     = body.get("team_members", [])

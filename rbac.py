@@ -49,6 +49,13 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         "manage_watchlists",    # create/edit/delete watchlists, trigger Grants.gov/SAM.gov sync
         # Phase 5 — Award & Project Management (PRD §16-17)
         "manage_awards",        # create/edit awards, record expenditures, compliance items, issues, performance, closeout, renewals
+        # Phase 7 — Award Received data model foundation (Version 3.0 upgrade)
+        "activate_award",       # lock a ProjectBaseline and flip an award from "received" to "active" — kept
+                                 # as its own permission (not folded into manage_awards) since it's a one-way,
+                                 # baseline-locking action; enforcement today is still via workspace_access.py's
+                                 # assert_can_edit (same as manage_awards — see routers/awards.py's module
+                                 # docstring), this registry entry exists for the same "documented, not yet
+                                 # actively branched on" reason manage_awards does.
         # Phase 6 — Integrations & Marketplace (PRD §19-20)
         "manage_connectors",    # create/edit/delete/test connector connections (webhooks, Slack, etc.) and view their event log
         "manage_api_keys",      # issue/revoke public API keys
@@ -68,6 +75,8 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         "manage_watchlists",
         # Phase 5
         "manage_awards",
+        # Phase 7
+        "activate_award",
         # Phase 6 permissions are deliberately owner-only — connector
         # credentials, API keys, branding, and marketplace listings are all
         # organization-identity/security-sensitive, unlike day-to-day

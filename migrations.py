@@ -74,6 +74,31 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     ("org_contexts", "partners",              "JSON DEFAULT '[]'",   "JSON DEFAULT '[]'::json"),
     ("org_contexts", "past_performance",      "JSON DEFAULT '[]'",   "JSON DEFAULT '[]'::json"),
 
+    # --- org_contexts: Firm identity/address + PI/BO/ACN contacts -----------
+    # Added after reviewing NASA's SBIR/STTR ProSAMS Firm Information and
+    # Phase I Proposal Forms — see docs/ARCHITECTURE.md's Company Profile
+    # addendum. Firm-level identity (EIN, DUNS, address, phone) and the two
+    # contact roles NASA requires alongside the PI (Business Official,
+    # Authorized Contract Negotiator) had no columns at all before this.
+    ("org_contexts", "ein_tax_id",   "VARCHAR(15)",  "VARCHAR(15)"),
+    ("org_contexts", "duns_number",  "VARCHAR(13)",  "VARCHAR(13)"),
+    ("org_contexts", "firm_street",  "VARCHAR(255)", "VARCHAR(255)"),
+    ("org_contexts", "firm_apt_suite", "VARCHAR(100)", "VARCHAR(100)"),
+    ("org_contexts", "firm_city",    "VARCHAR(100)", "VARCHAR(100)"),
+    ("org_contexts", "firm_state",   "VARCHAR(50)",  "VARCHAR(50)"),
+    ("org_contexts", "firm_zip",     "VARCHAR(12)",  "VARCHAR(12)"),
+    ("org_contexts", "firm_phone",   "VARCHAR(30)",  "VARCHAR(30)"),
+    ("org_contexts", "pi_email",     "VARCHAR(255)", "VARCHAR(255)"),
+    ("org_contexts", "pi_phone",     "VARCHAR(30)",  "VARCHAR(30)"),
+    ("org_contexts", "bo_name",      "VARCHAR(255)", "VARCHAR(255)"),
+    ("org_contexts", "bo_title",     "VARCHAR(150)", "VARCHAR(150)"),
+    ("org_contexts", "bo_phone",     "VARCHAR(30)",  "VARCHAR(30)"),
+    ("org_contexts", "bo_email",     "VARCHAR(255)", "VARCHAR(255)"),
+    ("org_contexts", "acn_name",     "VARCHAR(255)", "VARCHAR(255)"),
+    ("org_contexts", "acn_title",    "VARCHAR(150)", "VARCHAR(150)"),
+    ("org_contexts", "acn_phone",    "VARCHAR(30)",  "VARCHAR(30)"),
+    ("org_contexts", "acn_email",    "VARCHAR(255)", "VARCHAR(255)"),
+
     # --- organizations ------------------------------------------------------------
     # Forward-looking extension point called for by the Clariva Enterprise™ PRD
     # (Platform Architecture Overview, §6.2): "All new modules are feature-flagged
@@ -118,6 +143,11 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     # renews. Nullable — every pre-Phase-5 and non-renewal FOARecord has none.
     ("foa_records", "originating_award_id",    "VARCHAR(36)",                      "VARCHAR(36)"),
 
+    # --- foa_records (Version 3.0 architecture upgrade, Phase 14 — Renewal Loop Closure) --
+    # Persists the notes captured on the renewal-creation form; previously
+    # accepted by RenewalCreate but never written anywhere.
+    ("foa_records", "renewal_notes",           "TEXT",                             "TEXT"),
+
     # --- organizations (Phase 6 — Integrations & Marketplace, PRD §20 white-label) --
     # All nullable/defaulted — an org with none of these set renders exactly
     # like today (Clariva-branded, no change in behavior).
@@ -125,7 +155,36 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     ("organizations", "brand_name",          "VARCHAR(255)",      "VARCHAR(255)"),
     ("organizations", "logo_url",            "VARCHAR(1000)",     "VARCHAR(1000)"),
     ("organizations", "primary_color",       "VARCHAR(20)",       "VARCHAR(20)"),
+
+    # --- ai_credit_ledgers (low-balance warning) --------------------------------
+    # Defaulted to the same starter allotment as `balance` so every existing
+    # ledger row reads as "100% remaining" immediately after this migration
+    # runs, rather than divide-by-zero or a false low-balance alarm.
+    ("ai_credit_ledgers", "reference_balance", "FLOAT DEFAULT 100.0", "FLOAT NOT NULL DEFAULT 100.0"),
+
+    # --- credit_allocations (team/department spending caps) --------------------
+    # Additive dimensions alongside the existing per-user/org-wide-default cap
+    # — see CreditAllocation's docstring in models/db_models.py for the
+    # precedence rule CreditEngine.check_allocation() enforces.
+    ("credit_allocations", "team_id",       "VARCHAR(36)", "VARCHAR(36)"),
+    ("credit_allocations", "department_id", "VARCHAR(36)", "VARCHAR(36)"),
+
+    # --- awards (Phase 7 — Award Received data model foundation, Version 3.0) --
+    # IMPORTANT: this SQL-level default ("active") is intentionally DIFFERENT
+    # from the Python/ORM-level default ("received") on Award.award_status in
+    # models/db_models.py — see that column's docstring for the full
+    # rationale. Short version: every Award row that already exists when this
+    # migration runs was created before Award Received existed as a distinct
+    # stage, so it is backfilled as already-active/past-negotiation; only
+    # Award rows the ORM inserts AFTER this migration (i.e. new awards, via
+    # AwardEngine.create_award()) get the "received" starting state and must
+    # go through an explicit "Activate Project" action.
+    ("awards", "award_status", "VARCHAR(20) DEFAULT 'active'", "VARCHAR(20) NOT NULL DEFAULT 'active'"),
 ]
+
+# New tables introduced by Phase 7 (project_baselines, award_conditions) need
+# no entry here either — same create_all()-handles-new-tables rule as Phase 5
+# and Phase 6 above.
 
 # New tables introduced by Phase 5 (awards, award_expenditures,
 # award_compliance_items, award_amendments, project_issues,

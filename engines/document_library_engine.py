@@ -236,6 +236,15 @@ class DocumentLibraryEngine:
             # worth trying keyword matching rather than returning nothing.
             return await self._keyword_search(query, org_id, db, limit, library_type)
         except Exception:
+            # The `embedding` column is a plain JSON column, not a pgvector
+            # `vector` column (see models/db_models.py) — the `<=>` operator
+            # in _vector_search() has no JSON overload, so on real Postgres
+            # this always raises, which leaves the session's transaction in
+            # a failed state. Without rolling back here, the keyword-search
+            # fallback below would itself fail immediately with "current
+            # transaction is aborted", turning a graceful fallback into a
+            # hard 500. Roll back first so the fallback can actually run.
+            await db.rollback()
             return await self._keyword_search(query, org_id, db, limit, library_type)
 
     async def _embed(self, text: str) -> List[float]:

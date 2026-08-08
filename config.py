@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     # Webhook signature key (set in Square dashboard)
     SQUARE_WEBHOOK_SIGNATURE_KEY: str = ""
 
+    # Transactional email (Resend) — used to send org-member invitation
+    # emails (routers/invitations.py). Degrades gracefully exactly like
+    # SAM_GOV_API_KEY: when RESEND_API_KEY is blank, email_service.send_email()
+    # logs a warning and returns False instead of raising, so an invitation
+    # can still be created (and its link relayed by other means) before a
+    # Resend account is set up.
+    RESEND_API_KEY: str = ""
+    EMAIL_FROM: str = "Clariva <onboarding@resend.dev>"
+    # Base URL used to build the invite-accept link embedded in emails
+    # (e.g. "https://app.clariva.ai") — set this in Heroku config vars for
+    # production; the localhost default only matters for local dev.
+    FRONTEND_URL: str = "http://localhost:3000"
+
     # Superadmin seed (set in .env / Heroku config vars)
     SUPERADMIN_EMAIL: str = "admin@aistartupcopilot.org"
     SUPERADMIN_PASSWORD: str = ""

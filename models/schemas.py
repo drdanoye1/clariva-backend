@@ -412,6 +412,12 @@ class KPIDashboard(BaseModel):
 class CreditBalanceOut(BaseModel):
     org_id: str
     balance: float
+    # Low-balance warning addendum: reference_balance is the "100%" mark
+    # (the level of the last top-up); pct_remaining/low_balance are derived
+    # server-side so the frontend never has to duplicate that math.
+    reference_balance: float = 100.0
+    pct_remaining: float = 100.0
+    low_balance: bool = False
     updated_at: Optional[datetime] = None
 
 class CreditTransactionOut(BaseModel):
@@ -427,13 +433,19 @@ class CreditTopupRequest(BaseModel):
     reason: str = "manual_topup"
 
 class CreditAllocationRequest(BaseModel):
-    user_id: Optional[str] = None   # None = org-wide default cap
+    # Exactly one of these should be set — all None targets the org-wide
+    # default cap. See CreditAllocation's docstring in db_models.py.
+    user_id: Optional[str] = None
+    team_id: Optional[str] = None
+    department_id: Optional[str] = None
     cap: Optional[float] = Field(default=None, ge=0)  # None = unlimited
     period: str = "monthly"         # "monthly" | "total"
 
 class CreditAllocationOut(BaseModel):
     id: str
     user_id: Optional[str] = None
+    team_id: Optional[str] = None
+    department_id: Optional[str] = None
     cap: Optional[float] = None
     period: str
 
@@ -664,6 +676,30 @@ class BudgetSyncOut(BaseModel):
     synced_work_packages: int
 
 
+class DeriveFromProposalOut(BaseModel):
+    """Draft values extracted from the proposal's already-generated section
+    content — returned for review, not auto-saved (same "draft into the
+    field, Save is separate" contract as every other AI action here)."""
+    objectives: Optional[str] = None
+    need_statement: Optional[str] = None
+    outputs: Optional[str] = None
+    outcomes: Optional[str] = None
+    evaluation_plan: Optional[str] = None
+    methodology_narrative: Optional[str] = None
+    source_sections_used: List[str] = []
+
+
+class FieldSuggestRequest(BaseModel):
+    field: str  # one of: objectives, need_statement, outputs, outcomes
+    current_value: Optional[str] = None
+    additional_context: Optional[str] = None
+
+
+class FieldSuggestOut(BaseModel):
+    field: str
+    suggestion: str
+
+
 # ── Phase 3 — Collaboration & Content Management (Clariva Enterprise™ PRD §11, §14) ──
 # See docs/ARCHITECTURE.md §8. Composite *Out schemas that join in another
 # table's data (author name, actor name, email) are built manually in
@@ -891,6 +927,23 @@ class ArchiveExpiredOut(BaseModel):
     archived_count: int
 
 
+# ── Supporting Documents (post-Phase-3 addendum — Communication/Partnership
+# document generators from the pre-v5 "Supporting Documents Studio" concept,
+# see engines/supporting_documents_engine.py) ───────────────────────────────
+
+class SupportingDocumentTypeOut(BaseModel):
+    key: str
+    label: str
+    category: str
+
+class GenerateSupportingDocumentRequest(BaseModel):
+    doc_type: str
+    proposal_id: str
+    recipient_name: Optional[str] = None
+    recipient_organization: Optional[str] = None
+    additional_context: Optional[str] = None
+
+
 # ── Funding Intelligence & Grant Tracking (PRD §15, Phase 4) ────────────────────
 # Pipeline/watchlist schemas for the pre-award funnel built on top of the
 # existing FOARecord opportunity record. `agency`/`phase`/`grant_type` are
@@ -923,6 +976,15 @@ class FOARecordOut(BaseModel):
     last_synced_at: Optional[datetime] = None
     created_at: datetime
     has_parsed_template: bool = False
+    # Version 3.0 architecture upgrade, Phase 14 (Renewal Loop Closure) —
+    # surfaces FOARecord.originating_award_id (set since Phase 5 but never
+    # exposed) plus a resolved, human-readable label/link target so the
+    # pipeline board can render "Renewal of <award>" provenance without a
+    # separate lookup call. All four are None for every non-renewal record.
+    originating_award_id: Optional[str] = None
+    originating_proposal_id: Optional[str] = None
+    originating_award_label: Optional[str] = None
+    renewal_notes: Optional[str] = None
 
 class PipelineStageUpdateRequest(BaseModel):
     stage: str
@@ -1029,6 +1091,7 @@ class AwardOut(BaseModel):
     total_award_value: Optional[float] = None
     terms: Optional[str] = None
     status: str
+    award_status: str = "received"  # received | active | closed — see Award.award_status docstring
     created_by: str
     created_at: datetime
     updated_at: Optional[datetime] = None
@@ -1209,6 +1272,119 @@ class RenewalCreate(BaseModel):
     program_title: Optional[str] = None   # defaults to "<original title> (Renewal)"
     deadline: Optional[datetime] = None
     notes: Optional[str] = None
+
+
+# ── Award Received: Data Model Foundation (Version 3.0 architecture upgrade, ──
+# Phase 7) — ProjectBaseline (the immutable "Approved Project Baseline") and
+# AwardCondition (sponsor conditions reviewed before activation). See
+# db_models.py's ProjectBaseline/AwardCondition docstrings for the full
+# rationale.
+
+class ActivateProjectRequest(BaseModel):
+    """Payload for the 'Activate Project' action — locks the first
+    ProjectBaseline for an award and flips Award.award_status to 'active'."""
+    notes: Optional[str] = None
+
+class ProjectBaselineOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    award_id: str
+    version: int
+    is_current: bool
+    total_award_value: Optional[float] = None
+    period_of_performance_start: Optional[datetime] = None
+    period_of_performance_end: Optional[datetime] = None
+    budget_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    scope_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    notes: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: datetime
+
+class AwardConditionCreate(BaseModel):
+    description: str
+    category: Optional[str] = None  # reporting | financial | regulatory | programmatic | other
+    due_date: Optional[datetime] = None
+
+class AwardConditionUpdate(BaseModel):
+    description: Optional[str] = None
+    category: Optional[str] = None
+    due_date: Optional[datetime] = None
+    status: Optional[str] = None  # open | resolved | waived
+
+class AwardConditionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    award_id: str
+    description: str
+    category: Optional[str] = None
+    due_date: Optional[datetime] = None
+    status: str
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    created_by: Optional[str] = None
+    created_at: datetime
+
+
+# ── Planned vs. Actual (Version 3.0 architecture upgrade, Phase 10) ──────────
+# Replaces the dollars-vs-time-only BudgetStatusOut with a real comparison
+# against the locked ProjectBaseline (Phase 7) across budget, work packages,
+# milestones, deliverables, and schedule — see AwardEngine.get_planned_vs_actual
+# for the approximations this makes explicit (see its docstring).
+
+class PlannedVsActualOut(BaseModel):
+    award_id: str
+    baseline_version: int
+    baseline_locked_at: datetime
+    # Budget — same burn-rate/elapsed-time math as BudgetStatusOut, but
+    # against the frozen baseline_snapshot total, not the live BudgetRecord,
+    # so this number doesn't silently drift if the live budget is edited
+    # after activation without a formal re-baseline.
+    baseline_total_cost: float = 0.0
+    total_expended: float = 0.0
+    burn_rate_pct: Optional[float] = None
+    elapsed_pct: Optional[float] = None
+    budget_variance_pct: Optional[float] = None
+    # Scope — planned (from the baseline snapshot) vs current (live
+    # ScopeOfWork). A non-zero drift means the live scope has changed since
+    # the baseline was locked without a re-baseline capturing it yet.
+    planned_work_packages: int = 0
+    current_work_packages: int = 0
+    planned_milestones: int = 0
+    current_milestones: int = 0
+    milestones_completed: int = 0
+    milestones_behind_schedule: int = 0
+    planned_deliverables: int = 0
+    current_deliverables: int = 0
+    deliverables_completed: int = 0
+    deliverables_behind_schedule: int = 0
+    scope_drift: bool = False
+
+
+# ── Portfolio Dashboard (Version 3.0 architecture upgrade, Phase 12) ─────────
+# One rolled-up view across every proposal/award a user can see (owned +
+# every org they belong to), organized around the same three lifecycle
+# stages as LifecycleBanner (frontend) and Award.award_status — see
+# engines/portfolio_engine.py for how each field is computed.
+
+class PortfolioAlertOut(BaseModel):
+    severity: str  # "warning" | "info"
+    message: str
+    proposal_id: Optional[str] = None
+    award_id: Optional[str] = None
+
+class PortfolioSummaryOut(BaseModel):
+    # Lifecycle pipeline widget
+    pre_award_count: int = 0
+    award_received_count: int = 0
+    post_award_count: int = 0
+    # Portfolio health
+    total_active_award_value: float = 0.0
+    open_sponsor_conditions: int = 0
+    awards_over_budget: int = 0
+    milestones_behind_schedule: int = 0
+    deliverables_behind_schedule: int = 0
+    # Executive alerts — ordered most-actionable first
+    alerts: List[PortfolioAlertOut] = Field(default_factory=list)
 
 
 # ── Integrations & Marketplace (PRD §19-20, Phase 6) ─────────────────────────

@@ -26,13 +26,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models.db_models import Award, OrgMembership, User
 from models.schemas import (
-    AwardAmendmentCreate, AwardAmendmentOut, AwardCloseoutOut, AwardCloseoutRequest,
-    AwardComplianceItemCreate, AwardComplianceItemOut, AwardComplianceItemUpdate,
-    AwardCreate, AwardExpenditureCreate, AwardExpenditureOut, AwardOut,
-    AwardPerformanceRecordCreate, AwardPerformanceRecordOut, AwardReportOut,
-    AwardUpdate, BudgetStatusOut, FOARecordOut, ProjectExecutionStatusOut,
-    ProjectIssueCreate, ProjectIssueOut, ProjectIssueUpdate, RenewalCreate,
-    ReportNarrativeRequest,
+    ActivateProjectRequest, AwardAmendmentCreate, AwardAmendmentOut, AwardCloseoutOut,
+    AwardCloseoutRequest, AwardComplianceItemCreate, AwardComplianceItemOut,
+    AwardComplianceItemUpdate, AwardConditionCreate, AwardConditionOut,
+    AwardConditionUpdate, AwardCreate, AwardExpenditureCreate, AwardExpenditureOut,
+    AwardOut, AwardPerformanceRecordCreate, AwardPerformanceRecordOut, AwardReportOut,
+    AwardUpdate, BudgetStatusOut, FOARecordOut, PlannedVsActualOut, ProjectBaselineOut,
+    ProjectExecutionStatusOut, ProjectIssueCreate, ProjectIssueOut, ProjectIssueUpdate,
+    RenewalCreate, ReportNarrativeRequest,
 )
 from routers.auth import get_current_user
 from routers.organizations import _assert_member
@@ -53,6 +54,7 @@ def _to_award_out(award: Award, proposal_title: Optional[str] = None) -> AwardOu
         period_of_performance_start=award.period_of_performance_start,
         period_of_performance_end=award.period_of_performance_end,
         total_award_value=award.total_award_value, terms=award.terms, status=award.status,
+        award_status=award.award_status,
         created_by=award.created_by, created_at=award.created_at, updated_at=award.updated_at,
         proposal_title=proposal_title,
     )
@@ -125,6 +127,88 @@ async def update_award(
     return _to_award_out(award, proposal_title=access.proposal.title)
 
 
+# ── Award Received: activation & baselines (Version 3.0 upgrade, Phase 8) ──
+# "Activate Project" — locks the first ProjectBaseline and flips
+# award_status from "received" to "active". Gated the same way every other
+# award mutation is (assert_can_edit via _get_award_and_access), not by
+# rbac.py's "activate_award" permission — see that permission's docstring.
+
+@router.post("/{award_id}/activate", response_model=ProjectBaselineOut)
+async def activate_award(
+    award_id: str, payload: ActivateProjectRequest = ActivateProjectRequest(),
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    baseline = await engine.activate_award(db, award_id, payload.model_dump(), created_by=current_user.id)
+    await db.commit()
+    return baseline
+
+
+@router.post("/{award_id}/baselines/reversion", response_model=ProjectBaselineOut)
+async def create_baseline_version(
+    award_id: str, payload: ActivateProjectRequest = ActivateProjectRequest(),
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Re-baselines an already-active award — e.g. after an approved
+    AwardAmendment changed budget, scope, or schedule. A deliberate,
+    explicit call rather than automatic on amendment approval: the
+    amendment-decision flow (collaboration_engine.py::decide_approval_request)
+    applies effective_changes to the live Award directly without importing
+    AwardEngine, matching this codebase's "engines interoperate through
+    shared models, not each other's classes" convention (see
+    award_engine.py's module docstring) — whether re-baselining should be
+    automatic-on-approval or a deliberate follow-up action is a UI decision
+    left to Phase 9/11, not resolved here."""
+    await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    baseline = await engine.create_baseline_version(db, award_id, payload.model_dump(), created_by=current_user.id)
+    await db.commit()
+    return baseline
+
+
+@router.get("/{award_id}/baselines", response_model=List[ProjectBaselineOut])
+async def list_baselines(award_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    await _get_award_and_access(award_id, current_user, db, require_edit=False)
+    return await engine.list_baselines(db, award_id)
+
+
+@router.get("/{award_id}/baselines/current", response_model=ProjectBaselineOut)
+async def get_current_baseline(award_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    await _get_award_and_access(award_id, current_user, db, require_edit=False)
+    baseline = await engine.get_current_baseline(db, award_id)
+    if not baseline:
+        raise HTTPException(status_code=404, detail="This award has not been activated yet — no baseline exists.")
+    return baseline
+
+
+# ── Award Received: sponsor conditions (Version 3.0 upgrade, Phase 8) ──────
+
+@router.post("/{award_id}/conditions", response_model=AwardConditionOut)
+async def create_condition(
+    award_id: str, payload: AwardConditionCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    condition = await engine.create_condition(db, award_id, payload.model_dump(), created_by=current_user.id)
+    await db.commit()
+    return condition
+
+
+@router.get("/{award_id}/conditions", response_model=List[AwardConditionOut])
+async def list_conditions(award_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    await _get_award_and_access(award_id, current_user, db, require_edit=False)
+    return await engine.list_conditions(db, award_id)
+
+
+@router.patch("/conditions/{condition_id}", response_model=AwardConditionOut)
+async def update_condition(
+    condition_id: str, payload: AwardConditionUpdate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    condition = await engine.get_condition_or_404(db, condition_id)
+    await _get_award_and_access(condition.award_id, current_user, db, require_edit=True)
+    updated = await engine.update_condition(db, condition_id, payload.model_dump(exclude_unset=True), resolved_by=current_user.id)
+    await db.commit()
+    return updated
+
+
 # ── Budget administration / burn-rate ───────────────────────────────────────
 
 @router.post("/{award_id}/expenditures", response_model=AwardExpenditureOut)
@@ -147,6 +231,15 @@ async def list_expenditures(award_id: str, db: AsyncSession = Depends(get_db), c
 async def get_budget_status(award_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     await _get_award_and_access(award_id, current_user, db, require_edit=False)
     return await engine.get_budget_status(db, award_id)
+
+
+@router.get("/{award_id}/planned-vs-actual", response_model=PlannedVsActualOut)
+async def get_planned_vs_actual(award_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Version 3.0 upgrade, Phase 10: budget/scope/schedule variance against
+    the locked ProjectBaseline, not the live BudgetRecord/ScopeOfWork —
+    raises 400 (via the engine) if the award hasn't been activated yet."""
+    await _get_award_and_access(award_id, current_user, db, require_edit=False)
+    return await engine.get_planned_vs_actual(db, award_id)
 
 
 # ── Compliance checklist ─────────────────────────────────────────────────────
@@ -311,9 +404,14 @@ async def get_closeout(award_id: str, db: AsyncSession = Depends(get_db), curren
 async def create_renewal_opportunity(
     award_id: str, payload: RenewalCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
 ):
-    await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    award, access = await _get_award_and_access(award_id, current_user, db, require_edit=True)
     record = await engine.create_renewal_opportunity(db, award_id, payload.model_dump(), uploaded_by=current_user.id)
     await db.commit()
+    # Version 3.0 architecture upgrade, Phase 14 — the award/proposal are
+    # already in scope here (no extra query needed, unlike the general
+    # foa.py::_to_foa_out resolver used for every other listing endpoint),
+    # so populate the provenance fields directly on the creation response.
+    award_label = f"{access.proposal.title} · {award.funding_agency}" + (f" ({award.award_number})" if award.award_number else "")
     return FOARecordOut(
         id=record.id, org_id=record.org_id, agency=record.agency, program_title=record.program_title,
         solicitation_number=record.solicitation_number, phase=record.phase, grant_type=record.grant_type,
@@ -324,4 +422,6 @@ async def create_renewal_opportunity(
         bid_no_go_decision=record.bid_no_go_decision, bid_no_go_rationale=record.bid_no_go_rationale,
         assigned_to=record.assigned_to, uploaded_by=record.uploaded_by, last_synced_at=record.last_synced_at,
         created_at=record.created_at, has_parsed_template=record.parsed_template is not None,
+        originating_award_id=record.originating_award_id, originating_proposal_id=award.proposal_id,
+        originating_award_label=award_label, renewal_notes=record.renewal_notes,
     )

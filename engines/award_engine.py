@@ -53,11 +53,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import settings
 from models.db_models import (
     ApprovalRequest, Award, AwardAmendment, AwardCloseout, AwardComplianceItem,
-    AwardExpenditure, AwardPerformanceRecord, BudgetRecord, Deliverable, FOARecord,
-    MemoryRecord, Milestone, Notification, ProjectIssue, ProjectKnowledge, Proposal,
-    ScopeOfWork, Task, WorkPackage, new_uuid,
+    AwardCondition, AwardExpenditure, AwardPerformanceRecord, BudgetRecord,
+    Deliverable, FOARecord, MemoryRecord, Milestone, Notification, ProjectBaseline,
+    ProjectIssue, ProjectKnowledge, Proposal, ScopeOfWork, Task, WorkPackage, new_uuid,
 )
-from models.schemas import AwardReportOut, BudgetStatusOut, ProjectExecutionStatusOut
+from models.schemas import AwardReportOut, BudgetStatusOut, PlannedVsActualOut, ProjectExecutionStatusOut
 
 _log = logging.getLogger(__name__)
 
@@ -170,6 +170,277 @@ class AwardEngine:
             for a in shared.scalars().all():
                 by_id[a.id] = a
         return sorted(by_id.values(), key=lambda a: a.created_at or datetime.min, reverse=True)
+
+    # ── Award Received: activation & baselining (Phase 7 data model; PRD  ───
+    # addendum "Version 3.0 — Three Synchronized Operational Environments").
+    # `_build_snapshot` is the one place that reads the live BudgetRecord/
+    # ScopeOfWork hierarchy into a denormalized snapshot dict, shared by
+    # `activate_award` (the very first baseline) and `create_baseline_version`
+    # (every re-baseline after an approved amendment), so the two never drift.
+
+    async def _build_snapshot(self, db: AsyncSession, award: Award) -> Dict[str, Dict[str, Any]]:
+        budget_snapshot: Dict[str, Any] = {}
+        if award.budget_record_id:
+            result = await db.execute(select(BudgetRecord).where(BudgetRecord.id == award.budget_record_id))
+            budget = result.scalar_one_or_none()
+            if budget:
+                budget_snapshot = {
+                    "budget_months": budget.budget_months,
+                    "personnel": budget.personnel or [],
+                    "consultants": budget.consultants or [],
+                    "equipment": budget.equipment or [],
+                    "travel": budget.travel or [],
+                    "other_direct": budget.other_direct or [],
+                    "subcontracts": budget.subcontracts or [],
+                    "indirect_rate": budget.indirect_rate,
+                    "indirect_base": budget.indirect_base,
+                    "fee_rate": budget.fee_rate,
+                    "total_direct": budget.total_direct,
+                    "total_indirect": budget.total_indirect,
+                    "total_cost": budget.total_cost,
+                }
+
+        scope_snapshot: Dict[str, Any] = {"work_packages": [], "milestones": [], "deliverables": []}
+        pk_result = await db.execute(select(ProjectKnowledge).where(ProjectKnowledge.proposal_id == award.proposal_id))
+        pk = pk_result.scalar_one_or_none()
+        if pk:
+            sow_result = await db.execute(select(ScopeOfWork).where(ScopeOfWork.project_knowledge_id == pk.id))
+            sow = sow_result.scalar_one_or_none()
+            if sow:
+                wp_result = await db.execute(
+                    select(WorkPackage).where(WorkPackage.scope_of_work_id == sow.id).order_by(WorkPackage.order_index)
+                )
+                work_packages = list(wp_result.scalars().all())
+                scope_snapshot["work_packages"] = [
+                    {
+                        "id": wp.id, "name": wp.name, "description": wp.description, "lead": wp.lead,
+                        "start_month": wp.start_month, "end_month": wp.end_month, "estimated_cost": wp.estimated_cost,
+                    }
+                    for wp in work_packages
+                ]
+                wp_ids = [wp.id for wp in work_packages]
+                if wp_ids:
+                    tasks_result = await db.execute(select(Task).where(Task.work_package_id.in_(wp_ids)))
+                    scope_snapshot["tasks"] = [
+                        {
+                            "id": t.id, "work_package_id": t.work_package_id, "name": t.name,
+                            "start_month": t.start_month, "end_month": t.end_month, "status": t.status,
+                        }
+                        for t in tasks_result.scalars().all()
+                    ]
+                milestones_result = await db.execute(select(Milestone).where(Milestone.scope_of_work_id == sow.id))
+                scope_snapshot["milestones"] = [
+                    {"id": m.id, "name": m.name, "due_month": m.due_month, "status": m.status}
+                    for m in milestones_result.scalars().all()
+                ]
+                deliverables_result = await db.execute(select(Deliverable).where(Deliverable.scope_of_work_id == sow.id))
+                scope_snapshot["deliverables"] = [
+                    {"id": d.id, "name": d.name, "due_month": d.due_month,
+                     "deliverable_type": d.deliverable_type, "status": d.status}
+                    for d in deliverables_result.scalars().all()
+                ]
+
+        return {"budget_snapshot": budget_snapshot, "scope_snapshot": scope_snapshot}
+
+    async def activate_award(self, db: AsyncSession, award_id: str, data: Dict[str, Any], created_by: str) -> ProjectBaseline:
+        """The 'Activate Project' action: locks the first ProjectBaseline and
+        flips Award.award_status from 'received' to 'active'. Only valid
+        exactly once per award — re-baselining after this point goes through
+        create_baseline_version (driven by an approved AwardAmendment), never
+        through this method again."""
+        award = await self.get_award_or_404(db, award_id)
+        if award.award_status != "received":
+            raise HTTPException(status_code=400, detail=f"This award is already {award.award_status} and cannot be activated again.")
+
+        snapshot = await self._build_snapshot(db, award)
+        baseline = ProjectBaseline(
+            id=new_uuid(), award_id=award_id, version=1, is_current=True,
+            total_award_value=award.total_award_value,
+            period_of_performance_start=award.period_of_performance_start,
+            period_of_performance_end=award.period_of_performance_end,
+            budget_snapshot=snapshot["budget_snapshot"], scope_snapshot=snapshot["scope_snapshot"],
+            notes=data.get("notes"), created_by=created_by,
+        )
+        db.add(baseline)
+        award.award_status = "active"
+        await db.flush()
+        await db.refresh(baseline)
+        return baseline
+
+    async def create_baseline_version(self, db: AsyncSession, award_id: str, data: Dict[str, Any], created_by: str) -> ProjectBaseline:
+        """Re-baselines an already-active award — called after an
+        AwardAmendment changing budget, scope, or schedule is approved
+        (Phase 8 wires the actual trigger; this method is the mechanism).
+        Never edits the previous baseline row: flips it to is_current=False
+        and inserts a new, higher-version row instead, so every prior
+        approved state stays reconstructable."""
+        award = await self.get_award_or_404(db, award_id)
+        current_result = await db.execute(
+            select(ProjectBaseline).where(ProjectBaseline.award_id == award_id, ProjectBaseline.is_current == True)  # noqa: E712
+        )
+        current = current_result.scalar_one_or_none()
+        if not current:
+            raise HTTPException(status_code=400, detail="This award has not been activated yet — no baseline exists to re-version.")
+
+        current.is_current = False
+        await db.flush()
+
+        snapshot = await self._build_snapshot(db, award)
+        baseline = ProjectBaseline(
+            id=new_uuid(), award_id=award_id, version=current.version + 1, is_current=True,
+            total_award_value=award.total_award_value,
+            period_of_performance_start=award.period_of_performance_start,
+            period_of_performance_end=award.period_of_performance_end,
+            budget_snapshot=snapshot["budget_snapshot"], scope_snapshot=snapshot["scope_snapshot"],
+            notes=data.get("notes"), created_by=created_by,
+        )
+        db.add(baseline)
+        await db.flush()
+        await db.refresh(baseline)
+        return baseline
+
+    async def get_current_baseline(self, db: AsyncSession, award_id: str) -> Optional[ProjectBaseline]:
+        result = await db.execute(
+            select(ProjectBaseline).where(ProjectBaseline.award_id == award_id, ProjectBaseline.is_current == True)  # noqa: E712
+        )
+        return result.scalar_one_or_none()
+
+    async def list_baselines(self, db: AsyncSession, award_id: str) -> List[ProjectBaseline]:
+        result = await db.execute(
+            select(ProjectBaseline).where(ProjectBaseline.award_id == award_id).order_by(ProjectBaseline.version.desc())
+        )
+        return list(result.scalars().all())
+
+    # ── Award Received: sponsor conditions (Phase 7 data model) ────────────
+
+    async def get_condition_or_404(self, db: AsyncSession, condition_id: str) -> AwardCondition:
+        result = await db.execute(select(AwardCondition).where(AwardCondition.id == condition_id))
+        condition = result.scalar_one_or_none()
+        if not condition:
+            raise HTTPException(status_code=404, detail="Award condition not found")
+        return condition
+
+    async def create_condition(self, db: AsyncSession, award_id: str, data: Dict[str, Any], created_by: str) -> AwardCondition:
+        await self.get_award_or_404(db, award_id)
+        condition = AwardCondition(
+            id=new_uuid(), award_id=award_id, description=data["description"],
+            category=data.get("category"), due_date=data.get("due_date"), created_by=created_by,
+        )
+        db.add(condition)
+        await db.flush()
+        await db.refresh(condition)
+        return condition
+
+    async def list_conditions(self, db: AsyncSession, award_id: str) -> List[AwardCondition]:
+        result = await db.execute(
+            select(AwardCondition).where(AwardCondition.award_id == award_id).order_by(AwardCondition.due_date)
+        )
+        return list(result.scalars().all())
+
+    async def update_condition(self, db: AsyncSession, condition_id: str, data: Dict[str, Any], resolved_by: Optional[str] = None) -> AwardCondition:
+        condition = await self.get_condition_or_404(db, condition_id)
+        for field in ("description", "category", "due_date", "status"):
+            if field in data and data[field] is not None:
+                setattr(condition, field, data[field])
+        if data.get("status") in ("resolved", "waived") and not condition.resolved_at:
+            condition.resolved_at = datetime.utcnow()
+            condition.resolved_by = resolved_by
+        await db.flush()
+        await db.refresh(condition)
+        return condition
+
+    # ── Planned vs. Actual (Version 3.0 upgrade, Phase 10) ──────────────────
+    # Replaces the dollars-vs-time-only get_budget_status comparison with a
+    # real one against the locked ProjectBaseline, across budget, work
+    # packages, milestones, deliverables, and schedule.
+
+    async def get_planned_vs_actual(self, db: AsyncSession, award_id: str) -> PlannedVsActualOut:
+        award = await self.get_award_or_404(db, award_id)
+        baseline = await self.get_current_baseline(db, award_id)
+        if not baseline:
+            raise HTTPException(status_code=400, detail="This award has not been activated yet — no baseline exists to compare against.")
+
+        # Budget: baseline_snapshot's frozen total, not the live BudgetRecord
+        # (get_budget_status's baseline) — see PlannedVsActualOut's docstring
+        # for why these two are deliberately allowed to diverge.
+        baseline_total_cost = (baseline.budget_snapshot or {}).get("total_cost") or 0.0
+        expenditures = await self.list_expenditures(db, award_id)
+        total_expended = sum(e.amount for e in expenditures)
+        burn_rate_pct = round(total_expended / baseline_total_cost * 100, 1) if baseline_total_cost > 0 else None
+
+        start = _naive(baseline.period_of_performance_start)
+        end = _naive(baseline.period_of_performance_end)
+        elapsed_pct: Optional[float] = None
+        elapsed_months: Optional[float] = None
+        if start and end and end > start:
+            total_seconds = (end - start).total_seconds()
+            elapsed_seconds = max(0.0, min(total_seconds, (datetime.utcnow() - start).total_seconds()))
+            elapsed_pct = round(elapsed_seconds / total_seconds * 100, 1)
+            total_months = total_seconds / (30.44 * 86400)
+            elapsed_months = elapsed_pct / 100 * total_months
+
+        budget_variance_pct = round(burn_rate_pct - elapsed_pct, 1) if burn_rate_pct is not None and elapsed_pct is not None else None
+
+        # Scope: planned counts come from the frozen baseline snapshot;
+        # current/completed/behind-schedule come from LIVE ScopeOfWork rows
+        # (unlike the budget comparison, live status fields — not baseline
+        # snapshot values, which never change — are what tell us what's
+        # actually been completed since the baseline was locked).
+        scope_snapshot = baseline.scope_snapshot or {}
+        planned_work_packages = len(scope_snapshot.get("work_packages") or [])
+        planned_milestones = len(scope_snapshot.get("milestones") or [])
+        planned_deliverables = len(scope_snapshot.get("deliverables") or [])
+
+        current_work_packages = 0
+        current_milestones = milestones_completed = milestones_behind_schedule = 0
+        current_deliverables = deliverables_completed = deliverables_behind_schedule = 0
+
+        pk_result = await db.execute(select(ProjectKnowledge).where(ProjectKnowledge.proposal_id == award.proposal_id))
+        pk = pk_result.scalar_one_or_none()
+        if pk:
+            sow_result = await db.execute(select(ScopeOfWork).where(ScopeOfWork.project_knowledge_id == pk.id))
+            sow = sow_result.scalar_one_or_none()
+            if sow:
+                wp_result = await db.execute(select(WorkPackage).where(WorkPackage.scope_of_work_id == sow.id))
+                current_work_packages = len(list(wp_result.scalars().all()))
+
+                milestones_result = await db.execute(select(Milestone).where(Milestone.scope_of_work_id == sow.id))
+                live_milestones = list(milestones_result.scalars().all())
+                current_milestones = len(live_milestones)
+                milestones_completed = sum(1 for m in live_milestones if m.status == "complete")
+                if elapsed_months is not None:
+                    milestones_behind_schedule = sum(
+                        1 for m in live_milestones
+                        if m.status != "complete" and m.due_month is not None and m.due_month <= elapsed_months
+                    )
+
+                deliverables_result = await db.execute(select(Deliverable).where(Deliverable.scope_of_work_id == sow.id))
+                live_deliverables = list(deliverables_result.scalars().all())
+                current_deliverables = len(live_deliverables)
+                deliverables_completed = sum(1 for d in live_deliverables if d.status == "complete")
+                if elapsed_months is not None:
+                    deliverables_behind_schedule = sum(
+                        1 for d in live_deliverables
+                        if d.status != "complete" and d.due_month is not None and d.due_month <= elapsed_months
+                    )
+
+        scope_drift = (
+            planned_work_packages != current_work_packages
+            or planned_milestones != current_milestones
+            or planned_deliverables != current_deliverables
+        )
+
+        return PlannedVsActualOut(
+            award_id=award_id, baseline_version=baseline.version, baseline_locked_at=baseline.created_at,
+            baseline_total_cost=baseline_total_cost, total_expended=total_expended,
+            burn_rate_pct=burn_rate_pct, elapsed_pct=elapsed_pct, budget_variance_pct=budget_variance_pct,
+            planned_work_packages=planned_work_packages, current_work_packages=current_work_packages,
+            planned_milestones=planned_milestones, current_milestones=current_milestones,
+            milestones_completed=milestones_completed, milestones_behind_schedule=milestones_behind_schedule,
+            planned_deliverables=planned_deliverables, current_deliverables=current_deliverables,
+            deliverables_completed=deliverables_completed, deliverables_behind_schedule=deliverables_behind_schedule,
+            scope_drift=scope_drift,
+        )
 
     # ── Budget administration / burn-rate (PRD §16) ─────────────────────────
 
@@ -542,6 +813,9 @@ fabricate figures, dates, or results not given above.
             phase=proposal.phase, grant_type=proposal.grant_type or "sbir",
             deadline=data.get("deadline"), uploaded_by=uploaded_by, org_id=award.org_id,
             pipeline_stage="identified", source="manual", originating_award_id=award.id,
+            # Version 3.0 architecture upgrade, Phase 14 — previously accepted
+            # by RenewalCreate but never written anywhere; see FOARecord.
+            renewal_notes=data.get("notes"),
         )
         db.add(record)
         await db.flush()

@@ -10,7 +10,7 @@ Design notes (same discipline as engines/funding_intelligence_engine.py):
   functional in this environment (webhook/Slack/Teams — no OAuth app
   needed) versus registered-but-not-configured placeholders (Microsoft
   365, Google Workspace, Salesforce, HubSpot, DocuSign, Adobe Sign,
-  financial ERPs — all of which need a real OAuth app and live
+  financial ERPs, Zoom — all of which need a real OAuth app and live
   credentials this environment doesn't have). Dispatching to a
   non-functional type always returns "not configured" rather than
   erroring — the same graceful-degradation pattern SAM.gov established in
@@ -58,6 +58,7 @@ CONNECTOR_TYPES: Dict[str, Dict[str, Any]] = {
     "docusign":         {"label": "DocuSign",              "functional": False, "config_fields": []},
     "adobe_sign":       {"label": "Adobe Sign",            "functional": False, "config_fields": []},
     "financial_erp":    {"label": "Financial ERP",         "functional": False, "config_fields": []},
+    "zoom":             {"label": "Zoom",                  "functional": False, "config_fields": []},
 }
 
 

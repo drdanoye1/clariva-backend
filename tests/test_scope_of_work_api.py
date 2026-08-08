@@ -2,10 +2,14 @@
 Scope of Work Engine router — exercised through the real HTTP endpoints.
 
 Only the CRUD/ownership/staleness/budget-sync surface is covered here — the
-three AI-generation endpoints (generate-methodology, generate-evaluation-
-plan, generate-work-breakdown) need a real OpenAI call and are intentionally
-out of scope for this suite, same policy as proposals.py's generate-section
-(see conftest.py's module docstring).
+AI-generation endpoints (generate-methodology, generate-evaluation-plan,
+generate-work-breakdown, derive-from-proposal, suggest-field) need a real
+OpenAI call and are intentionally out of scope for this suite, same policy
+as proposals.py's generate-section (see conftest.py's module docstring).
+derive-from-proposal and suggest-field each have one validation path that
+short-circuits before any OpenAI call (no generated sections to derive from;
+an unrecognized field name) — those paths are covered below since they don't
+need a real API call.
 """
 from __future__ import annotations
 
@@ -222,6 +226,52 @@ def test_sync_budget_merges_work_package_costs(client, registered_user):
 
     knowledge = client.get(f"/api/v1/proposals/{proposal_id}/knowledge", headers=headers).json()
     assert "budget" not in knowledge["stale_flags"]
+
+
+# ── Derive from Proposal / inline field suggestions ─────────────────────────
+# (validation-only — see module docstring for why the actual AI paths aren't
+# exercised here)
+
+def test_derive_from_proposal_400s_with_no_generated_sections(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    resp = client.post(
+        f"/api/v1/proposals/{proposal_id}/scope-of-work/derive-from-proposal",
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 400
+    assert "generated section content" in resp.json()["detail"]
+
+
+def test_derive_from_proposal_requires_ownership(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    other = _register_and_login(client, "other3")
+    resp = client.post(
+        f"/api/v1/proposals/{proposal_id}/scope-of-work/derive-from-proposal",
+        headers=other["headers"],
+    )
+    assert resp.status_code == 404
+
+
+def test_suggest_field_rejects_unknown_field(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    resp = client.post(
+        f"/api/v1/proposals/{proposal_id}/scope-of-work/suggest-field",
+        json={"field": "not_a_real_field", "current_value": ""},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 400
+    assert "Unknown field" in resp.json()["detail"]
+
+
+def test_suggest_field_requires_ownership(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    other = _register_and_login(client, "other4")
+    resp = client.post(
+        f"/api/v1/proposals/{proposal_id}/scope-of-work/suggest-field",
+        json={"field": "objectives", "current_value": ""},
+        headers=other["headers"],
+    )
+    assert resp.status_code == 404
 
 
 def test_sync_budget_preserves_manually_added_line_items(client, registered_user):

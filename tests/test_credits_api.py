@@ -96,3 +96,86 @@ def test_editor_cannot_manage_allocations(client, registered_user):
     resp = client.post(f"/api/v1/organizations/{org_id}/credits/allocations",
                         json={"cap": 5.0}, headers=editor["headers"])
     assert resp.status_code == 403
+
+
+# ── Low-balance warning fields ────────────────────────────────────────────────
+
+def test_balance_response_includes_low_balance_fields(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    resp = client.get(f"/api/v1/organizations/{org_id}/credits", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["reference_balance"] == DEFAULT_STARTING_BALANCE
+    assert body["pct_remaining"] == 100.0
+    assert body["low_balance"] is False
+
+
+def test_low_balance_flag_flips_true_once_below_threshold(client, registered_user):
+    import asyncio
+    from database import AsyncSessionLocal
+    from engines.credit_engine import CreditEngine
+
+    org_id = _create_org(client, registered_user["headers"])
+
+    async def _spend_most_of_the_pool():
+        async with AsyncSessionLocal() as db:
+            # There's no HTTP endpoint that spends credits directly (that
+            # happens via AI-generation call sites) — debit through the
+            # engine directly, same org_id the API just created.
+            await CreditEngine().debit(db, org_id, registered_user["user_id"], 85.0, reason="test_spend")
+            await db.commit()
+
+    asyncio.run(_spend_most_of_the_pool())
+
+    resp = client.get(f"/api/v1/organizations/{org_id}/credits", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["balance"] == DEFAULT_STARTING_BALANCE - 85.0
+    assert body["low_balance"] is True
+
+
+# ── Team / department spending caps via the API ───────────────────────────────
+
+def test_owner_can_set_team_allocation_cap(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    team_resp = client.post(f"/api/v1/organizations/{org_id}/teams",
+                             json={"name": "Grants Team"}, headers=registered_user["headers"])
+    assert team_resp.status_code == 201, team_resp.text
+    team_id = team_resp.json()["id"]
+
+    resp = client.post(f"/api/v1/organizations/{org_id}/credits/allocations",
+                        json={"team_id": team_id, "cap": 15.0, "period": "monthly"},
+                        headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["team_id"] == team_id
+    assert resp.json()["cap"] == 15.0
+
+    listing = client.get(f"/api/v1/organizations/{org_id}/credits/allocations", headers=registered_user["headers"])
+    assert any(a["team_id"] == team_id and a["cap"] == 15.0 for a in listing.json())
+
+
+def test_owner_can_set_department_allocation_cap(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    dept_resp = client.post(f"/api/v1/organizations/{org_id}/departments",
+                             json={"name": "R&D"}, headers=registered_user["headers"])
+    assert dept_resp.status_code == 201, dept_resp.text
+    department_id = dept_resp.json()["id"]
+
+    resp = client.post(f"/api/v1/organizations/{org_id}/credits/allocations",
+                        json={"department_id": department_id, "cap": 30.0, "period": "total"},
+                        headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["department_id"] == department_id
+    assert resp.json()["cap"] == 30.0
+
+
+def test_setting_allocation_with_multiple_scopes_is_rejected(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    team_resp = client.post(f"/api/v1/organizations/{org_id}/teams",
+                             json={"name": "Team X"}, headers=registered_user["headers"])
+    team_id = team_resp.json()["id"]
+
+    resp = client.post(f"/api/v1/organizations/{org_id}/credits/allocations",
+                        json={"team_id": team_id, "user_id": registered_user["user_id"], "cap": 5.0},
+                        headers=registered_user["headers"])
+    assert resp.status_code == 400

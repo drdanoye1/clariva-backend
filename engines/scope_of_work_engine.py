@@ -39,8 +39,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from models.db_models import (
-    BudgetRecord, Deliverable, Milestone, ProjectKnowledge, ScopeOfWork,
-    Task, WorkPackage, new_uuid,
+    BudgetRecord, Deliverable, Milestone, ProjectKnowledge, ProposalSection,
+    ScopeOfWork, Task, WorkPackage, new_uuid,
 )
 
 _log = logging.getLogger(__name__)
@@ -562,6 +562,150 @@ empty lists are fine. Month numbers are 1-indexed from project start.
             for d_name in wp_data.get("deliverables", []) or []:
                 created["deliverables"].append(await self.create_deliverable(db, proposal_id, {"name": d_name, "work_package_id": wp.id}))
         return created
+
+    # ── Derive from Proposal / inline field suggestions ─────────────────────
+    # Both power the Scope of Work tab's non-blank-slate onramps: a one-click
+    # "Derive from Proposal" action for proposals that already have generated
+    # section content, and a per-field "Suggest" button for manual editing —
+    # distinct from generate_methodology_narrative/generate_evaluation_plan
+    # above, which draft from proposal *metadata* only (title/agency/research
+    # focus) rather than the actual written narrative.
+
+    _SUGGESTABLE_FIELDS: Dict[str, str] = {
+        "objectives": "the project's objectives — what it aims to achieve",
+        "need_statement": "the need statement — the problem or gap this project addresses",
+        "outputs": "the project's intended outputs — concrete things produced",
+        "outcomes": "the project's intended outcomes — longer-term changes/results",
+    }
+
+    async def derive_project_knowledge_from_proposal(
+        self, db: AsyncSession, proposal: Any, project_knowledge: ProjectKnowledge,
+    ) -> Dict[str, Any]:
+        """Reads the proposal's already-generated ProposalSection content and
+        extracts a Project Knowledge / Scope of Work draft from it. Returns an
+        unpersisted dict for the caller to show for review — nothing is saved
+        until the user clicks Save on each card, same as every other AI
+        action in this engine. Raises 400 if the proposal has no generated
+        section content yet (nothing to derive from) rather than silently
+        returning nulls, so the frontend can point the user at manual entry
+        or full proposal generation instead."""
+        result = await db.execute(
+            select(ProposalSection).where(ProposalSection.proposal_id == proposal.id).order_by(ProposalSection.section_id)
+        )
+        sections = [s for s in result.scalars().all() if (s.content or "").strip()]
+        if not sections:
+            raise HTTPException(
+                status_code=400,
+                detail="This proposal doesn't have any generated section content yet to derive a Scope of Work from. Generate proposal sections first, or fill in Project Knowledge manually below.",
+            )
+
+        # Bound the context sent to the model rather than concatenating the
+        # entire proposal — generous enough for a full SBIR/STTR narrative,
+        # cut off gracefully if it runs long.
+        blocks: List[str] = []
+        budget = 12000
+        for s in sections:
+            chunk = f"### {s.title}\n{s.content.strip()}"
+            if len(chunk) > budget:
+                chunk = chunk[:budget]
+            blocks.append(chunk)
+            budget -= len(chunk)
+            if budget <= 0:
+                break
+        proposal_text = "\n\n".join(blocks)
+
+        prompt = f"""
+Read the following already-written grant proposal sections and extract a
+Project Knowledge / Scope of Work summary as JSON only (no markdown fences,
+no commentary — just the JSON object).
+
+Project title: {getattr(proposal, "title", "")}
+Agency / grant type: {getattr(proposal, "agency", "")} / {getattr(proposal, "grant_type", "")}
+
+--- PROPOSAL SECTIONS ---
+{proposal_text}
+--- END PROPOSAL SECTIONS ---
+
+Return JSON matching exactly this shape:
+{{
+  "objectives": "string or null",
+  "need_statement": "string or null",
+  "outputs": "string or null",
+  "outcomes": "string or null",
+  "evaluation_plan": "string or null",
+  "methodology_narrative": "string or null"
+}}
+
+Each value should be plain prose (no markdown, no bullets) summarizing what
+the proposal sections already say — do not invent details the sections don't
+support. Use null for any field the sections genuinely don't address.
+""".strip()
+        try:
+            response = await self.client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert grant analyst extracting structured project information from a written proposal. Respond with a single JSON object only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=1600,
+            )
+        except Exception as exc:
+            raise _ai_error(exc)
+        parsed = _parse_json_response(response.choices[0].message.content or "")
+        parsed["source_sections_used"] = [s.section_id for s in sections]
+        return parsed
+
+    async def suggest_project_knowledge_field(
+        self, proposal: Any, project_knowledge: ProjectKnowledge, company_profile: Dict[str, Any],
+        field: str, current_value: Optional[str] = None, additional_context: Optional[str] = None,
+    ) -> str:
+        """Powers the inline "Suggest" button next to a manually-edited
+        Project Knowledge field. Unlike the full-field AI Draft buttons
+        (which overwrite from scratch), this factors in whatever the user
+        has already typed: if the field is in progress, it refines/completes
+        it; if it's empty, it proposes a first draft. Either way the result
+        replaces the field for the user to accept, edit further, or discard."""
+        if field not in self._SUGGESTABLE_FIELDS:
+            raise HTTPException(status_code=400, detail=f"Unknown field '{field}'.")
+        label = self._SUGGESTABLE_FIELDS[field]
+        sibling_context = "\n".join(
+            f"{self._SUGGESTABLE_FIELDS[f]}: {getattr(project_knowledge, f, None) or 'Not yet specified'}"
+            for f in self._SUGGESTABLE_FIELDS if f != field
+        )
+        prompt = f"""
+Suggest a value for {label}, for the following project.
+
+Project title: {getattr(proposal, "title", "")}
+Agency / grant type: {getattr(proposal, "agency", "")} / {getattr(proposal, "grant_type", "")}
+Research focus: {getattr(proposal, "research_focus", "") or "Not yet specified"}
+{self._profile_block(company_profile)}
+
+Other project knowledge already on file:
+{sibling_context}
+
+What the user has typed so far for this field ({"empty" if not (current_value or "").strip() else "in progress"}):
+{current_value or "(nothing yet)"}
+{f"Additional context: {additional_context}" if additional_context else ""}
+
+If the user has already typed something, refine or complete it rather than
+replacing it with something unrelated. If it's empty, propose a first draft.
+Respond with plain prose only (1-3 sentences) — no markdown, no headers, no
+surrounding quotation marks.
+""".strip()
+        try:
+            response = await self.client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert grant writer helping complete a project knowledge field. Output plain prose only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.6,
+                max_tokens=300,
+            )
+        except Exception as exc:
+            raise _ai_error(exc)
+        return response.choices[0].message.content.strip()
 
     # ── Budget sync (PRD §10: "Budget structure feeding the existing Budget Builder") ──
 

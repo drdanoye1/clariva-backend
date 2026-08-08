@@ -1,7 +1,9 @@
 """Organizations router — create org, invite members, share proposals."""
 
 from __future__ import annotations
+import secrets
 import uuid
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,14 +11,21 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+import email_service
+from config import settings
 from database import get_db
-from models.db_models import AuditLog, Organization, OrgMembership, OrgProposal, Proposal, User
+from models.db_models import (
+    AuditLog, Invitation, Organization, OrgMembership, OrgProposal,
+    Proposal, Team, TeamMembership, User,
+)
 from models.schemas import OrganizationBrandingOut, OrganizationBrandingUpdate
 from routers.auth import get_current_user
 from audit import log_action
 from rbac import ROLES, is_valid_role, roles_with_permission
 
 router = APIRouter()
+
+INVITATION_EXPIRY_DAYS = 7
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -41,6 +50,19 @@ class MemberOut(BaseModel):
 class InviteRequest(BaseModel):
     email: str
     role: str = "editor"  # owner | editor | viewer
+    team_id: Optional[str] = None
+    department_id: Optional[str] = None
+
+class InvitationOut(BaseModel):
+    id: str
+    org_id: str
+    email: str
+    role: str
+    team_id: Optional[str] = None
+    department_id: Optional[str] = None
+    status: str
+    expires_at: Optional[str] = None
+    created_at: Optional[str] = None
 
 class ShareProposalRequest(BaseModel):
     proposal_id: str
@@ -174,17 +196,53 @@ async def invite_member(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Invite a registered user to the organization by email."""
+    """Invite someone to the organization by email. If they already have a
+    Clariva account, they're added immediately (unchanged behavior). If
+    not, a pending Invitation is created and emailed instead of the old
+    404 — the org's admin no longer has to separately tell the invitee to
+    go self-register first."""
     await _assert_permission(org_id, current_user.id, "invite_members", db)
 
     if not is_valid_role(body.role):
         raise HTTPException(status_code=400, detail=f"Invalid role. Choose: {', '.join(ROLES)}")
 
+    org = await _get_org_or_404(org_id, db)
+
     # Look up the invitee
     target_result = await db.execute(select(User).where(User.email == body.email))
     target = target_result.scalar_one_or_none()
+
     if not target:
-        raise HTTPException(status_code=404, detail=f"No user found with email '{body.email}'. They must register first.")
+        # No account yet — create (or refresh) a pending Invitation and
+        # email a signup link instead of erroring.
+        existing_invite = await db.execute(
+            select(Invitation).where(
+                Invitation.org_id == org_id, Invitation.email == body.email, Invitation.status == "pending",
+            )
+        )
+        invitation = existing_invite.scalar_one_or_none()
+        if invitation:
+            invitation.role = body.role
+            invitation.team_id = body.team_id
+            invitation.department_id = body.department_id
+            invitation.expires_at = datetime.utcnow() + timedelta(days=INVITATION_EXPIRY_DAYS)
+        else:
+            invitation = Invitation(
+                id=str(uuid.uuid4()), org_id=org_id, email=body.email, role=body.role,
+                team_id=body.team_id, department_id=body.department_id,
+                token=secrets.token_urlsafe(32), invited_by=current_user.id,
+                expires_at=datetime.utcnow() + timedelta(days=INVITATION_EXPIRY_DAYS),
+            )
+            db.add(invitation)
+        await db.flush()
+
+        await _send_invitation_email(db, org, invitation, current_user)
+
+        await log_action(db, actor_id=current_user.id, action="member.invitation_sent",
+                          org_id=org_id, object_type="invitation", object_id=invitation.id,
+                          detail={"role": body.role, "email": body.email})
+
+        return {"message": f"Invitation sent to {body.email}.", "invitation_id": invitation.id, "status": "invited"}
 
     # Check already a member
     existing = await db.execute(
@@ -201,13 +259,102 @@ async def invite_member(
         invited_by=current_user.id,
     )
     db.add(membership)
+    if body.team_id:
+        db.add(TeamMembership(id=str(uuid.uuid4()), team_id=body.team_id, user_id=target.id))
     await db.flush()
 
     await log_action(db, actor_id=current_user.id, action="member.invited",
                       org_id=org_id, object_type="user", object_id=target.id,
                       detail={"role": body.role, "email": target.email})
 
-    return {"message": f"{target.full_name} added as {body.role}.", "user_id": target.id}
+    return {"message": f"{target.full_name} added as {body.role}.", "user_id": target.id, "status": "added"}
+
+
+async def _send_invitation_email(db: AsyncSession, org: Organization, invitation: Invitation, inviter: User) -> None:
+    team_name = None
+    if invitation.team_id:
+        t_result = await db.execute(select(Team).where(Team.id == invitation.team_id))
+        team = t_result.scalar_one_or_none()
+        team_name = team.name if team else None
+    accept_url = f"{settings.FRONTEND_URL.rstrip('/')}/accept-invite?token={invitation.token}"
+    html = email_service.render_invitation_email(
+        org_name=org.name, inviter_name=inviter.full_name, role=invitation.role,
+        accept_url=accept_url, team_name=team_name,
+    )
+    await email_service.send_email(invitation.email, f"You're invited to join {org.name} on Clariva", html)
+
+
+@router.get("/{org_id}/invitations", response_model=List[InvitationOut])
+async def list_invitations(
+    org_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pending/past invitations for the org — same permission as inviting."""
+    await _assert_permission(org_id, current_user.id, "invite_members", db)
+    result = await db.execute(
+        select(Invitation).where(Invitation.org_id == org_id).order_by(Invitation.created_at.desc())
+    )
+    return [
+        InvitationOut(
+            id=i.id, org_id=i.org_id, email=i.email, role=i.role,
+            team_id=i.team_id, department_id=i.department_id, status=i.status,
+            expires_at=i.expires_at.isoformat() if i.expires_at else None,
+            created_at=i.created_at.isoformat() if i.created_at else None,
+        )
+        for i in result.scalars().all()
+    ]
+
+
+@router.post("/{org_id}/invitations/{invitation_id}/resend", response_model=InvitationOut)
+async def resend_invitation(
+    org_id: str,
+    invitation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _assert_permission(org_id, current_user.id, "invite_members", db)
+    invitation = await _get_invitation_or_404(org_id, invitation_id, db)
+    if invitation.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Cannot resend a {invitation.status} invitation.")
+
+    invitation.expires_at = datetime.utcnow() + timedelta(days=INVITATION_EXPIRY_DAYS)
+    await db.flush()
+
+    org = await _get_org_or_404(org_id, db)
+    await _send_invitation_email(db, org, invitation, current_user)
+
+    return InvitationOut(
+        id=invitation.id, org_id=invitation.org_id, email=invitation.email, role=invitation.role,
+        team_id=invitation.team_id, department_id=invitation.department_id, status=invitation.status,
+        expires_at=invitation.expires_at.isoformat(), created_at=invitation.created_at.isoformat() if invitation.created_at else None,
+    )
+
+
+@router.delete("/{org_id}/invitations/{invitation_id}", status_code=204)
+async def revoke_invitation(
+    org_id: str,
+    invitation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _assert_permission(org_id, current_user.id, "invite_members", db)
+    invitation = await _get_invitation_or_404(org_id, invitation_id, db)
+    invitation.status = "revoked"
+    await db.flush()
+
+    await log_action(db, actor_id=current_user.id, action="member.invitation_revoked",
+                      org_id=org_id, object_type="invitation", object_id=invitation.id)
+
+
+async def _get_invitation_or_404(org_id: str, invitation_id: str, db: AsyncSession) -> Invitation:
+    result = await db.execute(
+        select(Invitation).where(Invitation.id == invitation_id, Invitation.org_id == org_id)
+    )
+    invitation = result.scalar_one_or_none()
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    return invitation
 
 
 @router.delete("/{org_id}/members/{user_id}", status_code=204)

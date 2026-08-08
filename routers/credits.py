@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -19,11 +19,22 @@ from models.schemas import (
 )
 from routers.auth import get_current_user
 from routers.organizations import _assert_member, _assert_permission
-from engines.credit_engine import CreditEngine, debit_or_402
+from engines.credit_engine import CreditEngine, LOW_BALANCE_WARNING_PCT, debit_or_402
 from audit import log_action
 
 router = APIRouter()
 credit_engine = CreditEngine()
+
+
+def _balance_out(org_id: str, ledger) -> CreditBalanceOut:
+    """Shared by both the balance and topup endpoints — computes
+    pct_remaining/low_balance from the ledger once, in one place."""
+    pct = (ledger.balance / ledger.reference_balance * 100) if ledger.reference_balance else 100.0
+    return CreditBalanceOut(
+        org_id=org_id, balance=ledger.balance, reference_balance=ledger.reference_balance,
+        pct_remaining=round(pct, 1), low_balance=pct < LOW_BALANCE_WARNING_PCT * 100,
+        updated_at=ledger.updated_at,
+    )
 
 
 @router.get("/{org_id}/credits", response_model=CreditBalanceOut)
@@ -35,7 +46,7 @@ async def get_credit_balance(
     """Any member can see the org's shared balance."""
     await _assert_member(org_id, current_user.id, db)
     ledger = await credit_engine.get_or_create_ledger(db, org_id)
-    return CreditBalanceOut(org_id=org_id, balance=ledger.balance, updated_at=ledger.updated_at)
+    return _balance_out(org_id, ledger)
 
 
 @router.get("/{org_id}/credits/transactions", response_model=List[CreditTransactionOut])
@@ -73,7 +84,7 @@ async def topup_credits(
                       org_id=org_id, object_type="ai_credit_ledger", object_id=ledger.id,
                       detail={"amount": body.amount, "reason": body.reason})
 
-    return CreditBalanceOut(org_id=org_id, balance=ledger.balance, updated_at=ledger.updated_at)
+    return _balance_out(org_id, ledger)
 
 
 @router.get("/{org_id}/credits/allocations", response_model=List[CreditAllocationOut])
@@ -83,12 +94,13 @@ async def list_allocations(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_permission(org_id, current_user.id, "manage_credits", db)
-    from sqlalchemy import select
-    from models.db_models import CreditAllocation
-    result = await db.execute(select(CreditAllocation).where(CreditAllocation.org_id == org_id))
+    allocations = await credit_engine.list_allocations(db, org_id)
     return [
-        CreditAllocationOut(id=a.id, user_id=a.user_id, cap=a.cap, period=a.period)
-        for a in result.scalars().all()
+        CreditAllocationOut(
+            id=a.id, user_id=a.user_id, team_id=a.team_id, department_id=a.department_id,
+            cap=a.cap, period=a.period,
+        )
+        for a in allocations
     ]
 
 
@@ -99,15 +111,27 @@ async def set_allocation(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Set (or clear, with cap=None) a per-member spending cap, or the
-    org-wide default cap when user_id is omitted."""
+    """Set (or clear, with cap=None) a spending cap for exactly one scope —
+    a member, a team, or a department — or the org-wide default cap when
+    all three are omitted. Owner-only for now; team/department leads
+    managing their own group's cap is a possible follow-up, not built yet."""
     await _assert_permission(org_id, current_user.id, "manage_credits", db)
-    allocation = await credit_engine.set_allocation(db, org_id, body.user_id, body.cap, body.period)
+    try:
+        allocation = await credit_engine.set_allocation(
+            db, org_id, body.cap, body.period,
+            user_id=body.user_id, team_id=body.team_id, department_id=body.department_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     await log_action(db, actor_id=current_user.id, action="credits.allocation_set",
                       org_id=org_id, object_type="credit_allocation", object_id=allocation.id,
-                      detail={"user_id": body.user_id, "cap": body.cap, "period": body.period})
+                      detail={
+                          "user_id": body.user_id, "team_id": body.team_id,
+                          "department_id": body.department_id, "cap": body.cap, "period": body.period,
+                      })
 
     return CreditAllocationOut(
-        id=allocation.id, user_id=allocation.user_id, cap=allocation.cap, period=allocation.period,
+        id=allocation.id, user_id=allocation.user_id, team_id=allocation.team_id,
+        department_id=allocation.department_id, cap=allocation.cap, period=allocation.period,
     )

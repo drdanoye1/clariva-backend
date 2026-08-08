@@ -24,16 +24,24 @@ from database import get_db
 from models.schemas import (
     ArchiveExpiredOut, DocumentCreate, DocumentOut, DocumentSearchResult,
     DocumentShareCreate, DocumentShareOut, DocumentVersionCreate, DocumentVersionOut,
-    RetentionPolicyOut, RetentionPolicyRequest,
+    GenerateSupportingDocumentRequest, RetentionPolicyOut, RetentionPolicyRequest,
+    SupportingDocumentTypeOut,
 )
 from models.db_models import DocumentShare, User
 from routers.auth import get_current_user
 from routers.organizations import _assert_member, _assert_permission
+from routers.proposals import _get_proposal_or_404, _load_company_profile
 from engines.document_library_engine import DocumentLibraryEngine
+from engines.scope_of_work_engine import ScopeOfWorkEngine
+from engines.supporting_documents_engine import SUPPORTING_DOCUMENT_TYPES, SupportingDocumentsEngine
+from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
 from audit import log_action
 
 router = APIRouter()
 engine = DocumentLibraryEngine()
+supporting_docs_engine = SupportingDocumentsEngine()
+sow_engine = ScopeOfWorkEngine()
+credit_engine = CreditEngine()
 
 
 async def _to_document_out(db: AsyncSession, doc) -> DocumentOut:
@@ -65,6 +73,55 @@ async def create_document(
     doc = await engine.create_document(db, org_id, current_user.id, body.model_dump())
     await log_action(db, actor_id=current_user.id, action="document.created", org_id=org_id,
                       object_type="document", object_id=doc.id, detail={"title": doc.title})
+    return await _to_document_out(db, doc)
+
+
+@router.get("/supporting-document-types", response_model=List[SupportingDocumentTypeOut])
+async def list_supporting_document_types(current_user: User = Depends(get_current_user)):
+    """Registry backing the "Generate Supporting Document" type dropdown —
+    same pattern as GET /connectors/types (Phase 6)."""
+    return [
+        SupportingDocumentTypeOut(key=key, label=meta["label"], category=meta["category"])
+        for key, meta in SUPPORTING_DOCUMENT_TYPES.items()
+    ]
+
+
+@router.post("/organizations/{org_id}/documents/generate-supporting", response_model=DocumentOut, status_code=201)
+async def generate_supporting_document(
+    org_id: str, body: GenerateSupportingDocumentRequest, db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """AI-drafts one of the Communication/Partnership supporting documents
+    (Cover Letter, Letter of Inquiry, Concept Paper, Letter of Support,
+    Letter of Commitment, MOU — see engines/supporting_documents_engine.py)
+    grounded in the given proposal's Project Knowledge Base and the user's
+    org profile, then saves it as a normal versioned Document in this org's
+    library — no separate storage path. Requires the same `manage_documents`
+    permission as a manual document creation, plus one AI-generation credit
+    debit, same metering contract as scope_of_work.py's generate-* endpoints."""
+    if body.doc_type not in SUPPORTING_DOCUMENT_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unknown supporting document type '{body.doc_type}'.")
+    await _assert_permission(org_id, current_user.id, "manage_documents", db)
+    proposal = await _get_proposal_or_404(body.proposal_id, current_user.id, db)
+    await debit_or_402(
+        credit_engine, db, org_id, current_user.id, GENERATION_COST,
+        reason=f"supporting_document:{body.doc_type}:{body.proposal_id}",
+    )
+    project_knowledge = await sow_engine.get_or_create_project_knowledge(db, body.proposal_id)
+    company_profile = await _load_company_profile(current_user.id, db)
+    content = await supporting_docs_engine.generate(
+        proposal, project_knowledge, company_profile, body.doc_type,
+        recipient_name=body.recipient_name, recipient_organization=body.recipient_organization,
+        additional_context=body.additional_context,
+    )
+    meta = SUPPORTING_DOCUMENT_TYPES[body.doc_type]
+    title = f"{meta['label']} — {proposal.title}"
+    doc = await engine.create_document(db, org_id, current_user.id, {
+        "title": title, "library_type": body.doc_type, "proposal_id": body.proposal_id,
+        "content": content, "format": "txt", "change_note": "AI-generated draft",
+    })
+    await log_action(db, actor_id=current_user.id, action="document.created", org_id=org_id,
+                      object_type="document", object_id=doc.id, detail={"title": doc.title, "generated": True})
     return await _to_document_out(db, doc)
 
 

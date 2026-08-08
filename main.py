@@ -19,7 +19,8 @@ from routers import (
     extract, budget, budget_export, payments, admin,
 )
 from routers import suggest, credits, scope_of_work, collaboration, documents_library, funding_intelligence, awards
-from routers import connectors, api_keys, public_api, marketplace
+from routers import connectors, api_keys, public_api, marketplace, invitations
+from routers import portfolio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -113,6 +114,8 @@ app.include_router(connectors.router,    prefix="/api/v1/connectors",    tags=["
 app.include_router(api_keys.router,      prefix="/api/v1/organizations", tags=["API Keys"])
 app.include_router(public_api.router,    prefix="/api/v1/public",        tags=["Public API"])
 app.include_router(marketplace.router,   prefix="/api/v1/marketplace",   tags=["Marketplace"])
+app.include_router(invitations.router,   prefix="/api/v1/invitations",   tags=["Invitations"])
+app.include_router(portfolio.router,     prefix="/api/v1/portfolio",     tags=["Portfolio Dashboard"])
 
 
 @app.get("/health", tags=["Health"])

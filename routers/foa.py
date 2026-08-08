@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from database import get_db
-from models.db_models import FOARecord, User
+from models.db_models import Award, FOARecord, Proposal, User
 from models.schemas import (
     BidNoGoRequest, FOARecordOut, FOATemplate, FOAUploadResponse,
     PipelineStageEventOut, PipelineStageUpdateRequest,
@@ -44,7 +44,29 @@ builder = FOATemplateBuilderEngine()
 funding = FundingIntelligenceEngine()
 
 
-def _to_foa_out(record: FOARecord) -> FOARecordOut:
+async def _to_foa_out(record: FOARecord, db: AsyncSession) -> FOARecordOut:
+    """
+    Version 3.0 architecture upgrade, Phase 14 (Renewal Loop Closure) — now
+    async so it can resolve `originating_award_id` into a human-readable
+    label/link target for the (rare) records created as a renewal. This is
+    a single extra query only when that field is set — the overwhelming
+    majority of FOARecords have it None and pay no extra cost.
+    """
+    originating_proposal_id: Optional[str] = None
+    originating_award_label: Optional[str] = None
+    if record.originating_award_id:
+        result = await db.execute(
+            select(Award, Proposal.title)
+            .join(Proposal, Proposal.id == Award.proposal_id)
+            .where(Award.id == record.originating_award_id)
+        )
+        row = result.first()
+        if row:
+            orig_award, proposal_title = row
+            originating_proposal_id = orig_award.proposal_id
+            originating_award_label = f"{proposal_title} · {orig_award.funding_agency}" + (
+                f" ({orig_award.award_number})" if orig_award.award_number else ""
+            )
     return FOARecordOut(
         id=record.id, org_id=record.org_id, agency=record.agency, program_title=record.program_title,
         solicitation_number=record.solicitation_number, phase=record.phase, grant_type=record.grant_type,
@@ -55,6 +77,8 @@ def _to_foa_out(record: FOARecord) -> FOARecordOut:
         bid_no_go_decision=record.bid_no_go_decision, bid_no_go_rationale=record.bid_no_go_rationale,
         assigned_to=record.assigned_to, uploaded_by=record.uploaded_by, last_synced_at=record.last_synced_at,
         created_at=record.created_at, has_parsed_template=record.parsed_template is not None,
+        originating_award_id=record.originating_award_id, originating_proposal_id=originating_proposal_id,
+        originating_award_label=originating_award_label, renewal_notes=record.renewal_notes,
     )
 
 
@@ -359,7 +383,7 @@ async def list_pipeline(
         db, org_id=org_id, uploaded_by=None if org_id else current_user.id,
         pipeline_stage=pipeline_stage, source=source, assigned_to=assigned_to,
     )
-    return [_to_foa_out(r) for r in records]
+    return [await _to_foa_out(r, db) for r in records]
 
 
 @router.get("/compare", response_model=List[FOARecordOut])
@@ -380,7 +404,7 @@ async def compare_foas(
             accessible.append(r)
         except HTTPException:
             continue  # silently skip records this user can't see, rather than 403ing the whole comparison
-    return [_to_foa_out(r) for r in accessible]
+    return [await _to_foa_out(r, db) for r in accessible]
 
 
 @router.get("/{foa_id}", response_model=FOATemplate)
@@ -436,7 +460,7 @@ async def update_pipeline_stage(
     record = await _get_foa_or_404(db, foa_id)
     await _assert_foa_access(record, current_user, db, permission="manage_pipeline")
     updated = await funding.update_pipeline_stage(db, foa_id, body.stage, current_user.id, body.notes)
-    return _to_foa_out(updated)
+    return await _to_foa_out(updated, db)
 
 
 @router.patch("/{foa_id}/bid-no-go", response_model=FOARecordOut)
@@ -447,7 +471,7 @@ async def set_bid_no_go(
     record = await _get_foa_or_404(db, foa_id)
     await _assert_foa_access(record, current_user, db, permission="manage_pipeline")
     updated = await funding.set_bid_no_go(db, foa_id, body.decision, body.rationale, current_user.id)
-    return _to_foa_out(updated)
+    return await _to_foa_out(updated, db)
 
 
 @router.patch("/{foa_id}/assign", response_model=FOARecordOut)
@@ -460,7 +484,7 @@ async def assign_opportunity(
     record.assigned_to = assigned_to
     await db.flush()
     await db.refresh(record)
-    return _to_foa_out(record)
+    return await _to_foa_out(record, db)
 
 
 @router.post("/{foa_id}/share", response_model=FOARecordOut)
@@ -480,7 +504,7 @@ async def share_opportunity(
     record.org_id = org_id
     await db.flush()
     await db.refresh(record)
-    return _to_foa_out(record)
+    return await _to_foa_out(record, db)
 
 
 @router.get("/{foa_id}/stage-history", response_model=List[PipelineStageEventOut])

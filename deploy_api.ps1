@@ -14,11 +14,12 @@ Write-Host "`n[1/4] Creating source archive..." -ForegroundColor Yellow
 
 $pyScript = @"
 import tarfile, os, sys
+from pathlib import Path
 
-exclude = {'.git', '__pycache__', '.env', 'venv', '.venv', '*.pyc', '_deploy.tar.gz'}
+exclude = {'.git', '__pycache__', '.env', 'venv', '.venv', '_deploy.tar.gz'}
 
 def should_exclude(path):
-    parts = path.replace('\\\\', '/').split('/')
+    parts = Path(path).parts
     for p in parts:
         if p in exclude or p.endswith('.pyc'):
             return True

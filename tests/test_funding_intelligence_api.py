@@ -113,6 +113,21 @@ def test_bid_no_go_invalid_decision_rejected(client, registered_user):
     assert resp.status_code == 400
 
 
+def test_bid_no_go_can_be_reset_to_undecided_without_reverting_stage(client, registered_user):
+    """The frontend's reset ("x") control sends decision="undecided" — this
+    must clear the decision but must NOT revert a stage that was already
+    auto-advanced by the original bid/no_go call (see set_bid_no_go's
+    auto-advance-only-forward comment in funding_intelligence_engine.py)."""
+    foa_id = _insert_foa_sync(uploaded_by=registered_user["user_id"])
+    client.patch(f"/api/v1/foa/{foa_id}/bid-no-go", json={"decision": "bid"}, headers=registered_user["headers"])
+
+    resp = client.patch(f"/api/v1/foa/{foa_id}/bid-no-go", json={"decision": "undecided"}, headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["bid_no_go_decision"] == "undecided"
+    assert body["pipeline_stage"] == "qualifying"  # untouched by the reset
+
+
 def test_assign_opportunity(client, registered_user):
     foa_id = _insert_foa_sync(uploaded_by=registered_user["user_id"])
     resp = client.patch(f"/api/v1/foa/{foa_id}/assign", json={"assigned_to": registered_user["user_id"]}, headers=registered_user["headers"])

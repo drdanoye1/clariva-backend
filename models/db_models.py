@@ -64,24 +64,53 @@ class OrgContextDB(Base):
 
     # ── Company Overview ──────────────────────────────────────────────────────
     organization_name     = Column(String(255))
-    industry              = Column(String(255))
-    core_technologies     = Column(JSON, default=list)
-    prior_sbir_experience = Column(Boolean, default=False)
-    uei_number            = Column(String(20), nullable=True)
-    cage_code             = Column(String(10), nullable=True)
-    company_capabilities  = Column(Text, nullable=True)   # narrative of core competencies
+    industry               = Column(String(255))
+    core_technologies      = Column(JSON, default=list)
+    prior_sbir_experience  = Column(Boolean, default=False)
+    uei_number             = Column(String(20), nullable=True)
+    cage_code              = Column(String(10), nullable=True)
+    company_capabilities   = Column(Text, nullable=True)   # narrative of core competencies
+
+    # ── Firm Identity & Address ───────────────────────────────────────────────
+    # Fields NASA's SBIR/STTR ProSAMS "Firm Information" form requires that
+    # weren't previously captured anywhere in the profile — see
+    # docs/ARCHITECTURE.md's Company Profile addendum for the source review.
+    ein_tax_id             = Column(String(15), nullable=True)   # EIN / Tax ID
+    duns_number            = Column(String(13), nullable=True)   # legacy identifier, still requested alongside UEI
+    firm_street            = Column(String(255), nullable=True)
+    firm_apt_suite         = Column(String(100), nullable=True)
+    firm_city              = Column(String(100), nullable=True)
+    firm_state             = Column(String(50), nullable=True)
+    firm_zip               = Column(String(12), nullable=True)   # ZIP+4
+    firm_phone             = Column(String(30), nullable=True)
 
     # ── Principal Investigator ────────────────────────────────────────────────
-    pi_name               = Column(String(255), nullable=True)
-    pi_credentials        = Column(Text, nullable=True)   # degrees, certifications
-    pi_orcid              = Column(String(25), nullable=True)
-    pi_degree             = Column(String(100), nullable=True)  # PhD, MD, etc.
-    pi_affiliation        = Column(String(255), nullable=True)  # primary employer
-    pi_publications       = Column(Integer, nullable=True)
-    pi_prior_sbir_awards  = Column(Integer, nullable=True)
+    pi_name                = Column(String(255), nullable=True)
+    pi_credentials         = Column(Text, nullable=True)   # degrees, certifications
+    pi_orcid               = Column(String(25), nullable=True)
+    pi_degree              = Column(String(100), nullable=True)  # PhD, MD, etc.
+    pi_affiliation         = Column(String(255), nullable=True)  # primary employer
+    pi_publications        = Column(Integer, nullable=True)
+    pi_prior_sbir_awards   = Column(Integer, nullable=True)
+    pi_email               = Column(String(255), nullable=True)
+    pi_phone               = Column(String(30), nullable=True)
+
+    # ── Business Official & Authorized Contract Negotiator ───────────────────
+    # NASA (and most federal SBIR/STTR programs) requires these as two
+    # additional named contacts distinct from the PI on every proposal — the
+    # profile previously had no place to store them at all.
+    bo_name                = Column(String(255), nullable=True)
+    bo_title               = Column(String(150), nullable=True)
+    bo_phone               = Column(String(30), nullable=True)
+    bo_email               = Column(String(255), nullable=True)
+    acn_name               = Column(String(255), nullable=True)
+    acn_title              = Column(String(150), nullable=True)
+    acn_phone              = Column(String(30), nullable=True)
+    acn_email              = Column(String(255), nullable=True)
 
     # ── Key Personnel / Team ──────────────────────────────────────────────────
-    # [{name, title, role, credentials, effort_pct, years_exp, orcid}]
+    # [{name, title, role, credentials, effort_pct, years_exp, orcid,
+    #   labor_category, education_level}]
     team_members          = Column(JSON, default=list)
 
     # ── Facilities & Equipment ────────────────────────────────────────────────
@@ -90,7 +119,9 @@ class OrgContextDB(Base):
 
     # ── Partners / Collaborators ──────────────────────────────────────────────
     # [{name, type (subcontractor|consultant|research_institution|industry),
-    #   role, pi_name, location, effort_pct, institution_type}]
+    #   role, pi_name, location, effort_pct, institution_type,
+    #   contact_phone, contact_email, has_letter_of_commitment,
+    #   include_in_ga, is_foreign_vendor}]
     partners              = Column(JSON, default=list)
 
     # ── Past Performance ──────────────────────────────────────────────────────
@@ -153,6 +184,13 @@ class FOARecord(Base):
     # a prior Award (engines/award_engine.py::create_renewal_opportunity),
     # so the funding pipeline can show "Renewal of <award>" provenance.
     originating_award_id    = Column(String(36), ForeignKey("awards.id"), nullable=True)
+
+    # --- Version 3.0 architecture upgrade, Phase 14 (Renewal Loop Closure) --
+    # Freeform notes captured on the "Create Renewal Opportunity" form
+    # (AwardPanel.tsx). Previously accepted by RenewalCreate but silently
+    # discarded by the engine; now persisted so they're visible on the
+    # pipeline entry the renewal creates.
+    renewal_notes            = Column(Text, nullable=True)
 
     proposals = relationship("Proposal", back_populates="foa")
 
@@ -301,6 +339,40 @@ class OrgMembership(Base):
     user         = relationship("User", foreign_keys=[user_id])
 
 
+class Invitation(Base):
+    """
+    Pending org-member invitation (post-Phase-6 addendum). Bridges the gap
+    between an org buying N bundled seats and having N real logins: an
+    owner/editor invites an email that has no existing User account (see
+    routers/organizations.py::invite_member) — this row is created instead
+    of the 404 that used to be the only outcome, and an email is sent
+    (engines-adjacent email_service.py, via Resend) with a link containing
+    `token`. The invitee follows the link to routers/invitations.py's
+    public (no-auth) accept endpoint, sets their own password, and a User +
+    OrgMembership (+ TeamMembership, if team_id is set) are created
+    atomically — the owner never sees or handles a password. If the email
+    already belongs to an existing User at invite time, no Invitation row
+    is created at all; membership is still added immediately as before.
+    """
+    __tablename__ = "invitations"
+
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    org_id        = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    email         = Column(String(255), nullable=False, index=True)
+    role          = Column(String(20), default="editor", nullable=False)
+    # Optional — lets an owner assign the invitee straight into a team
+    # and/or department (PRD §11 workspace hierarchy) at invite time,
+    # rather than requiring a second step after they join.
+    team_id       = Column(String(36), ForeignKey("teams.id"), nullable=True)
+    department_id = Column(String(36), ForeignKey("departments.id"), nullable=True)
+    token         = Column(String(64), unique=True, nullable=False, index=True)
+    invited_by    = Column(String(36), ForeignKey("users.id"), nullable=False)
+    status        = Column(String(20), default="pending", nullable=False)  # pending | accepted | revoked
+    expires_at    = Column(DateTime(timezone=True), nullable=False)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    accepted_at   = Column(DateTime(timezone=True), nullable=True)
+
+
 class OrgProposal(Base):
     __tablename__ = "org_proposals"
 
@@ -403,6 +475,12 @@ class AICreditLedger(Base):
     id         = Column(String(36), primary_key=True, default=new_uuid)
     org_id     = Column(String(36), ForeignKey("organizations.id"), unique=True, nullable=False)
     balance    = Column(Float, default=100.0, nullable=False)  # starter free allotment
+    # High-water mark used to compute "% of pool remaining" for the low-balance
+    # warning: seeded to `balance` at ledger creation, and reset to the new
+    # `balance` every time credit() (a top-up) runs — so "20% remaining" always
+    # means 20% of what the org most recently topped up to, not some fixed
+    # historical maximum. See engines/credit_engine.py's LOW_BALANCE_WARNING_PCT.
+    reference_balance = Column(Float, default=100.0, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -425,21 +503,27 @@ class CreditTransaction(Base):
 
 class CreditAllocation(Base):
     """
-    Optional per-member spending cap within an organization's shared pool
-    (PRD §13: "Organization Admins allocate credit budgets to departments/
-    teams and can cap per-user or per-project consumption"). user_id=None
-    represents the org-wide default cap applied to members with no
-    individual allocation row.
+    Optional spending cap within an organization's shared pool (PRD §13:
+    "Organization Admins allocate credit budgets to departments/teams and
+    can cap per-user or per-project consumption"). Exactly one of
+    (user_id, team_id, department_id) should be set for a scoped cap;
+    all three null represents the org-wide default cap applied when no
+    more specific cap matches (see CreditEngine.check_allocation, which
+    enforces personal -> team -> department -> org-wide-default caps
+    independently — a spend is blocked if it would exceed ANY applicable
+    level, the same way a real budget hierarchy works).
     """
     __tablename__ = "credit_allocations"
 
-    id         = Column(String(36), primary_key=True, default=new_uuid)
-    org_id     = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
-    user_id    = Column(String(36), ForeignKey("users.id"), nullable=True)
-    cap        = Column(Float, nullable=True)              # None = unlimited
-    period     = Column(String(20), default="monthly", nullable=False)  # "monthly" | "total"
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    org_id        = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    user_id       = Column(String(36), ForeignKey("users.id"), nullable=True)
+    team_id       = Column(String(36), ForeignKey("teams.id"), nullable=True)
+    department_id = Column(String(36), ForeignKey("departments.id"), nullable=True)
+    cap           = Column(Float, nullable=True)              # None = unlimited
+    period        = Column(String(20), default="monthly", nullable=False)  # "monthly" | "total"
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at    = Column(DateTime(timezone=True), onupdate=func.now())
 
 
 # ── Phase 2 — Scope of Work Engine & Project Knowledge Base ────────────────────
@@ -892,6 +976,23 @@ class Award(Base):
     terms                           = Column(Text, nullable=True)
     # active | closed | terminated
     status                          = Column(String(20), nullable=False, default="active", index=True)
+    # received | active | closed — the "Award Received" pre-activation negotiation
+    # stage (Version 3.0 architecture upgrade, PRD addendum: "Three Synchronized
+    # Operational Environments"). Deliberately a SEPARATE field from `status`
+    # above, not a new value added to it: `status` continues to govern the
+    # post-activation lifecycle exactly as it always has, while `award_status`
+    # governs only whether a ProjectBaseline has been locked yet via
+    # AwardEngine.activate_award(). NOTE the asymmetric defaults between this
+    # Python-side default and the SQL migration's column default in
+    # migrations.py: every Award created going forward (via AwardEngine.
+    # create_award()) starts "received" and requires an explicit "Activate
+    # Project" action, but every Award that already existed before this column
+    # was added is backfilled to "active" by the migration — those awards were
+    # created under the old create_award(), which set status="active"
+    # immediately with no negotiation step, so they are already past the
+    # Award Received stage and must not be retroactively gated behind a
+    # baseline that was never captured for them.
+    award_status                    = Column(String(20), nullable=False, default="received", index=True)
     created_by                      = Column(String(36), ForeignKey("users.id"), nullable=False)
     created_at                      = Column(DateTime(timezone=True), server_default=func.now())
     updated_at                      = Column(DateTime(timezone=True), onupdate=func.now())
@@ -1034,6 +1135,99 @@ class AwardCloseout(Base):
     closed_by                 = Column(String(36), ForeignKey("users.id"), nullable=True)
     closed_at                 = Column(DateTime(timezone=True), nullable=True)
     created_at                = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ── Phase 7 — Award Received: Data Model Foundation (Version 3.0 architecture ──
+# upgrade — "Three Synchronized Operational Environments": Pre-Award, Award
+# Received, Post-Award). See docs/Clariva_Enterprise_v3_Roadmap.docx §3-4 for
+# the full audit this closes: today a proposal moves directly from
+# "submitted" to a live, editable Award (Phase 5 above) with no negotiation
+# step, no sponsor-condition tracking, and no immutable record of what was
+# originally approved. The two tables below give the Award Received stage
+# its own real backend state, ahead of any UI work (Phases 8-14).
+
+class ProjectBaseline(Base):
+    """
+    An immutable, versioned snapshot of everything a Proposed Project
+    (Phase 2's ScopeOfWork/BudgetRecord "digital twin") looked like at the
+    moment it became an Approved Project Baseline — the one object this
+    codebase did not have before Phase 7, per the Version 3.0 brief's core
+    finding. Created exactly once per award by AwardEngine.activate_award()
+    (the "Activate Project" action, deliberately a separate, later step than
+    Award creation — see Award.award_status's docstring), and again by
+    AwardEngine.create_baseline_version() whenever an approved AwardAmendment
+    changes budget, scope, or schedule.
+
+    Rows are never edited after creation — "what was originally approved"
+    (or most recently re-baselined) must always be reconstructable, which is
+    the whole point: Phase 5's BudgetRecord/ScopeOfWork/WorkPackage/Task rows
+    stay live and mutable for day-to-day project administration, while this
+    table is what a future Planned-vs-Actual engine (Phase 10) diffs actual
+    execution against. Snapshot content is denormalized JSON, not FK rows
+    into the live tables, specifically so it survives edits/deletes to the
+    live ScopeOfWork/BudgetRecord without cascading.
+    """
+    __tablename__ = "project_baselines"
+
+    id                     = Column(String(36), primary_key=True, default=new_uuid)
+    award_id               = Column(String(36), ForeignKey("awards.id"), nullable=False, index=True)
+    version                = Column(Integer, nullable=False, default=1)
+    # Exactly one row per award should have is_current=True — the baseline a
+    # future variance engine (Phase 10) compares live execution against.
+    # Enforced in the engine (AwardEngine.create_baseline_version flips the
+    # previous current row to False in the same transaction), not a DB
+    # constraint, matching this codebase's is_current-flag precedent
+    # (ProjectBaseline is the first use of the pattern, but see how
+    # OrgMembership/CreditAllocation etc. also rely on engine-enforced
+    # invariants rather than DB-level ones).
+    is_current             = Column(Boolean, default=True, nullable=False)
+    total_award_value      = Column(Float, nullable=True)
+    period_of_performance_start = Column(DateTime(timezone=True), nullable=True)
+    period_of_performance_end   = Column(DateTime(timezone=True), nullable=True)
+    # Denormalized snapshot of the BudgetRecord this award references at
+    # baseline time — same shape as BudgetRecord's own JSON columns
+    # (personnel/consultants/equipment/travel/other_direct/subcontracts) plus
+    # its cached totals, so a variance engine never needs to touch the live
+    # BudgetRecord row to know what was approved.
+    budget_snapshot        = Column(JSON, default=dict)
+    # Denormalized snapshot of the ScopeOfWork hierarchy: {work_packages: [...],
+    # milestones: [...], deliverables: [...]}, each item flattened to plain
+    # dicts (not FK rows) for the same survive-live-edits reason as above.
+    scope_snapshot         = Column(JSON, default=dict)
+    notes                  = Column(Text, nullable=True)
+    created_by             = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at             = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AwardCondition(Base):
+    """
+    A sponsor-imposed condition surfaced during Award Received review —
+    e.g. "submit revised budget justification before first drawdown" or
+    "withhold 10% pending IRB approval." Distinct from the existing
+    AwardComplianceItem (Phase 5): that table is the post-activation,
+    ongoing reporting/compliance calendar; this table is specifically the
+    negotiation-stage review captured before a project is activated, which
+    had no row to live in before Phase 7 (the brief's Award Received Core
+    Activities explicitly list "review sponsor conditions" as an input).
+    A condition may optionally be carried forward into an AwardComplianceItem
+    by the user once the project is activated, but Phase 7 does not do this
+    automatically — see docs/ARCHITECTURE.md for why (kept as a deliberate,
+    later UI decision rather than an automatic data-model coupling).
+    """
+    __tablename__ = "award_conditions"
+
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    award_id      = Column(String(36), ForeignKey("awards.id"), nullable=False, index=True)
+    description   = Column(Text, nullable=False)
+    # reporting | financial | regulatory | programmatic | other
+    category      = Column(String(50), nullable=True)
+    due_date      = Column(DateTime(timezone=True), nullable=True)
+    # open | resolved | waived
+    status        = Column(String(20), nullable=False, default="open")
+    resolved_by   = Column(String(36), ForeignKey("users.id"), nullable=True)
+    resolved_at   = Column(DateTime(timezone=True), nullable=True)
+    created_by    = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
 
 # ── Phase 6 — Integrations & Marketplace (Clariva Enterprise™ PRD §19-20) ──────

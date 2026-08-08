@@ -170,8 +170,13 @@ async def create_proposal(
         if not foa_record:
             raise HTTPException(status_code=404, detail="FOA not found")
 
-        foa_agency   = foa_record.parsed_template.get("agency", agency_val or "OTHER")
-        foa_sections = foa_record.parsed_template.get("ordered_sections", [])
+        # parsed_template can be None for FOAs that were synced from an
+        # external source (Grants.gov/SAM.gov, Phase 4) but never had their
+        # template parsed — fall back to an empty dict rather than assuming
+        # every FOA record has one.
+        parsed_template = foa_record.parsed_template or {}
+        foa_agency   = parsed_template.get("agency", agency_val or "OTHER")
+        foa_sections = parsed_template.get("ordered_sections", [])
 
         # Guard: reject FOA sections that look like topic areas rather than proposal narrative sections.
         # Topic-area titles from NSF/DOE/etc. solicitations (e.g. "Advanced Manufacturing",

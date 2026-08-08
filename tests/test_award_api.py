@@ -311,3 +311,207 @@ def test_renewal_creates_pipeline_entry(client, registered_user):
     assert "Renewal" in body["program_title"]
     assert body["pipeline_stage"] == "identified"
     assert body["agency"] == "NSF"
+
+
+# ── Renewal provenance (Version 3.0 upgrade, Phase 14 — Renewal Loop Closure) ──
+
+def test_renewal_response_carries_provenance_and_notes(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/renewal",
+        json={"notes": "Renewing for a Phase II continuation."},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["originating_award_id"] == award["id"]
+    assert body["originating_proposal_id"] == proposal_id
+    assert "NSF-9999" in body["originating_award_label"]
+    assert body["renewal_notes"] == "Renewing for a Phase II continuation."
+
+
+def test_pipeline_listing_resolves_renewal_provenance(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+    created = client.post(
+        f"/api/v1/awards/{award['id']}/renewal",
+        json={"notes": "Track for next cycle."},
+        headers=registered_user["headers"],
+    ).json()
+
+    resp = client.get("/api/v1/foa/pipeline", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    records = {r["id"]: r for r in resp.json()}
+    renewal_record = records[created["id"]]
+    assert renewal_record["originating_award_id"] == award["id"]
+    assert renewal_record["originating_proposal_id"] == proposal_id
+    assert renewal_record["renewal_notes"] == "Track for next cycle."
+    assert "NSF-9999" in renewal_record["originating_award_label"]
+
+    # A pipeline entry never created via the renewal endpoint reports every
+    # provenance field as null — this must stay purely additive. Inserted
+    # directly via the ORM (same "no real OpenAI calls in tests" pattern as
+    # test_funding_intelligence_api.py::_insert_foa) rather than through
+    # upload/parse-text/parse-url.
+    import asyncio
+    from database import AsyncSessionLocal
+    from models.db_models import FOARecord, new_uuid
+
+    async def _insert_plain_foa() -> str:
+        plain_id = new_uuid()
+        async with AsyncSessionLocal() as db:
+            db.add(FOARecord(
+                id=plain_id, agency="NSF", program_title="Unrelated Opportunity",
+                phase="phase_i", grant_type="sbir", uploaded_by=registered_user["user_id"],
+            ))
+            await db.commit()
+        return plain_id
+
+    plain_id = asyncio.run(_insert_plain_foa())
+    resp2 = client.get("/api/v1/foa/pipeline", headers=registered_user["headers"])
+    assert resp2.status_code == 200, resp2.text
+    plain_record = next(r for r in resp2.json() if r["id"] == plain_id)
+    assert plain_record["originating_award_id"] is None
+    assert plain_record["originating_proposal_id"] is None
+    assert plain_record["originating_award_label"] is None
+    assert plain_record["renewal_notes"] is None
+
+
+# ── Award Received: activation & baselines (Version 3.0 upgrade, Phase 8) ──
+
+def test_new_award_starts_received_and_can_be_activated(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id, total_award_value=50000.0)
+    assert award["award_status"] == "received"
+
+    resp = client.post(f"/api/v1/awards/{award['id']}/activate", json={"notes": "Kickoff"}, headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    baseline = resp.json()
+    assert baseline["version"] == 1
+    assert baseline["is_current"] is True
+    assert baseline["total_award_value"] == 50000.0
+    assert baseline["notes"] == "Kickoff"
+
+    resp = client.get(f"/api/v1/awards/{award['id']}", headers=registered_user["headers"])
+    assert resp.json()["award_status"] == "active"
+
+
+def test_activate_award_twice_returns_400(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    resp = client.post(f"/api/v1/awards/{award['id']}/activate", json={}, headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+
+    resp = client.post(f"/api/v1/awards/{award['id']}/activate", json={}, headers=registered_user["headers"])
+    assert resp.status_code == 400
+
+
+def test_current_baseline_404_before_activation(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    resp = client.get(f"/api/v1/awards/{award['id']}/baselines/current", headers=registered_user["headers"])
+    assert resp.status_code == 404
+
+
+def test_baseline_reversion_increments_version(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    resp = client.post(f"/api/v1/awards/{award['id']}/activate", json={}, headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+
+    resp = client.post(f"/api/v1/awards/{award['id']}/baselines/reversion", json={"notes": "Scope amendment"}, headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["version"] == 2
+    assert resp.json()["is_current"] is True
+
+    resp = client.get(f"/api/v1/awards/{award['id']}/baselines", headers=registered_user["headers"])
+    assert [b["version"] for b in resp.json()] == [2, 1]
+
+    resp = client.get(f"/api/v1/awards/{award['id']}/baselines/current", headers=registered_user["headers"])
+    assert resp.json()["version"] == 2
+
+
+def test_baseline_reversion_before_activation_returns_400(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    resp = client.post(f"/api/v1/awards/{award['id']}/baselines/reversion", json={}, headers=registered_user["headers"])
+    assert resp.status_code == 400
+
+
+def test_award_activation_requires_edit_access(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    _share_proposal(client, org_id, proposal_id, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    viewer = _register_and_login(client, "baseline-viewer")
+    _invite_member(client, org_id, registered_user["headers"], viewer["email"], "viewer")
+
+    resp = client.post(f"/api/v1/awards/{award['id']}/activate", json={}, headers=viewer["headers"])
+    assert resp.status_code == 403
+
+
+# ── Award Received: sponsor conditions (Version 3.0 upgrade, Phase 8) ──────
+
+def test_award_condition_crud(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/conditions",
+        json={"description": "Submit revised budget justification before first drawdown.", "category": "financial"},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    condition = resp.json()
+    assert condition["status"] == "open"
+    condition_id = condition["id"]
+
+    resp = client.patch(
+        f"/api/v1/awards/conditions/{condition_id}", json={"status": "resolved"}, headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "resolved"
+    assert resp.json()["resolved_at"] is not None
+    assert resp.json()["resolved_by"] == registered_user["user_id"]
+
+    resp = client.get(f"/api/v1/awards/{award['id']}/conditions", headers=registered_user["headers"])
+    assert len(resp.json()) == 1
+
+
+# ── Planned vs. Actual (Version 3.0 upgrade, Phase 10) ──────────────────────
+
+def test_planned_vs_actual_requires_activation(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id)
+
+    resp = client.get(f"/api/v1/awards/{award['id']}/planned-vs-actual", headers=registered_user["headers"])
+    assert resp.status_code == 400
+
+
+def test_planned_vs_actual_reflects_expenditures_after_activation(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    award = _create_award(client, registered_user["headers"], proposal_id, total_award_value=40000.0)
+
+    resp = client.post(f"/api/v1/awards/{award['id']}/activate", json={}, headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/expenditures",
+        json={"category": "personnel", "amount": 10000.0},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = client.get(f"/api/v1/awards/{award['id']}/planned-vs-actual", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["baseline_version"] == 1
+    assert body["total_expended"] == 10000.0
+    assert body["scope_drift"] is False
