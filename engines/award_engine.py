@@ -150,6 +150,32 @@ class AwardEngine:
         await db.refresh(award)
         return award
 
+    # ── Quick Award Intake (Version 3.0 upgrade, Phase 15) ──────────────────
+    # For a customer who already has a signed/funded award and never used
+    # Pre-Award — there is no existing Proposal for create_award() above to
+    # attach to (Award.proposal_id is unique/required — see that column's
+    # docstring). Rather than change that relationship, this auto-creates a
+    # minimal Proposal shell (origin="imported", no ProposalSection scaffold,
+    # not meant to be opened in the proposal editor) purely so the Award has
+    # somewhere to point, then reuses create_award() completely unchanged.
+
+    async def create_award_from_intake(self, db: AsyncSession, data: Dict[str, Any], created_by: str) -> Award:
+        shell = Proposal(
+            id=new_uuid(), owner_id=created_by, title=data["title"],
+            agency=data["funding_agency"], phase="phase_i", grant_type="federal_other",
+            status="submitted", origin="imported",
+        )
+        db.add(shell)
+        await db.flush()
+        await db.refresh(shell)
+
+        award = await self.create_award(
+            db, shell.id,
+            {k: v for k, v in data.items() if k not in ("title", "org_id")},
+            created_by=created_by, org_id=data.get("org_id"),
+        )
+        return award
+
     async def update_award(self, db: AsyncSession, award_id: str, data: Dict[str, Any]) -> Award:
         award = await self.get_award_or_404(db, award_id)
         for field in ("award_number", "period_of_performance_start", "period_of_performance_end",

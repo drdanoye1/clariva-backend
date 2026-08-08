@@ -45,3 +45,6 @@ tenacity==9.0.0
 # PostgreSQL (Neon)
 asyncpg==0.29.0
 psycopg2-binary==2.9.9
+
+# File storage (Cloudflare R2 — S3-compatible API; see storage.py)
+boto3==1.35.36

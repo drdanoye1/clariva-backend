@@ -180,6 +180,14 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     # AwardEngine.create_award()) get the "received" starting state and must
     # go through an explicit "Activate Project" action.
     ("awards", "award_status", "VARCHAR(20) DEFAULT 'active'", "VARCHAR(20) NOT NULL DEFAULT 'active'"),
+
+    # --- proposals (Version 3.0 upgrade, Phase 15 — Quick Award Intake) --------
+    # Nullable, no backfill needed: every existing proposal implicitly reads
+    # as native (origin IS NULL) and behaves exactly as it always has. Only
+    # new shell proposals created by AwardEngine.create_award_from_intake()
+    # ever get "imported" written into this column. See Proposal.origin's
+    # docstring in models/db_models.py for the full rationale.
+    ("proposals", "origin", "VARCHAR(20)", "VARCHAR(20)"),
 ]
 
 # New tables introduced by Phase 7 (project_baselines, award_conditions) need

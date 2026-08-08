@@ -1,7 +1,19 @@
-"""Document export router — TXT, DOCX, PDF."""
+"""
+Document export router — TXT, DOCX, PDF.
+
+Version 3.0 upgrade, "Real File Storage" scope (Phase B; see docs/
+Clariva_File_Storage_Scoping_Document.docx) — the old GET /download/
+{filename} endpoint (and the local-disk file it read from) is gone.
+export_proposal() now persists the generated file to Cloudflare R2 via
+DocumentOutputEngine.export()/storage.py and returns a real presigned
+download URL directly in the response; nothing is served from this app's
+own disk anymore. ExportResponse.download_url's shape is unchanged (still
+a plain string), so no frontend change was required — pages/proposals/
+[id].tsx's window.open(download_url) works identically whether the URL is
+relative (old behavior) or an absolute presigned R2 URL (now).
+"""
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -39,16 +51,28 @@ async def export_proposal(
     )
     sections = sec_result.scalars().all()
 
+    # org_id intentionally left None: proposal export has always been a
+    # per-owner action gated on Proposal.owner_id above (not routed through
+    # workspace_access.py's org-sharing resolver the way Award/Document
+    # actions are), so the resulting StoredFile is scoped as a personal file
+    # for now — StoredFile.org_id is nullable specifically to allow this
+    # (see its docstring in models/db_models.py). Attributing proposal
+    # exports to an org when the proposal is shared is a reasonable future
+    # refinement, not required for this phase.
     export_info = await doc_engine.export(
         proposal=proposal,
         sections=sections,
         fmt=body.format,
+        db=db,
+        created_by=current_user.id,
+        org_id=None,
         include_scoring=body.include_scoring_summary,
         include_reviewer=body.include_reviewer_feedback,
         include_compliance=body.include_compliance_status,
         generate_figures=body.generate_figures,
         format_options=body.format_options,
     )
+    await db.commit()
 
     return ExportResponse(
         proposal_id=body.proposal_id,
@@ -57,16 +81,3 @@ async def export_proposal(
         file_size_bytes=export_info["file_size"],
         exported_at=export_info["exported_at"],
     )
-
-
-@router.get("/download/{filename}")
-async def download_file(filename: str):
-    """Serve exported files from the temp export directory."""
-    import os, tempfile
-    export_dir = os.path.join(tempfile.gettempdir(), "sbir_exports")
-    file_path = os.path.join(export_dir, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found or expired")
-    media_types = {".pdf": "application/pdf", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".txt": "text/plain"}
-    ext = os.path.splitext(filename)[1].lower()
-    return FileResponse(file_path, filename=filename, media_type=media_types.get(ext, "application/octet-stream"))

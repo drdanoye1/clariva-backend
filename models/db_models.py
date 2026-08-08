@@ -216,6 +216,19 @@ class Proposal(Base):
     program_label          = Column(String(300), nullable=True)  # e.g. "Community Development Block Grant (CDBG)"
     program_size           = Column(String(50),  nullable=True)  # e.g. "$250K–$5M"
     grantor_name           = Column(String(200), nullable=True)  # for non-federal grants
+    # Provenance flag (Version 3.0 upgrade, Phase 15 — Quick Award Intake).
+    # Null/"native" for every proposal created through the normal Pre-Award
+    # wizard (the overwhelming majority). "imported" marks a minimal shell
+    # Proposal auto-created behind the scenes by AwardEngine.
+    # create_award_from_intake() so a customer who never used Pre-Award can
+    # still get an already-signed/funded award into the system — Award has
+    # required Proposal.id 1:1 since Phase 5 (see Award.proposal_id), so
+    # Quick Award Intake satisfies that constraint with a shell row instead
+    # of changing the Award-Proposal relationship itself. An "imported"
+    # proposal deliberately has no ProposalSection scaffold and is not meant
+    # to be opened in the proposal editor — it exists only so its Award has
+    # somewhere to point.
+    origin                 = Column(String(20), nullable=True)
     version                = Column(Integer, default=1)
     created_at             = Column(DateTime(timezone=True), server_default=func.now())
     updated_at             = Column(DateTime(timezone=True), onupdate=func.now())
@@ -772,6 +785,48 @@ class Notification(Base):
     object_id   = Column(String(36), nullable=True)
     read        = Column(Boolean, default=False)
     created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class StoredFile(Base):
+    """
+    Engine-agnostic pointer to a real file in Cloudflare R2 object storage
+    (Version 3.0 upgrade — "Real File Storage" scope; see docs/
+    Clariva_File_Storage_Scoping_Document.docx). One polymorphic table for
+    every stored file across the platform — AI-generated exports (proposal
+    PDFs/DOCX today; budget exports and invoices/receipts in later phases)
+    and, eventually, real uploaded originals — rather than separate storage
+    columns bolted onto Document, Award, and a future Invoice model
+    one-by-one. Uses the same object_type/object_id polymorphism this
+    codebase already uses for Notification and ApprovalRequest above,
+    deliberately not a real ForeignKey since the referenced table varies by
+    object_type.
+
+    org_id is nullable — UNLIKE Document.org_id, which is NOT NULL by design
+    (the Document Library is an org-level-only concept; see
+    document_library_engine.py's module docstring). A personal/orgless
+    user's proposal exports and (from a later phase) Quick Award Intake
+    documents still need somewhere to go, so StoredFile follows Award.org_id's
+    nullable precedent instead.
+
+    Every row here is a real object in R2 — created via storage.py's
+    upload_file(), read back via get_download_url() (a time-limited
+    presigned URL), never served through this app's own disk or bandwidth.
+    """
+    __tablename__ = "stored_files"
+
+    id                 = Column(String(36), primary_key=True, default=new_uuid)
+    org_id             = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    # "proposal_export" today (Phase B); "budget_export" | "award_notice" |
+    # "funded_proposal" | "invoice" | ... in later phases of the same scope.
+    object_type        = Column(String(50), nullable=False, index=True)
+    object_id          = Column(String(36), nullable=False, index=True)
+    storage_key        = Column(String(500), nullable=False)
+    original_filename  = Column(String(255), nullable=False)
+    content_type       = Column(String(100), nullable=True)
+    size_bytes         = Column(Integer, nullable=True)
+    checksum           = Column(String(64), nullable=True)  # SHA-256 hex digest
+    created_by         = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at         = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class ApprovalRequest(Base):

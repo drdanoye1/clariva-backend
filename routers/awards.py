@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,19 +31,23 @@ from models.schemas import (
     AwardComplianceItemUpdate, AwardConditionCreate, AwardConditionOut,
     AwardConditionUpdate, AwardCreate, AwardExpenditureCreate, AwardExpenditureOut,
     AwardOut, AwardPerformanceRecordCreate, AwardPerformanceRecordOut, AwardReportOut,
-    AwardUpdate, BudgetStatusOut, FOARecordOut, PlannedVsActualOut, ProjectBaselineOut,
-    ProjectExecutionStatusOut, ProjectIssueCreate, ProjectIssueOut, ProjectIssueUpdate,
-    RenewalCreate, ReportNarrativeRequest,
+    AwardUpdate, BudgetStatusOut, DocumentOut, FOARecordOut, PlannedVsActualOut,
+    ProjectBaselineOut, ProjectExecutionStatusOut, ProjectIssueCreate, ProjectIssueOut,
+    ProjectIssueUpdate, QuickAwardIntakeRequest, RenewalCreate, ReportNarrativeRequest,
 )
 from routers.auth import get_current_user
-from routers.organizations import _assert_member
+from routers.organizations import _assert_member, _assert_permission
+from routers.documents_library import _to_document_out
+from routers.extract import _extract_text_from_docx, _extract_text_from_pdf
 from workspace_access import ProposalAccess, assert_can_edit, assert_can_view
 from engines.award_engine import AwardEngine
 from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
+from engines.document_library_engine import DocumentLibraryEngine
 
 router = APIRouter()
 engine = AwardEngine()
 credit_engine = CreditEngine()
+document_engine = DocumentLibraryEngine()
 
 
 def _to_award_out(award: Award, proposal_title: Optional[str] = None) -> AwardOut:
@@ -98,6 +102,92 @@ async def create_award(
     )
     await db.commit()
     return _to_award_out(award, proposal_title=access.proposal.title)
+
+
+@router.post("/intake", response_model=AwardOut)
+async def quick_award_intake(
+    payload: QuickAwardIntakeRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """'Quick Award Intake' (Version 3.0 upgrade, Phase 15) — lets a customer
+    who already has a signed/funded award get it into the system without
+    ever having gone through Pre-Award. See QuickAwardIntakeRequest's and
+    AwardEngine.create_award_from_intake()'s docstrings for the shell-Proposal
+    mechanism this uses instead of changing Award.proposal_id's required 1:1
+    relationship. Gated the same way personal (unshared) proposal creation
+    always has been — no org membership required — unless org_id is given,
+    in which case it's gated like every other org-level award action
+    (manage_awards, via _assert_permission)."""
+    if payload.org_id:
+        await _assert_permission(payload.org_id, current_user.id, "manage_awards", db)
+    award = await engine.create_award_from_intake(db, payload.model_dump(), created_by=current_user.id)
+    await db.commit()
+    return _to_award_out(award, proposal_title=payload.title)
+
+
+# Document types Quick Award Intake can attach — the customer's own signed
+# copy of the proposal that won the award, and/or the funder's award
+# notice/letter. Kept as a small closed set (rather than a free-text label)
+# so the frontend can offer exactly two clearly-labeled upload slots instead
+# of a single generic one.
+_INTAKE_DOC_LABELS = {"funded_proposal": "Approved/Funded Proposal", "award_notice": "Award Notice"}
+
+
+@router.post("/{award_id}/intake/document", response_model=DocumentOut)
+async def intake_award_document(
+    award_id: str, org_id: str = Form(...), file: UploadFile = File(...),
+    doc_type: str = Form("award_notice"),
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Attaches a document during Quick Award Intake — either the customer's
+    approved/funded proposal (doc_type="funded_proposal") or the funder's
+    award notice/letter (doc_type="award_notice", the default). Callable
+    twice per award, once per doc_type, since a customer may have either or
+    both on hand.
+
+    IMPORTANT: this codebase has no file/blob storage anywhere — Document.
+    file_url is a plain string column, never a real upload target (the same
+    text-only pattern routers/extract.py's profile extraction already uses).
+    This endpoint extracts and stores the document's TEXT content only; the
+    original PDF/DOCX bytes are not preserved or re-downloadable.
+
+    org_id is required (not optional, unlike POST /intake above) because
+    Document.org_id is NOT NULL by design (see document_library_engine.py's
+    module docstring) — a solo user with no organization can complete Quick
+    Award Intake itself but cannot attach a document until they belong to
+    one; the frontend should skip/hide this step for orgless users rather
+    than surface this 422/403 to them.
+    """
+    if doc_type not in _INTAKE_DOC_LABELS:
+        raise HTTPException(status_code=422, detail=f"doc_type must be one of {sorted(_INTAKE_DOC_LABELS)}.")
+
+    _, access = await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    await _assert_permission(org_id, current_user.id, "manage_documents", db)
+
+    content = await file.read()
+    filename = file.filename or "document"
+    lower = filename.lower()
+    if lower.endswith(".pdf"):
+        text = _extract_text_from_pdf(content)
+    elif lower.endswith(".docx"):
+        text = _extract_text_from_docx(content)
+    elif lower.endswith(".txt"):
+        text = content.decode("utf-8", errors="ignore")
+    else:
+        raise HTTPException(status_code=422, detail="Unsupported file type — upload a PDF, DOCX, or plain text file.")
+
+    doc = await document_engine.create_document(
+        db, org_id, current_user.id,
+        {
+            "title": f"{_INTAKE_DOC_LABELS[doc_type]} — {filename}",
+            "library_type": doc_type,
+            "proposal_id": access.proposal.id,
+            "content": text,
+            "format": "txt",
+            "change_note": "Imported via Quick Award Intake",
+        },
+    )
+    await db.commit()
+    return await _to_document_out(db, doc)
 
 
 @router.get("/by-proposal/{proposal_id}", response_model=AwardOut)

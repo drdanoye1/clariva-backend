@@ -1069,6 +1069,26 @@ class AwardCreate(BaseModel):
     # this award's budget baseline for burn-rate tracking.
     link_budget: bool = True
 
+class QuickAwardIntakeRequest(BaseModel):
+    """Version 3.0 upgrade, Phase 15 — 'Quick Award Intake'. For a customer
+    who already has a signed/funded award and never used Pre-Award, so there
+    is no existing Proposal for the Award-creation flow above to attach to.
+    AwardEngine.create_award_from_intake() auto-creates a minimal
+    origin="imported" Proposal shell behind the scenes and reuses the
+    existing create_award() on it — no change to Award.proposal_id's
+    1:1/required relationship. org_id is optional (a solo user with no
+    organization can still import an award; they just can't attach the
+    award-notice document afterward, since Document.org_id is required —
+    see routers/awards.py::intake_document)."""
+    title: str
+    funding_agency: str
+    award_number: Optional[str] = None
+    period_of_performance_start: Optional[datetime] = None
+    period_of_performance_end: Optional[datetime] = None
+    total_award_value: Optional[float] = None
+    terms: Optional[str] = None
+    org_id: Optional[str] = None
+
 class AwardUpdate(BaseModel):
     award_number: Optional[str] = None
     period_of_performance_start: Optional[datetime] = None

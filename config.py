@@ -29,11 +29,22 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite+aiosqlite:///./sbir_platform.db"   # fallback for local-only dev
     SYNC_DATABASE_URL: str = ""
 
-    # Supabase
-    SUPABASE_URL: str = ""
-    SUPABASE_ANON_KEY: str = ""
-    SUPABASE_SERVICE_KEY: str = ""
-    SUPABASE_BUCKET: str = "sbir-documents"
+    # File storage — Cloudflare R2 (Version 3.0 upgrade, "Real File Storage"
+    # scope; see docs/Clariva_File_Storage_Scoping_Document.docx). R2 exposes
+    # a fully S3-compatible API, so storage.py talks to it via boto3's S3
+    # client pointed at R2's endpoint rather than a Cloudflare-specific SDK.
+    # Replaces a dead, never-wired-up SUPABASE_* block that lived here
+    # before — grepping the rest of the backend for SUPABASE_ turned up zero
+    # other references, confirming it was leftover from an earlier,
+    # abandoned storage plan.
+    R2_ACCOUNT_ID: str = ""
+    R2_ACCESS_KEY_ID: str = ""
+    R2_SECRET_ACCESS_KEY: str = ""
+    R2_BUCKET_NAME: str = ""
+    # Optional: only needed if the bucket is ever fronted by a public/CDN
+    # hostname for unauthenticated assets (e.g. white-label logos) — not
+    # used by the presigned-URL flow storage.py implements today.
+    R2_PUBLIC_HOSTNAME: str = ""
 
     # Auth
     SECRET_KEY: str = "CHANGE_ME_IN_PRODUCTION"

@@ -1,16 +1,32 @@
 """
 Engine 9 — Document Output Engine
 Produces TXT, DOCX, and PDF exports of completed proposals.
+
+Version 3.0 upgrade, "Real File Storage" scope (Phase B; see docs/
+Clariva_File_Storage_Scoping_Document.docx) — export() used to write the
+generated file to the API dyno's local disk (tempfile.gettempdir()/
+sbir_exports/) and hand back a relative download_url read back from that
+same path by routers/documents.py::download_file(). That local-disk path
+never survived a Heroku dyno restart/deploy and would 404 the moment
+traffic landed on a different dyno than the one that generated the file —
+a live reliability bug, not a missing feature. Every exporter below now
+writes into an in-memory io.BytesIO buffer instead (the exact pattern
+already proven in routers/budget_export.py's six export endpoints), and
+export() uploads that buffer to Cloudflare R2 via storage.py, logs a
+StoredFile row, and returns a real presigned download URL. Nothing is ever
+written to local disk anymore.
 """
 
 from __future__ import annotations
 
-import os
+import io
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-import tempfile
-EXPORT_DIR = os.path.join(tempfile.gettempdir(), "sbir_exports")
+from sqlalchemy.ext.asyncio import AsyncSession
+
+import storage
+from models.db_models import StoredFile, new_uuid
 
 
 AI_DISCLAIMER = (
@@ -30,21 +46,32 @@ class DocumentOutputEngine:
     Generates submission-ready documents in TXT, DOCX, and PDF formats.
     """
 
-    def __init__(self):
-        os.makedirs(EXPORT_DIR, exist_ok=True)
+    # Content-Type per format, for the R2 object metadata and the
+    # presigned URL's Content-Disposition header.
+    _CONTENT_TYPES = {
+        "txt": "text/plain",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pdf": "application/pdf",
+    }
 
     async def export(
         self,
         proposal: Any,
         sections: List[Any],
         fmt: str,
+        db: AsyncSession,
+        created_by: str,
+        org_id: Optional[str] = None,
         include_scoring: bool = True,
         include_reviewer: bool = False,
         include_compliance: bool = True,
         generate_figures: bool = False,
         format_options: Any = None,   # ExportFormatOptions schema object or None
     ) -> Dict[str, Any]:
-        """Route to format-specific exporter."""
+        """Route to format-specific exporter, then persist the result to R2
+        (storage.py) and log a StoredFile row. Flushes but does not commit —
+        same "engines flush, routers commit" convention as every other
+        engine in this codebase (e.g. award_engine.py)."""
         from utils.doc_utils import FormatOptions
 
         # Convert Pydantic schema → dataclass (None preserves all defaults)
@@ -66,28 +93,38 @@ class DocumentOutputEngine:
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in proposal.title[:40])
         filename = f"{safe_title}_{timestamp}.{fmt}"
-        filepath = os.path.join(EXPORT_DIR, filename)
 
         # Pre-generate figures for DOCX/PDF when requested
         figures: Dict[str, bytes] = {}
         if generate_figures and fmt in ("docx", "pdf"):
             figures = await self._generate_figures(proposal, sections)
 
+        buffer = io.BytesIO()
         if fmt == "txt":
-            self._export_txt(filepath, proposal, sections)
+            self._export_txt(buffer, proposal, sections)
         elif fmt == "docx":
-            self._export_docx(filepath, proposal, sections, figures=figures, opts=opts)
+            self._export_docx(buffer, proposal, sections, figures=figures, opts=opts)
         elif fmt == "pdf":
-            self._export_pdf(filepath, proposal, sections)
+            self._export_pdf(buffer, proposal, sections)
         else:
             raise ValueError(f"Unsupported format: {fmt}")
 
-        file_size = os.path.getsize(filepath)
-        download_url = f"/api/v1/documents/download/{filename}"
+        content = buffer.getvalue()
+        content_type = self._CONTENT_TYPES.get(fmt, "application/octet-stream")
+
+        storage_key = await storage.upload_file(org_id, "proposal_export", content, filename, content_type)
+        stored_file = StoredFile(
+            id=new_uuid(), org_id=org_id, object_type="proposal_export", object_id=proposal.id,
+            storage_key=storage_key, original_filename=filename, content_type=content_type,
+            size_bytes=len(content), checksum=storage.sha256_hex(content), created_by=created_by,
+        )
+        db.add(stored_file)
+        await db.flush()
+        download_url = await storage.get_download_url(storage_key, filename=filename)
 
         return {
             "download_url": download_url,
-            "file_size": file_size,
+            "file_size": len(content),
             "exported_at": datetime.utcnow(),
         }
 
@@ -127,7 +164,7 @@ class DocumentOutputEngine:
 
     # ── TXT ───────────────────────────────────────────────────────────────────
 
-    def _export_txt(self, filepath: str, proposal: Any, sections: List[Any]) -> None:
+    def _export_txt(self, buffer: io.BytesIO, proposal: Any, sections: List[Any]) -> None:
         import textwrap
         disclaimer_wrapped = "\n".join(textwrap.wrap(AI_DISCLAIMER, width=68))
         lines = [
@@ -159,12 +196,11 @@ class DocumentOutputEngine:
             "=" * 70,
         ]
 
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        buffer.write("\n".join(lines).encode("utf-8"))
 
     # ── DOCX ──────────────────────────────────────────────────────────────────
 
-    def _export_docx(self, filepath: str, proposal: Any, sections: List[Any],
+    def _export_docx(self, buffer: io.BytesIO, proposal: Any, sections: List[Any],
                      figures: Dict[str, bytes] = {}, opts=None) -> None:
         try:
             from docx import Document
@@ -232,17 +268,14 @@ class DocumentOutputEngine:
             # ── Page numbers ──────────────────────────────────────────────────
             add_page_numbers(doc, opts=opts)
 
-            doc.save(filepath)
+            doc.save(buffer)
 
         except ImportError:
-            txt_path = filepath.replace(".docx", ".txt")
-            self._export_txt(txt_path, proposal, sections)
-            import shutil
-            shutil.copy(txt_path, filepath)
+            self._export_txt(buffer, proposal, sections)
 
     # ── PDF ───────────────────────────────────────────────────────────────────
 
-    def _export_pdf(self, filepath: str, proposal: Any, sections: List[Any]) -> None:
+    def _export_pdf(self, buffer: io.BytesIO, proposal: Any, sections: List[Any]) -> None:
         try:
             from reportlab.lib.pagesizes import LETTER
             from reportlab.lib.styles import ParagraphStyle
@@ -270,7 +303,7 @@ class DocumentOutputEngine:
             )
 
             doc_obj = SimpleDocTemplate(
-                filepath, pagesize=LETTER,
+                buffer, pagesize=LETTER,
                 leftMargin=inch, rightMargin=inch,
                 topMargin=inch, bottomMargin=inch,
             )
@@ -323,4 +356,4 @@ class DocumentOutputEngine:
                           onLaterPages=pdf_page_number)
 
         except ImportError:
-            self._export_txt(filepath.replace(".pdf", ".txt"), proposal, sections)
+            self._export_txt(buffer, proposal, sections)

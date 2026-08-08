@@ -515,3 +515,181 @@ def test_planned_vs_actual_reflects_expenditures_after_activation(client, regist
     assert body["baseline_version"] == 1
     assert body["total_expended"] == 10000.0
     assert body["scope_drift"] is False
+
+
+# ── Quick Award Intake (Version 3.0 upgrade, Phase 15) ──────────────────────
+# Lets a customer who already has a signed/funded award get it into the
+# system without ever having used Pre-Award — no existing proposal_id, no
+# organization required. See QuickAwardIntakeRequest's docstring in
+# models/schemas.py and AwardEngine.create_award_from_intake().
+
+def test_quick_intake_creates_award_with_no_proposal_or_org(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Rural Broadband Expansion", "funding_agency": "USDA", "award_number": "USDA-4471", "total_award_value": 250000.0},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    award = resp.json()
+    assert award["funding_agency"] == "USDA"
+    assert award["award_number"] == "USDA-4471"
+    assert award["total_award_value"] == 250000.0
+    assert award["proposal_title"] == "Rural Broadband Expansion"
+    # Every award created via AwardEngine.create_award() (intake reuses it
+    # unchanged) starts "received" and requires an explicit Activate Project.
+    assert award["award_status"] == "received"
+
+    # The shell proposal is real and owned by the importing user, so the
+    # award is fully usable through every other award endpoint afterward.
+    resp = client.get(f"/api/v1/awards/{award['id']}", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+
+
+def test_quick_intake_award_can_be_activated_like_any_other(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Community Health Outreach", "funding_agency": "HHS"},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    award = resp.json()
+
+    resp = client.post(f"/api/v1/awards/{award['id']}/activate", json={"notes": "Imported and kicked off"}, headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_current"] is True
+
+
+def test_quick_intake_unrelated_user_cannot_view(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Water Infrastructure Study", "funding_agency": "EPA"},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    award = resp.json()
+
+    other = _register_and_login(client, "intake-outsider")
+    resp = client.get(f"/api/v1/awards/{award['id']}", headers=other["headers"])
+    assert resp.status_code == 403
+
+
+def test_quick_intake_with_org_requires_manage_awards_permission(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    viewer = _register_and_login(client, "intake-viewer")
+    _invite_member(client, org_id, registered_user["headers"], viewer["email"], "viewer")
+
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Blocked Import", "funding_agency": "NSF", "org_id": org_id},
+        headers=viewer["headers"],
+    )
+    assert resp.status_code == 403
+
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Owner Import", "funding_agency": "NSF", "org_id": org_id},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["org_id"] == org_id
+
+
+def test_quick_intake_document_extracts_text_and_tags_award_notice(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Advanced Materials Research", "funding_agency": "DOE", "org_id": org_id},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    award = resp.json()
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/intake/document",
+        data={"org_id": org_id},
+        files={"file": ("award-notice.txt", b"This award is hereby granted in the amount of $500,000.", "text/plain")},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    doc = resp.json()
+    assert doc["library_type"] == "award_notice"
+    assert doc["proposal_id"] == award["proposal_id"]
+    assert doc["latest_version"]["content"] == "This award is hereby granted in the amount of $500,000."
+
+
+def test_quick_intake_document_accepts_funded_proposal_doc_type(client, registered_user):
+    # Same endpoint, the other doc_type — a customer skipping Pre-Award may
+    # have their own approved/funded proposal on hand instead of (or as well
+    # as) the funder's award notice.
+    org_id = _create_org(client, registered_user["headers"])
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Marine Debris Cleanup Program", "funding_agency": "EPA", "org_id": org_id},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/intake/document",
+        data={"org_id": org_id, "doc_type": "funded_proposal"},
+        files={"file": ("proposal.txt", b"Our approach to marine debris cleanup...", "text/plain")},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    doc = resp.json()
+    assert doc["library_type"] == "funded_proposal"
+    assert "Approved/Funded Proposal" in doc["title"]
+
+
+def test_quick_intake_document_rejects_invalid_doc_type(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Invalid Doc Type Test", "funding_agency": "NSF", "org_id": org_id},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/intake/document",
+        data={"org_id": org_id, "doc_type": "something_else"},
+        files={"file": ("notice.txt", b"content", "text/plain")},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 422
+
+
+def test_quick_intake_document_rejects_unsupported_file_type(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Unsupported Upload Test", "funding_agency": "NIH", "org_id": org_id},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/intake/document",
+        data={"org_id": org_id},
+        files={"file": ("notice.exe", b"binary junk", "application/octet-stream")},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 422
+
+
+def test_quick_intake_document_requires_edit_access_to_award(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Access Control Check", "funding_agency": "NSF"},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    other = _register_and_login(client, "intake-doc-outsider")
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/intake/document",
+        data={"org_id": "does-not-matter"},
+        files={"file": ("notice.txt", b"content", "text/plain")},
+        headers=other["headers"],
+    )
+    assert resp.status_code == 403
