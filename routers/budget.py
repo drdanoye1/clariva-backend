@@ -521,7 +521,18 @@ Rules:
 - Return ONLY the JSON object, no markdown fences
 
 DOCUMENT:
-{text[:12000]}"""
+{text[:100000]}"""
+    # Truncation raised from 12k to 100k chars (Version 3.0 upgrade, Award
+    # Intake Intelligence bugfix): a real funded proposal's Budget Summary/
+    # Budget Narrative section (where the actual stated line items and
+    # total live) commonly falls past the 12k-character mark, well after
+    # Executive Summary/Statement of Need/Goals/Technical Approach. With the
+    # old cutoff, the AI never saw the real budget table and had to
+    # extrapolate a number from whatever partial context remained — which is
+    # why extracted totals kept coming back different from (and higher
+    # than) the document's actual stated total. settings.OPENAI_MODEL is
+    # gpt-4o (128k-token context window), so 100k chars (~25k tokens) is
+    # still a small fraction of the available context.
 
     try:
         response = await _get_client().chat.completions.create(

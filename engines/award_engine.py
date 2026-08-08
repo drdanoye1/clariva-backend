@@ -399,7 +399,19 @@ class AwardEngine:
         scope_of_work_engine.py's generate_work_breakdown() work_packages
         shape exactly, so the result can be persisted via that engine's
         apply_generated_work_breakdown() unchanged. Returns an unpersisted
-        dict for the caller to show for review — nothing is saved here."""
+        dict for the caller to show for review — nothing is saved here.
+
+        Truncates document_text at 100k chars, not the ~16k this originally
+        shipped with — a real funded proposal easily runs 30-50k+ characters,
+        and the Work Plan / Implementation Schedule section (where work
+        packages/milestones actually live) is typically well past the
+        halfway point, after Executive Summary/Statement of Need/Goals/
+        Technical Approach. The old 16k cutoff silently dropped that section
+        for any real-world document, so the AI correctly reported "no work
+        plan found" — it never saw one. settings.OPENAI_MODEL is gpt-4o
+        (128k-token context window, ~4 chars/token), so 100k chars (~25k
+        tokens) leaves enormous headroom; this isn't a case of "raise it a
+        little," the original limit was just wrong for this model."""
         prompt = f"""
 Read the following award-related document(s) and extract structured project
 information as JSON only (no markdown fences, no commentary — just the JSON
@@ -409,7 +421,7 @@ Project title: {getattr(proposal, "title", "")}
 Funding agency: {getattr(proposal, "agency", "")}
 
 --- DOCUMENT(S) ---
-{document_text[:16000]}
+{document_text[:100000]}
 --- END DOCUMENT(S) ---
 
 Return JSON matching exactly this shape:
