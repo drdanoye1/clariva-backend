@@ -436,9 +436,9 @@ total_award_value/dates if not stated, and an empty work_packages array if
 the document doesn't describe a work plan — a short award notice letter
 often only states the amount and dates with no work breakdown, and that's
 fine; don't invent one. Month numbers in work packages are 1-indexed from
-project start. Set extraction_notes to a one- or two-sentence summary of
-what was found and what was not (e.g. "Award value and dates found; no
-work plan was described in the uploaded document(s).").
+project start. For extraction_notes, write a specific one- or two-sentence
+summary referencing what this particular document actually contains (cite
+the title or a phrase from it) — not a generic template sentence.
 """.strip()
         try:
             response = await self.client.chat.completions.create(

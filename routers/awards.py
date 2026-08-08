@@ -44,7 +44,7 @@ from routers.documents_library import _to_document_out
 from routers.extract import _extract_text_from_docx, _extract_text_from_pdf
 from routers.budget import _extract_budget_from_text, apply_budget_dict
 from workspace_access import ProposalAccess, assert_can_edit, assert_can_view
-from engines.award_engine import AwardEngine
+from engines.award_engine import AwardEngine, _naive
 from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
 from engines.document_library_engine import DocumentLibraryEngine
 from engines.scope_of_work_engine import ScopeOfWorkEngine
@@ -320,26 +320,43 @@ async def apply_award_intelligence(
     caveat Scope of Work's own 'Derive from Proposal' onramp already has —
     intended for the one-time "just imported this award" moment, not
     repeated re-application."""
+    import logging, traceback
+    log = logging.getLogger(__name__)
+
     award, access = await _get_award_and_access(award_id, current_user, db, require_edit=True)
 
-    if body.total_award_value is not None and award.total_award_value is None:
-        award.total_award_value = body.total_award_value
-    if body.period_of_performance_start is not None and award.period_of_performance_start is None:
-        award.period_of_performance_start = body.period_of_performance_start
-    if body.period_of_performance_end is not None and award.period_of_performance_end is None:
-        award.period_of_performance_end = body.period_of_performance_end
+    try:
+        if body.total_award_value is not None and award.total_award_value is None:
+            award.total_award_value = body.total_award_value
+        # _naive() strips tzinfo — the AI extraction returns plain "YYYY-MM-DD"
+        # dates with no timezone, and this codebase already has a documented
+        # naive-vs-aware datetime footgun around Award.period_of_performance_*
+        # (see award_engine.py's _naive() docstring); stripping it here rather
+        # than trusting Pydantic's parsed value avoids re-triggering it.
+        if body.period_of_performance_start is not None and award.period_of_performance_start is None:
+            award.period_of_performance_start = _naive(body.period_of_performance_start)
+        if body.period_of_performance_end is not None and award.period_of_performance_end is None:
+            award.period_of_performance_end = _naive(body.period_of_performance_end)
 
-    if body.work_packages:
-        await scope_engine.apply_generated_work_breakdown(
-            db, access.proposal.id, {"work_packages": body.work_packages}
+        if body.work_packages:
+            await scope_engine.apply_generated_work_breakdown(
+                db, access.proposal.id, {"work_packages": body.work_packages}
+            )
+
+        if body.budget and body.budget.get("extracted"):
+            budget_record = await apply_budget_dict(db, access.proposal.id, body.budget["extracted"])
+            if not award.budget_record_id:
+                award.budget_record_id = budget_record.id
+
+        await db.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("apply-intelligence failed for award %s:\n%s", award_id, traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not apply these details: {type(exc).__name__}: {exc}",
         )
-
-    if body.budget and body.budget.get("extracted"):
-        budget_record = await apply_budget_dict(db, access.proposal.id, body.budget["extracted"])
-        if not award.budget_record_id:
-            award.budget_record_id = budget_record.id
-
-    await db.commit()
     return _to_award_out(award, proposal_title=access.proposal.title)
 
 
