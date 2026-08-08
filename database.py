@@ -86,9 +86,35 @@ async def create_tables() -> None:
     function for offline/one-off use. The column list itself lives in
     migrations.py — add new columns there, not here.
     """
-    async with async_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    # Concurrent-boot guard: with WEB_CONCURRENCY > 1, every worker calls
+    # create_tables() independently on startup. SQLAlchemy's create_all()
+    # checks "does this table exist?" before issuing CREATE TABLE, but two
+    # workers can both see "no" at the same instant and both race to create
+    # it — Postgres's catalog uniqueness constraint (pg_type) lets one
+    # succeed and raises IntegrityError in the other. That's a benign
+    # outcome (the table exists either way, created by the sibling worker),
+    # not a real failure — observed in production on the Phase 7 deploy
+    # (new `project_baselines` table) and expected to recur for any future
+    # phase that adds new tables, so this is a standing guard, not a
+    # one-off patch. It's caught in its own transaction block, not the same
+    # one as the column migrations below: Postgres aborts the whole
+    # transaction on any statement error, so catching it inside the same
+    # `async with async_engine.begin()` block would poison every migration
+    # statement that runs after it in that block. Any other exception (e.g.
+    # can't reach the database at all) still propagates and fails startup
+    # loudly, as it should.
+    from sqlalchemy.exc import IntegrityError
+    try:
+        async with async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    except IntegrityError as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "create_all() raced with a concurrent worker (benign — table "
+            "already created by a sibling process): %s", exc
+        )
 
+    async with async_engine.begin() as conn:
         if _is_sqlite:
             for table, column, sqlite_def, _pg_def in COLUMN_MIGRATIONS:
                 await _sqlite_add_column_if_missing(conn, table, column, sqlite_def)
