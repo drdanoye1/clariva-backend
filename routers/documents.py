@@ -13,13 +13,16 @@ a plain string), so no frontend change was required — pages/proposals/
 relative (old behavior) or an absolute presigned R2 URL (now).
 """
 
+from typing import List
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+import storage
 from database import get_db
-from models.db_models import Proposal, ProposalSection, User
-from models.schemas import DocumentFormat, ExportRequest, ExportResponse
+from models.db_models import Proposal, ProposalSection, StoredFile, User
+from models.schemas import DocumentFormat, ExportRequest, ExportResponse, StoredFileOut
 from routers.auth import get_current_user
 from engines.document_output import DocumentOutputEngine
 
@@ -81,3 +84,34 @@ async def export_proposal(
         file_size_bytes=export_info["file_size"],
         exported_at=export_info["exported_at"],
     )
+
+
+@router.get("/exports/{proposal_id}", response_model=List[StoredFileOut])
+async def list_proposal_exports(
+    proposal_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Export history (Phase C) — export_proposal() above only ever returned
+    a one-time download_url in its HTTP response; there was previously no
+    way to come back later and find a file you'd already exported. Same
+    ownership check as export_proposal() (Proposal.owner_id), since exports
+    are still a per-owner action, not routed through workspace_access.py."""
+    result = await db.execute(
+        select(Proposal).where(Proposal.id == proposal_id, Proposal.owner_id == current_user.id)
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Proposal not found")
+
+    files_result = await db.execute(
+        select(StoredFile)
+        .where(StoredFile.object_type == "proposal_export", StoredFile.object_id == proposal_id)
+        .order_by(StoredFile.created_at.desc())
+    )
+    files = files_result.scalars().all()
+    out = []
+    for f in files:
+        download_url = await storage.get_download_url(f.storage_key, filename=f.original_filename)
+        out.append(StoredFileOut(
+            id=f.id, original_filename=f.original_filename, content_type=f.content_type,
+            size_bytes=f.size_bytes, created_at=f.created_at, download_url=download_url,
+        ))
+    return out

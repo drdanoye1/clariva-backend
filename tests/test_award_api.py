@@ -14,6 +14,29 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
+import storage
+
+
+@pytest.fixture(autouse=True)
+def _fake_r2(monkeypatch):
+    """Phase C added a real storage.upload_file()/get_download_url() call
+    into intake_award_document() and list_award_files(). Autouse + module-
+    scoped to every test here (not just the intake-document ones) so this
+    file never depends on — or hits — real R2, honoring the same "no network
+    calls in tests" policy as test_document_export_api.py, regardless of
+    whether a developer's local .env happens to have real R2 credentials in
+    it (as it will, once Cloudflare R2 setup is complete)."""
+    async def fake_upload_file(org_id, category, content, filename, content_type):
+        return f"fake/{category}/{filename}"
+
+    async def fake_get_download_url(storage_key, filename=None, expires_in=3600):
+        return f"https://example-bucket.r2.example.com/{storage_key}"
+
+    monkeypatch.setattr(storage, "upload_file", fake_upload_file)
+    monkeypatch.setattr(storage, "get_download_url", fake_get_download_url)
+
 
 def _register_and_login(client, label: str) -> dict:
     email = f"{label}-{uuid.uuid4().hex[:10]}@example.com"
@@ -692,4 +715,113 @@ def test_quick_intake_document_requires_edit_access_to_award(client, registered_
         files={"file": ("notice.txt", b"content", "text/plain")},
         headers=other["headers"],
     )
+    assert resp.status_code == 403
+
+
+# ── Phase C: original file preservation + GET /awards/{id}/files ──────────────
+
+def test_intake_document_persists_original_file_and_is_listed(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Original File Preservation Test", "funding_agency": "NSF", "org_id": org_id},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/intake/document",
+        data={"org_id": org_id, "doc_type": "award_notice"},
+        files={"file": ("award-notice.pdf", b"%PDF-1.4 fake pdf bytes", "application/pdf")},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = client.get(f"/api/v1/awards/{award['id']}/files", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    files = resp.json()
+    assert len(files) == 1
+    assert files[0]["original_filename"] == "award-notice.pdf"
+    assert files[0]["content_type"] == "application/pdf"
+    assert files[0]["size_bytes"] == len(b"%PDF-1.4 fake pdf bytes")
+    assert files[0]["download_url"].startswith("https://example-bucket.r2.example.com/")
+
+
+def test_intake_document_two_doc_types_both_listed(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Two Doc Types Test", "funding_agency": "EPA", "org_id": org_id},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    for doc_type, fname in (("award_notice", "notice.txt"), ("funded_proposal", "proposal.txt")):
+        resp = client.post(
+            f"/api/v1/awards/{award['id']}/intake/document",
+            data={"org_id": org_id, "doc_type": doc_type},
+            files={"file": (fname, b"content", "text/plain")},
+            headers=registered_user["headers"],
+        )
+        assert resp.status_code == 200, resp.text
+
+    resp = client.get(f"/api/v1/awards/{award['id']}/files", headers=registered_user["headers"])
+    assert resp.status_code == 200
+    filenames = {f["original_filename"] for f in resp.json()}
+    assert filenames == {"notice.txt", "proposal.txt"}
+
+
+def test_intake_document_degrades_gracefully_when_r2_unconfigured(client, registered_user, monkeypatch):
+    """If R2 isn't configured, storage.upload_file raises HTTPException(503)
+    — the endpoint should still succeed (Document Library text extraction
+    doesn't depend on R2) and simply not have a file to list afterward."""
+    async def unconfigured_upload_file(org_id, category, content, filename, content_type):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="File storage is not configured. Contact support.")
+
+    monkeypatch.setattr(storage, "upload_file", unconfigured_upload_file)
+
+    org_id = _create_org(client, registered_user["headers"])
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "R2 Unconfigured Test", "funding_agency": "NSF", "org_id": org_id},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    resp = client.post(
+        f"/api/v1/awards/{award['id']}/intake/document",
+        data={"org_id": org_id},
+        files={"file": ("notice.txt", b"content", "text/plain")},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text  # Document Library save still succeeds
+
+    resp = client.get(f"/api/v1/awards/{award['id']}/files", headers=registered_user["headers"])
+    assert resp.status_code == 200
+    assert resp.json() == []  # nothing to preserve/list — degraded gracefully, not a 500
+
+
+def test_list_award_files_empty_for_new_award(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "No Files Yet Test", "funding_agency": "NIH"},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+    resp = client.get(f"/api/v1/awards/{award['id']}/files", headers=registered_user["headers"])
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_list_award_files_requires_view_access(client, registered_user):
+    resp = client.post(
+        "/api/v1/awards/intake",
+        json={"title": "Files Access Control Test", "funding_agency": "NSF"},
+        headers=registered_user["headers"],
+    )
+    award = resp.json()
+
+    other = _register_and_login(client, "files-outsider")
+    resp = client.get(f"/api/v1/awards/{award['id']}/files", headers=other["headers"])
     assert resp.status_code == 403

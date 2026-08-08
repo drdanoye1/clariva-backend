@@ -384,6 +384,21 @@ class ExportResponse(BaseModel):
     exported_at: datetime
 
 
+# ── Stored Files (Version 3.0 upgrade, "Real File Storage" Phase C) ────────────
+# Read-only view over models.db_models.StoredFile for the two "browse what's
+# in R2" list endpoints (GET /awards/{id}/files, GET /documents/exports/
+# {proposal_id}) — see those routers for the access-control checks, which
+# differ per object_type and are NOT done generically here.
+
+class StoredFileOut(BaseModel):
+    id: str
+    original_filename: str
+    content_type: Optional[str] = None
+    size_bytes: Optional[int] = None
+    created_at: datetime
+    download_url: str
+
+
 # ── Memory / KPI ──────────────────────────────────────────────────────────────
 
 class MemoryEntry(BaseModel):

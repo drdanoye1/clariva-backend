@@ -23,8 +23,9 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import storage
 from database import get_db
-from models.db_models import Award, OrgMembership, User
+from models.db_models import Award, OrgMembership, StoredFile, User, new_uuid
 from models.schemas import (
     ActivateProjectRequest, AwardAmendmentCreate, AwardAmendmentOut, AwardCloseoutOut,
     AwardCloseoutRequest, AwardComplianceItemCreate, AwardComplianceItemOut,
@@ -34,6 +35,7 @@ from models.schemas import (
     AwardUpdate, BudgetStatusOut, DocumentOut, FOARecordOut, PlannedVsActualOut,
     ProjectBaselineOut, ProjectExecutionStatusOut, ProjectIssueCreate, ProjectIssueOut,
     ProjectIssueUpdate, QuickAwardIntakeRequest, RenewalCreate, ReportNarrativeRequest,
+    StoredFileOut,
 )
 from routers.auth import get_current_user
 from routers.organizations import _assert_member, _assert_permission
@@ -130,6 +132,11 @@ async def quick_award_intake(
 # so the frontend can offer exactly two clearly-labeled upload slots instead
 # of a single generic one.
 _INTAKE_DOC_LABELS = {"funded_proposal": "Approved/Funded Proposal", "award_notice": "Award Notice"}
+_INTAKE_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".txt": "text/plain",
+}
 
 
 @router.post("/{award_id}/intake/document", response_model=DocumentOut)
@@ -144,11 +151,17 @@ async def intake_award_document(
     twice per award, once per doc_type, since a customer may have either or
     both on hand.
 
-    IMPORTANT: this codebase has no file/blob storage anywhere — Document.
-    file_url is a plain string column, never a real upload target (the same
-    text-only pattern routers/extract.py's profile extraction already uses).
-    This endpoint extracts and stores the document's TEXT content only; the
-    original PDF/DOCX bytes are not preserved or re-downloadable.
+    This endpoint always extracts the document's TEXT content into Document
+    Library (for versioning/semantic search — same as before Phase C). As of
+    Version 3.0's "Real File Storage" Phase C, it ALSO uploads the original
+    file bytes to R2 and records a StoredFile row (object_type=
+    "award_document", object_id=award_id), so the original PDF/DOCX is
+    re-downloadable via GET /awards/{award_id}/files below — not just its
+    extracted text. If R2 isn't configured (storage.upload_file raises a 503),
+    this degrades gracefully: the Document Library text extraction above has
+    already succeeded and is kept; only the original-file preservation is
+    skipped, matching this codebase's existing pattern of optional
+    integrations no-op'ing rather than failing the whole request.
 
     org_id is required (not optional, unlike POST /intake above) because
     Document.org_id is NOT NULL by design (see document_library_engine.py's
@@ -186,8 +199,53 @@ async def intake_award_document(
             "change_note": "Imported via Quick Award Intake",
         },
     )
+
+    # Phase C: also preserve the original file bytes in R2 so they can be
+    # re-downloaded later (GET /awards/{award_id}/files) — not just the
+    # extracted text saved above. Best-effort: if R2 isn't configured, the
+    # Document Library entry already succeeded and is kept regardless.
+    ext = "." + lower.rsplit(".", 1)[-1] if "." in lower else ""
+    content_type = _INTAKE_CONTENT_TYPES.get(ext, "application/octet-stream")
+    try:
+        storage_key = await storage.upload_file(org_id, f"award_document_{doc_type}", content, filename, content_type)
+    except HTTPException as exc:
+        if exc.status_code != 503:
+            raise
+        storage_key = None
+    if storage_key:
+        db.add(StoredFile(
+            id=new_uuid(), org_id=org_id, object_type="award_document", object_id=award_id,
+            storage_key=storage_key, original_filename=filename, content_type=content_type,
+            size_bytes=len(content), checksum=storage.sha256_hex(content), created_by=current_user.id,
+        ))
+
     await db.commit()
     return await _to_document_out(db, doc)
+
+
+@router.get("/{award_id}/files", response_model=List[StoredFileOut])
+async def list_award_files(
+    award_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Browsable list of original files preserved for this award (currently
+    just Quick Award Intake uploads — see intake_award_document above), each
+    with a fresh presigned download URL. View-level access only (matches
+    every other read on this award)."""
+    await _get_award_and_access(award_id, current_user, db, require_edit=False)
+    result = await db.execute(
+        select(StoredFile)
+        .where(StoredFile.object_type == "award_document", StoredFile.object_id == award_id)
+        .order_by(StoredFile.created_at.desc())
+    )
+    files = result.scalars().all()
+    out = []
+    for f in files:
+        download_url = await storage.get_download_url(f.storage_key, filename=f.original_filename)
+        out.append(StoredFileOut(
+            id=f.id, original_filename=f.original_filename, content_type=f.content_type,
+            size_bytes=f.size_bytes, created_at=f.created_at, download_url=download_url,
+        ))
+    return out
 
 
 @router.get("/by-proposal/{proposal_id}", response_model=AwardOut)

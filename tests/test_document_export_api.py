@@ -119,6 +119,49 @@ def test_export_requires_ownership(client, registered_user):
     assert resp.status_code == 404
 
 
+def test_list_proposal_exports_empty_before_any_export(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    resp = client.get(f"/api/v1/documents/exports/{proposal_id}", headers=registered_user["headers"])
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_list_proposal_exports_returns_history_after_export(client, registered_user, monkeypatch):
+    """Phase C — export_proposal() only ever returned a one-time download_url
+    in its response body; this is the first way to come back later and find
+    a file already exported."""
+    import storage
+
+    async def fake_upload_file(org_id, category, content, filename, content_type):
+        return "fake/proposal_export/report.txt"
+
+    async def fake_get_download_url(storage_key, filename=None, expires_in=3600):
+        return f"https://example-bucket.r2.example.com/{storage_key}"
+
+    monkeypatch.setattr(storage, "upload_file", fake_upload_file)
+    monkeypatch.setattr(storage, "get_download_url", fake_get_download_url)
+
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    resp = client.post(
+        "/api/v1/documents/export",
+        json={"proposal_id": proposal_id, "format": "txt"},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = client.get(f"/api/v1/documents/exports/{proposal_id}", headers=registered_user["headers"])
+    assert resp.status_code == 200
+    files = resp.json()
+    assert len(files) == 1
+    assert files[0]["download_url"] == "https://example-bucket.r2.example.com/fake/proposal_export/report.txt"
+    assert files[0]["size_bytes"] > 0
+
+
+def test_list_proposal_exports_requires_ownership(client, registered_user):
+    resp = client.get(f"/api/v1/documents/exports/{uuid.uuid4().hex}", headers=registered_user["headers"])
+    assert resp.status_code == 404
+
+
 def test_local_disk_download_endpoint_no_longer_exists(client, registered_user):
     """The old GET /download/{filename} endpoint (and the local-disk file it
     served) was removed in this phase — downloads are presigned R2 URLs
