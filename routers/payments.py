@@ -19,34 +19,66 @@ from routers.auth import get_current_user
 router = APIRouter()
 
 # ── Plan catalogue ────────────────────────────────────────────────────────────
-# Amount in cents (USD). Starter is free — no checkout needed.
-
+# Amount in cents (USD). Free tier has no checkout needed (5 grant-opportunity
+# searches/month, no other paid features — enforced client-side/product-side
+# for now; see ARCHITECTURE.md "Phase 16 (cont'd) — Pricing & packaging
+# overhaul" for the enforcement caveat).
+#
+# Version 3.0 architecture upgrade, Phase 16 (cont'd) — pricing/packaging
+# overhaul per the "Enterprise Public-Facing Pricing & Internal Engineering
+# Economics" spec (v1.0, Aug 2026), Phase 1 (public pricing update) of that
+# doc's three-phase roadmap. Replaces the old $29/$79/$199 AI-credit-bundle
+# plans (keys "builder"/"innovator"/"professional", which had ALREADY drifted
+# out of sync with the live pricing page — the page sent "professional"/
+# "organization"/"enterprise" while only "builder"/"innovator"/"professional"
+# existed here, so Organization/Enterprise checkout 400'd and Professional
+# checked out at $249 while the page advertised $29). Reconciled to one
+# consistent set of planId strings shared by pricing.tsx and this dict:
+# professional/team/organization/enterprise, each with a separate `_annual`
+# key so the pricing page's monthly/annual toggle actually charges the
+# amount it displays instead of always charging monthly regardless of
+# toggle state (the previous behavior — a latent bug, not a deliberate
+# design). Removed PAYGO_PACKS/ALL_PRODUCTS entirely: the spec replaces
+# "buy a bundle of AI credits" with "pay per on-demand service, at a PAYG
+# premium over the subscriber price" (Phase 2 marketplace scope) — there is
+# no more standalone credit-pack product to sell.
 PLANS = {
-    "builder": {
-        "name":        "Clariva Builder",
-        "amount":      3900,
-        "description": "Clariva Builder Plan — 1,000 AI credits/month for grant proposal generation.",
-    },
-    "innovator": {
-        "name":        "Clariva Innovator",
-        "amount":      12900,
-        "description": "Clariva Innovator Plan — 5,000 AI credits/month including SBIR Phase I & II.",
-    },
     "professional": {
         "name":        "Clariva Professional",
+        "amount":      3900,
+        "description": "Clariva Professional — monthly platform access, all four grant lifecycle workspaces, complimentary AI services on signup.",
+    },
+    "professional_annual": {
+        "name":        "Clariva Professional (Annual)",
+        "amount":      39000,
+        "description": "Clariva Professional — annual platform access, all four grant lifecycle workspaces, complimentary AI services on signup.",
+    },
+    "team": {
+        "name":        "Clariva Team",
+        "amount":      9900,
+        "description": "Clariva Team — monthly platform access for up to 5 users, collaboration, organizational knowledge.",
+    },
+    "team_annual": {
+        "name":        "Clariva Team (Annual)",
+        "amount":      99000,
+        "description": "Clariva Team — annual platform access for up to 5 users, collaboration, organizational knowledge.",
+    },
+    "organization": {
+        "name":        "Clariva Organization",
         "amount":      24900,
-        "description": "Clariva Professional Plan — 10,000+ AI credits/month with priority support.",
+        "description": "Clariva Organization — monthly platform access for up to 15 users, advanced administration, API access.",
+    },
+    "organization_annual": {
+        "name":        "Clariva Organization (Annual)",
+        "amount":      249000,
+        "description": "Clariva Organization — annual platform access for up to 15 users, advanced administration, API access.",
+    },
+    "enterprise": {
+        "name":        "Clariva Enterprise",
+        "amount":      59900,
+        "description": "Clariva Enterprise — starting monthly platform access; custom users, capacity, and support. Contact sales for a tailored quote.",
     },
 }
-
-PAYGO_PACKS = {
-    "paygo_starter":      {"name": "100 Credits Pack",   "amount":  1000, "description": "Clariva — 100 pay-as-you-go AI credits."},
-    "paygo_builder":      {"name": "300 Credits Pack",   "amount":  2500, "description": "Clariva — 300 pay-as-you-go AI credits."},
-    "paygo_innovator":    {"name": "1,000 Credits Pack", "amount":  7500, "description": "Clariva — 1,000 pay-as-you-go AI credits."},
-    "paygo_professional": {"name": "2,500 Credits Pack", "amount": 15000, "description": "Clariva — 2,500 pay-as-you-go AI credits."},
-}
-
-ALL_PRODUCTS = {**PLANS, **PAYGO_PACKS}
 
 # Module-level cache so we only call Square's Locations API once per process.
 _cached_location_id: str | None = None
@@ -118,7 +150,7 @@ async def create_checkout(
     body: CheckoutRequest,
     current_user: User = Depends(get_current_user),
 ):
-    product = ALL_PRODUCTS.get(body.plan_id)
+    product = PLANS.get(body.plan_id)
     if not product:
         raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan_id}")
 
@@ -169,14 +201,10 @@ async def create_checkout(
 
 @router.get("/plans")
 async def list_plans():
-    """Return available plans and pay-as-you-go packs (no auth required)."""
+    """Return available plans (no auth required)."""
     return {
         "plans": [
             {"id": k, "name": v["name"], "amount_cents": v["amount"]}
             for k, v in PLANS.items()
-        ],
-        "paygo": [
-            {"id": k, "name": v["name"], "amount_cents": v["amount"]}
-            for k, v in PAYGO_PACKS.items()
         ],
     }
