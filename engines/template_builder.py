@@ -75,6 +75,8 @@ class FOATemplateBuilderEngine:
             compliance_rules=self._build_compliance_rules(parsed, agency),
             deadline=deadline,
             weights={s.section_id: s.evaluation_weight for s in sections},
+            summary=parsed.get("summary"),
+            eligibility_summary=parsed.get("eligibility_summary"),
         )
 
     # ── Agency/Phase resolution ───────────────────────────────────────────────

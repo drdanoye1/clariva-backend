@@ -9,7 +9,7 @@ from __future__ import annotations
 import io
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import openai
 
@@ -57,6 +57,15 @@ DO NOT include any of these as ordered_sections — they are NOT proposal sectio
 
 If the FOA lists only topic areas and does not explicitly define proposal narrative sections, extract an empty list for ordered_sections — the system will apply agency-standard sections automatically.
 
+Also produce two short plain-language fields so a reader can decide whether
+this opportunity is worth pursuing WITHOUT reading the full solicitation:
+- "summary": 2-4 sentences covering what this funds, who it's for, the
+  approximate award amount (if stated), and the core ask.
+- "eligibility_summary": 1-3 sentences on who is eligible to apply and any
+  major restrictions (e.g. business size, nonprofit status, citizenship,
+  prior award history). If the FOA doesn't state eligibility, say so briefly
+  rather than inventing requirements.
+
 Return ONLY a JSON object with this exact structure:
 {{
   "agency": "<NSF|DOE|NIH|DOD|DARPA|ARPA-E|NASA|OTHER>",
@@ -65,6 +74,8 @@ Return ONLY a JSON object with this exact structure:
   "phase": "<pre_phase_i|phase_i|phase_ii|fast_track>",
   "total_page_limit": <integer or null>,
   "deadline": "<ISO8601 datetime or null>",
+  "summary": "<2-4 sentence plain-language summary>",
+  "eligibility_summary": "<1-3 sentence plain-language eligibility summary>",
   "ordered_sections": [
     {{
       "section_id": "<snake_case_id>",
@@ -80,6 +91,20 @@ Return ONLY a JSON object with this exact structure:
     "<section_id>": <float 0-1>
   }}
 }}
+
+FOA TEXT:
+{foa_text}
+"""
+
+# A lighter prompt for on-demand backfill (POST /foa/{foa_id}/summarize) —
+# used for FOAs parsed before `summary`/`eligibility_summary` existed. Asks
+# for only the two short fields instead of the full section/weights
+# extraction, so backfilling an old record is cheaper than a full re-parse.
+SUMMARIZE_ONLY_PROMPT = """You are an expert federal grant analyst. Read the following funding opportunity text and produce two short plain-language fields so a reader can decide whether it's worth pursuing without reading the whole thing:
+- "summary": 2-4 sentences covering what this funds, who it's for, the approximate award amount (if stated), and the core ask.
+- "eligibility_summary": 1-3 sentences on who is eligible to apply and any major restrictions. If not stated, say so briefly rather than inventing requirements.
+
+Return ONLY a JSON object: {{"summary": "<string>", "eligibility_summary": "<string>"}}
 
 FOA TEXT:
 {foa_text}
@@ -216,6 +241,37 @@ class FOAParserEngine:
         parsed = self._parse_json(raw_json)
         return self._normalize(parsed)
 
+    async def summarize(self, raw_text: str) -> Dict[str, Optional[str]]:
+        """
+        Cheaper sibling of parse() for on-demand backfill of FOAs that were
+        parsed before `summary`/`eligibility_summary` existed (or synced
+        records that were never AI-parsed at all) — asks GPT-4o for only
+        the two short fields instead of the full section/weights
+        extraction. Returns {"summary": ..., "eligibility_summary": ...},
+        both possibly None if the model returned nothing usable.
+        """
+        truncated = raw_text[:12000]
+        response = await self.client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert federal grant analyst. Always return valid JSON only.",
+                },
+                {
+                    "role": "user",
+                    "content": SUMMARIZE_ONLY_PROMPT.format(foa_text=truncated),
+                },
+            ],
+            temperature=0.1,
+        )
+        raw_json = response.choices[0].message.content or ""
+        parsed = self._parse_json(raw_json)
+        return {
+            "summary": parsed.get("summary") or None,
+            "eligibility_summary": parsed.get("eligibility_summary") or None,
+        }
+
     def _normalize(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Ensure required fields exist with defaults."""
         data.setdefault("agency", "OTHER")
@@ -227,6 +283,8 @@ class FOAParserEngine:
         data.setdefault("ordered_sections", self._default_sections())
         data.setdefault("compliance_rules", [])
         data.setdefault("weights", {})
+        data.setdefault("summary", None)
+        data.setdefault("eligibility_summary", None)
 
         weights = data["weights"]
         total = sum(weights.values()) if weights else 0

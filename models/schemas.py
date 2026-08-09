@@ -221,6 +221,14 @@ class FOATemplate(BaseModel):
     compliance_rules: List[str]
     deadline: Optional[datetime] = None
     weights: Dict[str, float]
+    # Version 3.0 architecture upgrade, Phase 16 (cont'd) — plain-language
+    # summary and eligibility text, generated in the same GPT-4o parse call
+    # that produces ordered_sections/weights above, so a user can decide
+    # whether an opportunity is worth pursuing without reading the full
+    # solicitation first. Optional/nullable so older parsed_template blobs
+    # (persisted before this field existed) still deserialize cleanly.
+    summary: Optional[str] = None
+    eligibility_summary: Optional[str] = None
 
 class FOAUploadResponse(BaseModel):
     foa_id: str
@@ -983,6 +991,11 @@ class FOARecordOut(BaseModel):
     estimated_award_floor: Optional[float] = None
     estimated_award_ceiling: Optional[float] = None
     eligibility_summary: Optional[str] = None
+    # Version 3.0 architecture upgrade, Phase 16 (cont'd) — plain-language
+    # AI summary, generated alongside eligibility_summary above so a user
+    # can decide whether an opportunity is worth pursuing before clicking
+    # into it. None until the record has been parsed/enriched/summarized.
+    ai_summary: Optional[str] = None
     pipeline_stage: str
     bid_no_go_decision: Optional[str] = None
     bid_no_go_rationale: Optional[str] = None

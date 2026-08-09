@@ -148,6 +148,14 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     # accepted by RenewalCreate but never written anywhere.
     ("foa_records", "renewal_notes",           "TEXT",                             "TEXT"),
 
+    # --- foa_records (Version 3.0 architecture upgrade, Phase 16 cont'd) --------
+    # Plain-language AI summary shown on the FOA Library card, generated
+    # alongside eligibility_summary (above) so a user can decide whether an
+    # opportunity is worth pursuing before clicking "Use this FOA." Nullable
+    # — existing records are backfilled on-demand via POST /foa/{id}/summarize
+    # rather than in a batch migration.
+    ("foa_records", "ai_summary",              "TEXT",                             "TEXT"),
+
     # --- organizations (Phase 6 — Integrations & Marketplace, PRD §20 white-label) --
     # All nullable/defaulted — an org with none of these set renders exactly
     # like today (Clariva-branded, no change in behavior).

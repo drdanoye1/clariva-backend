@@ -73,7 +73,7 @@ async def _to_foa_out(record: FOARecord, db: AsyncSession) -> FOARecordOut:
         total_page_limit=record.total_page_limit, deadline=record.deadline, source=record.source,
         external_id=record.external_id, external_url=record.external_url,
         estimated_award_floor=record.estimated_award_floor, estimated_award_ceiling=record.estimated_award_ceiling,
-        eligibility_summary=record.eligibility_summary, pipeline_stage=record.pipeline_stage,
+        eligibility_summary=record.eligibility_summary, ai_summary=record.ai_summary, pipeline_stage=record.pipeline_stage,
         bid_no_go_decision=record.bid_no_go_decision, bid_no_go_rationale=record.bid_no_go_rationale,
         assigned_to=record.assigned_to, uploaded_by=record.uploaded_by, last_synced_at=record.last_synced_at,
         created_at=record.created_at, has_parsed_template=record.parsed_template is not None,
@@ -227,6 +227,8 @@ async def upload_foa(
             total_page_limit=template.total_page_limit,
             deadline=template.deadline,
             uploaded_by=current_user.id,
+            ai_summary=template.summary,
+            eligibility_summary=template.eligibility_summary,
         )
         db.add(record)
         await db.flush()
@@ -265,6 +267,8 @@ async def parse_foa_text(
             total_page_limit=template.total_page_limit,
             deadline=template.deadline,
             uploaded_by=current_user.id,
+            ai_summary=template.summary,
+            eligibility_summary=template.eligibility_summary,
         )
         db.add(record)
         await db.flush()
@@ -350,6 +354,8 @@ async def parse_foa_url(
             total_page_limit=template.total_page_limit,
             deadline=template.deadline,
             uploaded_by=current_user.id,
+            ai_summary=template.summary,
+            eligibility_summary=template.eligibility_summary,
         )
         db.add(record)
         await db.flush()
@@ -430,9 +436,22 @@ async def list_foas(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """
+    The FOA Library list — kept as a lightweight bare-dict response (not
+    the full FOARecordOut) since it can return hundreds of rows. Version
+    3.0 architecture upgrade, Phase 16 (cont'd): added `ai_summary`,
+    `eligibility_summary`, and `has_parsed_template` so each card can show
+    an AI-generated summary/eligibility read before the user clicks "Use
+    this FOA" — these are cheap scalar columns, not the full
+    `parsed_template` JSON blob, so this stays a fast query even at scale.
+    """
     result = await db.execute(
         select(FOARecord.id, FOARecord.program_title, FOARecord.agency,
-               FOARecord.phase, FOARecord.deadline, FOARecord.created_at)
+               FOARecord.phase, FOARecord.deadline, FOARecord.created_at,
+               FOARecord.ai_summary, FOARecord.eligibility_summary,
+               FOARecord.parsed_template, FOARecord.estimated_award_floor,
+               FOARecord.estimated_award_ceiling, FOARecord.source,
+               FOARecord.external_url)
         .where(FOARecord.uploaded_by == current_user.id)
         .order_by(FOARecord.created_at.desc())
     )
@@ -445,6 +464,13 @@ async def list_foas(
             "phase": r.phase,
             "deadline": r.deadline,
             "created_at": r.created_at,
+            "ai_summary": r.ai_summary,
+            "eligibility_summary": r.eligibility_summary,
+            "has_parsed_template": r.parsed_template is not None,
+            "estimated_award_floor": r.estimated_award_floor,
+            "estimated_award_ceiling": r.estimated_award_ceiling,
+            "source": r.source,
+            "external_url": r.external_url,
         }
         for r in rows
     ]
@@ -549,9 +575,14 @@ async def enrich_opportunity(
         record.total_page_limit = template.total_page_limit
         if template.deadline:
             record.deadline = template.deadline
+        # Prefer Grants.gov's own structured applicant-type list when
+        # present (more precise than GPT's read of the synopsis text);
+        # fall back to the AI-generated eligibility_summary from this same
+        # parse, then to whatever was already on the record.
         record.eligibility_summary = ", ".join(
             a.get("description", "") for a in (synopsis.get("applicantTypes") or []) if a.get("description")
-        ) or record.eligibility_summary
+        ) or template.eligibility_summary or record.eligibility_summary
+        record.ai_summary = template.summary or record.ai_summary
         try:
             record.estimated_award_floor = float(synopsis.get("awardFloor")) if synopsis.get("awardFloor") else record.estimated_award_floor
             record.estimated_award_ceiling = float(synopsis.get("awardCeiling")) if synopsis.get("awardCeiling") else record.estimated_award_ceiling
@@ -564,3 +595,72 @@ async def enrich_opportunity(
         raise _clean_parse_error(exc)
 
     return FOATemplate(**record.parsed_template)
+
+
+@router.post("/{foa_id}/summarize", response_model=FOARecordOut)
+async def summarize_opportunity(
+    foa_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """
+    On-demand backfill for `ai_summary`/`eligibility_summary` on FOAs that
+    predate those fields — Version 3.0 architecture upgrade, Phase 16
+    (cont'd). User feedback: the FOA Library only ever showed a title and
+    deadline, with no way to judge an opportunity before clicking "Use
+    this FOA." Rather than batch-reprocessing every existing record (an
+    upfront AI cost for opportunities nobody may ever open), this
+    generates the summary the first time a user expands that specific
+    card, using whichever source text is already available:
+
+    1. If `ai_summary` is already set, this is a no-op (returns as-is) —
+       calling it repeatedly, e.g. from a UI that doesn't track "already
+       generated" state, never re-spends AI credits.
+    2. If `raw_text` is present (every upload/parse-text/parse-url record
+       has this), run the cheap `FOAParserEngine.summarize()` prompt
+       against it — no need to redo the full section/weights extraction.
+    3. If there's no raw_text but this is a Grants.gov-synced record with
+       a link, fetch the synopsis and run it through the full parser
+       (mirrors `enrich`, which also usefully populates `parsed_template`
+       so "View Full Analysis" has requirements/evaluation criteria too).
+    4. Otherwise, there's nothing to summarize from — 400.
+    """
+    record = await _get_foa_or_404(db, foa_id)
+    await _assert_foa_access(record, current_user, db)
+
+    if record.ai_summary:
+        return await _to_foa_out(record, db)
+
+    try:
+        if record.raw_text:
+            result = await parser.summarize(record.raw_text)
+            record.ai_summary = result.get("summary")
+            record.eligibility_summary = result.get("eligibility_summary") or record.eligibility_summary
+        elif record.source == "grants_gov" and record.external_url:
+            opp_id = record.external_url.rstrip("/").split("/")[-1]
+            detail = await funding.fetch_grants_gov_detail(opp_id)
+            synopsis = detail.get("synopsis") or {}
+            raw_text = _html_to_text(synopsis.get("synopsisDesc") or "") or record.program_title
+            parsed   = await parser.parse(raw_text)
+            template = builder.build(parsed)
+
+            record.raw_text = raw_text[:50000]
+            record.parsed_template = template.model_dump(mode="json")
+            record.total_page_limit = template.total_page_limit
+            if template.deadline:
+                record.deadline = template.deadline
+            record.eligibility_summary = ", ".join(
+                a.get("description", "") for a in (synopsis.get("applicantTypes") or []) if a.get("description")
+            ) or template.eligibility_summary or record.eligibility_summary
+            record.ai_summary = template.summary
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="No content available to generate a summary for this opportunity.",
+            )
+        await db.flush()
+        await db.refresh(record)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _clean_parse_error(exc)
+
+    return await _to_foa_out(record, db)

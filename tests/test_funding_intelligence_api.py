@@ -232,6 +232,113 @@ def test_sync_endpoint_creates_records_and_reports_sam_gov_unconfigured(client, 
     assert results["grants_gov"]["created_count"] == 1
     assert results["sam_gov"]["configured"] is False
 
+
+# ── FOA Library summary/eligibility surfacing (Version 3.0, Phase 16 cont'd) ──
+# The AI summary/eligibility text is meant to let a user decide whether an
+# opportunity is worth pursuing before clicking "Use this FOA" — these
+# tests cover the on-demand backfill endpoint and the legacy list
+# endpoint's new fields. Real OpenAI calls are monkeypatched at the shared
+# router-module `parser`/`funding` instances, same pattern as the sync test
+# above.
+
+def test_list_foas_includes_ai_summary_and_eligibility_fields(client, registered_user):
+    _insert_foa_sync(
+        uploaded_by=registered_user["user_id"], program_title="Has Summary",
+        ai_summary="This funds early-stage R&D.", eligibility_summary="Small businesses only.",
+        parsed_template={"ordered_sections": []},
+    )
+    resp = client.get("/api/v1/foa/", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    row = next(r for r in resp.json() if r["program_title"] == "Has Summary")
+    assert row["ai_summary"] == "This funds early-stage R&D."
+    assert row["eligibility_summary"] == "Small businesses only."
+    assert row["has_parsed_template"] is True
+
+
+def test_summarize_is_noop_when_already_summarized(client, registered_user, monkeypatch):
+    import routers.foa as foa_router
+
+    foa_id = _insert_foa_sync(
+        uploaded_by=registered_user["user_id"], raw_text="Some solicitation text.",
+        ai_summary="Already summarized.",
+    )
+
+    async def fail_if_called(raw_text):
+        raise AssertionError("summarize() should not be called when ai_summary is already set")
+
+    monkeypatch.setattr(foa_router.parser, "summarize", fail_if_called)
+
+    resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ai_summary"] == "Already summarized."
+
+
+def test_summarize_generates_from_existing_raw_text(client, registered_user, monkeypatch):
+    import routers.foa as foa_router
+
+    foa_id = _insert_foa_sync(
+        uploaded_by=registered_user["user_id"], raw_text="Full solicitation text goes here.",
+        ai_summary=None, eligibility_summary=None,
+    )
+
+    async def fake_summarize(raw_text):
+        assert raw_text == "Full solicitation text goes here."
+        return {"summary": "Funds AI research.", "eligibility_summary": "US small businesses."}
+
+    monkeypatch.setattr(foa_router.parser, "summarize", fake_summarize)
+
+    resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ai_summary"] == "Funds AI research."
+    assert body["eligibility_summary"] == "US small businesses."
+
+
+def test_summarize_falls_back_to_grants_gov_enrichment_when_no_raw_text(client, registered_user, monkeypatch):
+    import routers.foa as foa_router
+
+    foa_id = _insert_foa_sync(
+        uploaded_by=registered_user["user_id"], source="grants_gov",
+        external_url="https://api.grants.gov/v1/opportunities/12345",
+        raw_text=None, ai_summary=None, parsed_template=None,
+    )
+
+    async def fake_fetch_detail(opportunity_id):
+        assert opportunity_id == "12345"
+        return {
+            "synopsis": {
+                "synopsisDesc": "<p>This program funds clean energy research.</p>",
+                "applicantTypes": [{"description": "Small businesses"}],
+            }
+        }
+
+    async def fake_parse(raw_text):
+        return {
+            "agency": "DOE", "program_title": "Clean Energy Program", "solicitation_number": None,
+            "phase": "phase_i", "total_page_limit": None, "deadline": None,
+            "ordered_sections": [], "compliance_rules": [], "weights": {},
+            "summary": "Funds clean energy research.", "eligibility_summary": None,
+        }
+
+    monkeypatch.setattr(foa_router.funding, "fetch_grants_gov_detail", fake_fetch_detail)
+    monkeypatch.setattr(foa_router.parser, "parse", fake_parse)
+
+    resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ai_summary"] == "Funds clean energy research."
+    assert body["eligibility_summary"] == "Small businesses"  # Grants.gov structured field preferred over AI text
+    assert body["has_parsed_template"] is True
+
+
+def test_summarize_400_when_no_content_available(client, registered_user):
+    foa_id = _insert_foa_sync(
+        uploaded_by=registered_user["user_id"], source="manual",
+        raw_text=None, ai_summary=None, parsed_template=None,
+    )
+    resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
+    assert resp.status_code == 400
+
     listed = client.get("/api/v1/foa/pipeline", headers=registered_user["headers"]).json()
     assert any(r["program_title"] == "Synced Opportunity" for r in listed)
 

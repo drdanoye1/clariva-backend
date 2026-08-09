@@ -97,3 +97,15 @@ def test_normalize_renormalizes_weights_to_sum_to_one(engine):
 def test_normalize_leaves_empty_weights_alone(engine):
     result = engine._normalize({"weights": {}})
     assert result["weights"] == {}
+
+
+def test_normalize_defaults_summary_fields_to_none(engine):
+    result = engine._normalize({})
+    assert result["summary"] is None
+    assert result["eligibility_summary"] is None
+
+
+def test_normalize_preserves_provided_summary_fields(engine):
+    result = engine._normalize({"summary": "Funds AI research.", "eligibility_summary": "Small businesses only."})
+    assert result["summary"] == "Funds AI research."
+    assert result["eligibility_summary"] == "Small businesses only."
