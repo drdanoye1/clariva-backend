@@ -246,6 +246,17 @@ class ServiceCatalogEngine:
                 continue
             db.add(ServiceCatalogItem(id=new_uuid(), **item))
 
+        # Flush the catalog items before adding anything that foreign-keys to
+        # service_key (ComplimentaryAllowance below). This session is
+        # configured with autoflush=False (see database.py — a deliberate
+        # choice to avoid an earlier async/greenlet issue), so without this
+        # explicit flush both batches of db.add() calls would only hit the
+        # database at the single flush() at the end of this method, with no
+        # guarantee the ServiceCatalogItem INSERTs run before the
+        # ComplimentaryAllowance ones that reference them — which is exactly
+        # what caused a production ForeignKeyViolationError on first deploy.
+        await db.flush()
+
         existing_allow = await db.execute(
             select(ComplimentaryAllowance.plan, ComplimentaryAllowance.service_key)
         )
