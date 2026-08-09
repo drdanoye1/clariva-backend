@@ -68,6 +68,12 @@ class ServiceNotFoundError(Exception):
         super().__init__(f"Unknown service_key: {service_key}")
 
 
+class AllowanceNotFoundError(Exception):
+    def __init__(self, allowance_id: str):
+        self.allowance_id = allowance_id
+        super().__init__(f"Unknown allowance id: {allowance_id}")
+
+
 # ---------------------------------------------------------------------------
 # Seed data — Enterprise Pricing spec §2.4, §3.2, §3.3, §4.1, §4.2
 # All prices in cents. subscriber_price_cents applies to Professional/Team/
@@ -470,3 +476,77 @@ class ServiceCatalogEngine:
             "entitlements": entitlements,
             "transactions": transactions,
         }
+
+    # -- Admin — Configurable Pricing Controls (Phase 3.1) -------------------
+    # Lets a superadmin edit prices/allowances that were previously only
+    # settable by editing SERVICE_CATALOG_SEED / COMPLIMENTARY_ALLOWANCE_SEED
+    # and redeploying. Gated by routers.admin.require_superadmin at the
+    # router layer — these methods do no permission checking themselves.
+
+    async def admin_update_service(
+        self, db: AsyncSession, service_key: str, updates: Dict,
+    ) -> ServiceCatalogItem:
+        service = await self.get_service(db, service_key)
+        for field in ("name", "description", "subscriber_price_cents", "payg_price_cents", "active"):
+            value = updates.get(field, None)
+            if value is not None:
+                setattr(service, field, value)
+        await db.flush()
+        await db.refresh(service)
+        return service
+
+    async def admin_create_service(self, db: AsyncSession, data: Dict) -> ServiceCatalogItem:
+        existing = await db.execute(
+            select(ServiceCatalogItem).where(ServiceCatalogItem.service_key == data["service_key"])
+        )
+        if existing.scalar_one_or_none():
+            raise ValueError(f"service_key '{data['service_key']}' already exists")
+        service = ServiceCatalogItem(id=new_uuid(), **data)
+        db.add(service)
+        await db.flush()
+        await db.refresh(service)
+        return service
+
+    async def admin_list_allowances(
+        self, db: AsyncSession, plan: Optional[str] = None,
+    ) -> List[ComplimentaryAllowance]:
+        query = select(ComplimentaryAllowance)
+        if plan:
+            query = query.where(ComplimentaryAllowance.plan == plan)
+        result = await db.execute(query.order_by(ComplimentaryAllowance.plan, ComplimentaryAllowance.service_key))
+        return list(result.scalars().all())
+
+    async def admin_create_allowance(self, db: AsyncSession, data: Dict) -> ComplimentaryAllowance:
+        # service_key must reference a real catalog item — surface a clean
+        # 404-able error rather than letting the FK violation bubble up as
+        # a raw IntegrityError (the exact class of bug that crashed startup
+        # before ensure_seeded() was fixed to flush in the right order).
+        await self.get_service(db, data["service_key"])
+        existing = await db.execute(
+            select(ComplimentaryAllowance).where(
+                ComplimentaryAllowance.plan == data["plan"],
+                ComplimentaryAllowance.service_key == data["service_key"],
+            )
+        )
+        if existing.scalar_one_or_none():
+            raise ValueError(f"An allowance for plan '{data['plan']}' + service '{data['service_key']}' already exists — edit it instead.")
+        allowance = ComplimentaryAllowance(id=new_uuid(), **data)
+        db.add(allowance)
+        await db.flush()
+        await db.refresh(allowance)
+        return allowance
+
+    async def admin_update_allowance(
+        self, db: AsyncSession, allowance_id: str, updates: Dict,
+    ) -> ComplimentaryAllowance:
+        result = await db.execute(select(ComplimentaryAllowance).where(ComplimentaryAllowance.id == allowance_id))
+        allowance = result.scalar_one_or_none()
+        if not allowance:
+            raise AllowanceNotFoundError(allowance_id)
+        for field in ("quantity", "validity_days"):
+            value = updates.get(field, None)
+            if value is not None:
+                setattr(allowance, field, value)
+        await db.flush()
+        await db.refresh(allowance)
+        return allowance

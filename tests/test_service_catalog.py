@@ -35,7 +35,7 @@ from engines.service_catalog_engine import (
 )
 from models.db_models import (
     ComplimentaryAllowance, FOARecord, Organization, OrgServiceEntitlement,
-    ServiceCatalogItem, new_uuid,
+    ServiceCatalogItem, User, new_uuid,
 )
 
 
@@ -415,3 +415,152 @@ def test_org_scoped_foa_summarize_402s_when_no_allowance_and_no_balance(client, 
 
     resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
     assert resp.status_code == 402
+
+
+# ── Admin — Configurable Pricing Controls (Phase 3.1) ────────────────────
+# Enterprise Pricing spec §9.3. No admin-user-creation endpoint exists —
+# is_superadmin is set directly via the ORM, same "insert what a future
+# flow will eventually create" convention _set_org_plan already uses above.
+
+def _make_superadmin(user_id: str) -> None:
+    async def _body():
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(User).where(User.id == user_id))
+            user = result.scalar_one()
+            user.is_superadmin = True
+            await db.commit()
+    _run(_body())
+
+
+def test_non_admin_cannot_update_catalog_price(client, registered_user):
+    resp = client.patch(
+        "/api/v1/service-catalog/admin/catalog/grant_opportunity_analysis",
+        json={"subscriber_price_cents": 500},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 403
+
+
+def test_non_admin_cannot_list_organizations(client, registered_user):
+    resp = client.get("/api/v1/admin/organizations", headers=registered_user["headers"])
+    assert resp.status_code == 403
+
+
+def test_admin_can_update_catalog_price(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    resp = client.patch(
+        "/api/v1/service-catalog/admin/catalog/grant_opportunity_analysis",
+        json={"subscriber_price_cents": 1500, "payg_price_cents": 1800},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["subscriber_price_cents"] == 1500
+    assert body["payg_price_cents"] == 1800
+
+    # Reflected in a subsequent quote.
+    org_id = _create_org(client, registered_user["headers"])
+    _set_org_plan(org_id, "free")
+    quote_resp = client.get(
+        f"/api/v1/service-catalog/{org_id}/quote/grant_opportunity_analysis",
+        headers=registered_user["headers"],
+    )
+    assert quote_resp.json()["price_cents"] == 1800
+
+
+def test_admin_update_unknown_service_404s(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    resp = client.patch(
+        "/api/v1/service-catalog/admin/catalog/not_a_real_service",
+        json={"subscriber_price_cents": 500},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 404
+
+
+def test_admin_can_create_catalog_item(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    resp = client.post(
+        "/api/v1/service-catalog/admin/catalog",
+        json={
+            "service_key": "test_new_service", "category": "supporting_document",
+            "name": "Test New Service", "workspace": "pre_award",
+            "subscriber_price_cents": 999,
+        },
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["service_key"] == "test_new_service"
+
+    # Duplicate service_key is rejected.
+    dupe_resp = client.post(
+        "/api/v1/service-catalog/admin/catalog",
+        json={
+            "service_key": "test_new_service", "category": "supporting_document",
+            "name": "Dupe", "workspace": "pre_award", "subscriber_price_cents": 100,
+        },
+        headers=registered_user["headers"],
+    )
+    assert dupe_resp.status_code == 409
+
+
+def test_admin_can_create_and_update_allowance(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+
+    create_resp = client.post(
+        "/api/v1/service-catalog/admin/allowances",
+        json={"plan": "enterprise", "service_key": "grant_opportunity_analysis", "quantity": 20, "validity_days": 90},
+        headers=registered_user["headers"],
+    )
+    assert create_resp.status_code == 200, create_resp.text
+    allowance_id = create_resp.json()["id"]
+    assert create_resp.json()["quantity"] == 20
+
+    # Duplicate (plan, service_key) is rejected.
+    dupe_resp = client.post(
+        "/api/v1/service-catalog/admin/allowances",
+        json={"plan": "enterprise", "service_key": "grant_opportunity_analysis", "quantity": 5},
+        headers=registered_user["headers"],
+    )
+    assert dupe_resp.status_code == 409
+
+    update_resp = client.patch(
+        f"/api/v1/service-catalog/admin/allowances/{allowance_id}",
+        json={"quantity": 50},
+        headers=registered_user["headers"],
+    )
+    assert update_resp.status_code == 200, update_resp.text
+    assert update_resp.json()["quantity"] == 50
+
+
+def test_admin_allowance_for_unknown_service_404s(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    resp = client.post(
+        "/api/v1/service-catalog/admin/allowances",
+        json={"plan": "team", "service_key": "not_a_real_service", "quantity": 1},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 404
+
+
+def test_admin_can_list_and_override_org_plan(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    _make_superadmin(registered_user["user_id"])
+
+    list_resp = client.get("/api/v1/admin/organizations", headers=registered_user["headers"])
+    assert list_resp.status_code == 200, list_resp.text
+    assert any(o["id"] == org_id for o in list_resp.json())
+
+    update_resp = client.patch(
+        f"/api/v1/admin/organizations/{org_id}/plan",
+        json={"plan": "organization"},
+        headers=registered_user["headers"],
+    )
+    assert update_resp.status_code == 200, update_resp.text
+    assert update_resp.json()["plan"] == "organization"
+
+    # The new plan is what future entitlement grants read from.
+    entitlements_resp = client.get(
+        f"/api/v1/service-catalog/{org_id}/entitlements", headers=registered_user["headers"],
+    )
+    assert any(e["service_key"] == "grant_opportunity_analysis" and e["granted_quantity"] == 10 for e in entitlements_resp.json())

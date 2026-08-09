@@ -10,8 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from database import get_db
-from models.db_models import User, Proposal
+from models.db_models import Organization, User, Proposal
+from models.schemas import OrgAdminOut, OrgPlanUpdateRequest
 from routers.auth import get_current_user
+from audit import log_action
 
 router = APIRouter()
 
@@ -121,3 +123,45 @@ async def delete_user(
         raise HTTPException(status_code=404, detail="User not found")
     await db.delete(user)
     await db.flush()
+
+
+# ── Organization plan overrides (Phase 3.1 — Configurable Pricing Controls) ──
+# Organization.plan drives ComplimentaryAllowance lookups (see
+# engines/service_catalog_engine.py) but has no self-serve write path yet —
+# Square checkout completion doesn't grant it automatically (a known,
+# documented gap; see docs/ARCHITECTURE.md's pricing-overhaul section).
+# Until that billing integration exists, this is the only way to set an
+# org's plan, e.g. to manually reflect an offline/invoiced upgrade.
+
+@router.get("/organizations", response_model=List[OrgAdminOut])
+async def admin_list_organizations(
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Organization).order_by(Organization.name))
+    return result.scalars().all()
+
+
+@router.patch("/organizations/{org_id}/plan", response_model=OrgAdminOut)
+async def admin_update_org_plan(
+    org_id: str,
+    body: OrgPlanUpdateRequest,
+    current_user: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    old_plan = org.plan
+    org.plan = body.plan
+    await db.flush()
+    await db.refresh(org)
+
+    await log_action(
+        db, actor_id=current_user.id, action="admin.organization.plan_updated",
+        org_id=org_id, object_type="organization", object_id=org_id,
+        detail={"old_plan": old_plan, "new_plan": body.plan},
+    )
+    return org

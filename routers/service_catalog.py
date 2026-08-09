@@ -23,7 +23,7 @@ distinguishable in the transaction log.
 """
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,13 +31,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models.db_models import User
 from models.schemas import (
-    AIServiceTransactionOut, OrgServiceSummaryOut, ServiceCatalogItemOut,
+    AIServiceTransactionOut, ComplimentaryAllowanceAdminCreate,
+    ComplimentaryAllowanceAdminUpdate, ComplimentaryAllowanceOut,
+    OrgServiceSummaryOut, ServiceCatalogItemAdminCreate,
+    ServiceCatalogItemAdminUpdate, ServiceCatalogItemOut,
     ServiceConsumeRequest, ServiceEntitlementOut, ServiceQuoteOut,
 )
 from routers.auth import get_current_user
+from routers.admin import require_superadmin
 from routers.organizations import _assert_member, _assert_permission
 from engines.credit_engine import InsufficientCreditsError
-from engines.service_catalog_engine import ServiceCatalogEngine, ServiceNotFoundError
+from engines.service_catalog_engine import (
+    AllowanceNotFoundError, ServiceCatalogEngine, ServiceNotFoundError,
+)
 from audit import log_action
 
 router = APIRouter()
@@ -144,3 +150,101 @@ async def get_org_service_summary(
         entitlements=summary["entitlements"],
         transactions=summary["transactions"],
     )
+
+
+# ── Admin — Configurable Pricing Controls (Phase 3.1) ────────────────────
+# Enterprise Pricing spec §9.3 (Phase 3): lets a platform superadmin edit
+# prices/allowances without a code change + redeploy. Gated by the same
+# require_superadmin dependency routers/admin.py already uses — this is
+# platform-wide pricing configuration, not an org-scoped action, so it's
+# deliberately NOT gated by any org-level rbac.py permission. All routes
+# below are prefixed with the literal "admin" segment so they can never be
+# ambiguous with the "/{org_id}/..." routes above.
+
+@router.patch("/admin/catalog/{service_key}", response_model=ServiceCatalogItemOut)
+async def admin_update_catalog_item(
+    service_key: str,
+    body: ServiceCatalogItemAdminUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_superadmin),
+):
+    try:
+        service = await engine.admin_update_service(db, service_key, body.model_dump(exclude_unset=True))
+    except ServiceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    await log_action(
+        db, actor_id=current_user.id, action="admin.service_catalog.updated",
+        org_id=None, object_type="service_catalog_item", object_id=service.id,
+        detail=body.model_dump(exclude_unset=True),
+    )
+    return service
+
+
+@router.post("/admin/catalog", response_model=ServiceCatalogItemOut)
+async def admin_create_catalog_item(
+    body: ServiceCatalogItemAdminCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_superadmin),
+):
+    try:
+        service = await engine.admin_create_service(db, body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    await log_action(
+        db, actor_id=current_user.id, action="admin.service_catalog.created",
+        org_id=None, object_type="service_catalog_item", object_id=service.id,
+        detail={"service_key": service.service_key},
+    )
+    return service
+
+
+@router.get("/admin/allowances", response_model=List[ComplimentaryAllowanceOut])
+async def admin_list_allowances(
+    plan: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_superadmin),
+):
+    return await engine.admin_list_allowances(db, plan=plan)
+
+
+@router.post("/admin/allowances", response_model=ComplimentaryAllowanceOut)
+async def admin_create_allowance(
+    body: ComplimentaryAllowanceAdminCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_superadmin),
+):
+    try:
+        allowance = await engine.admin_create_allowance(db, body.model_dump())
+    except ServiceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    await log_action(
+        db, actor_id=current_user.id, action="admin.allowance.created",
+        org_id=None, object_type="complimentary_allowance", object_id=allowance.id,
+        detail={"plan": allowance.plan, "service_key": allowance.service_key, "quantity": allowance.quantity},
+    )
+    return allowance
+
+
+@router.patch("/admin/allowances/{allowance_id}", response_model=ComplimentaryAllowanceOut)
+async def admin_update_allowance(
+    allowance_id: str,
+    body: ComplimentaryAllowanceAdminUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_superadmin),
+):
+    try:
+        allowance = await engine.admin_update_allowance(db, allowance_id, body.model_dump(exclude_unset=True))
+    except AllowanceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    await log_action(
+        db, actor_id=current_user.id, action="admin.allowance.updated",
+        org_id=None, object_type="complimentary_allowance", object_id=allowance.id,
+        detail=body.model_dump(exclude_unset=True),
+    )
+    return allowance

@@ -130,6 +130,11 @@ class UserOut(BaseModel):
     organization: str
     mfa_enabled: bool = False
     created_at: datetime
+    # Phase 3.1 — Configurable Pricing Controls: the frontend needs this to
+    # decide whether to show the admin nav link / page at all. The real
+    # security boundary is still server-side (require_superadmin on every
+    # admin.py / service_catalog.py admin endpoint) — this is UX-only.
+    is_superadmin: bool = False
 
 
 # ── Company Profile sub-objects ────────────────────────────────────────────────
@@ -1727,3 +1732,62 @@ class OrgServiceSummaryOut(BaseModel):
     ai_services_balance_cents: int
     entitlements: List[ServiceEntitlementOut]
     transactions: List[AIServiceTransactionOut]
+
+
+# ── Phase 3.1 — Configurable Pricing Controls (admin-only) ──────────────
+# Enterprise Pricing spec §9.3 (Phase 3): lets a superadmin edit the
+# service catalog / complimentary allowances / an org's plan without a
+# code change + redeploy. See routers/admin.py's require_superadmin and
+# the new admin-only endpoints on routers/service_catalog.py.
+
+class ServiceCatalogItemAdminUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    subscriber_price_cents: Optional[int] = Field(default=None, ge=0)
+    payg_price_cents: Optional[int] = Field(default=None, ge=0)
+    active: Optional[bool] = None
+
+
+class ServiceCatalogItemAdminCreate(BaseModel):
+    service_key: str
+    category: str
+    name: str
+    description: Optional[str] = None
+    complexity: Optional[str] = None
+    workspace: str
+    subscriber_price_cents: int = Field(ge=0)
+    payg_price_cents: Optional[int] = Field(default=None, ge=0)
+    recurring: bool = False
+
+
+class ComplimentaryAllowanceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    plan: str
+    service_key: str
+    quantity: Optional[int] = None
+    validity_days: int
+
+
+class ComplimentaryAllowanceAdminCreate(BaseModel):
+    plan: str
+    service_key: str
+    quantity: Optional[int] = Field(default=None, ge=0)
+    validity_days: int = Field(default=90, ge=1)
+
+
+class ComplimentaryAllowanceAdminUpdate(BaseModel):
+    quantity: Optional[int] = Field(default=None, ge=0)
+    validity_days: Optional[int] = Field(default=None, ge=1)
+
+
+class OrgAdminOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+    plan: str
+    created_at: datetime
+
+
+class OrgPlanUpdateRequest(BaseModel):
+    plan: str  # free | professional | team | organization | enterprise
