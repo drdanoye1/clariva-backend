@@ -1659,3 +1659,71 @@ class MarketplaceListingOut(BaseModel):
     created_by: str
     created_at: datetime
     updated_at: Optional[datetime] = None
+
+
+# ── Phase 2 — On-Demand AI Services Marketplace & Org Funding Controls ──
+# (Enterprise Public-Facing Pricing & Internal Engineering Economics spec
+# v1.0, Aug 2026, §9.2). See engines/service_catalog_engine.py for the
+# pricing/entitlement logic these schemas surface.
+
+class ServiceCatalogItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    service_key: str
+    category: str
+    name: str
+    description: Optional[str] = None
+    complexity: Optional[str] = None
+    workspace: str
+    subscriber_price_cents: int
+    payg_price_cents: Optional[int] = None
+    recurring: bool
+    active: bool
+
+
+class ServiceQuoteOut(BaseModel):
+    """Price-before-generation confirmation payload — a router must fetch
+    this and have the caller confirm it before calling consume() for any
+    paid service (acceptance criterion: "no paid marketplace generation
+    occurs without authorization")."""
+    service_key: str
+    name: str
+    category: str
+    complexity: Optional[str] = None
+    recurring: bool
+    funding_source: str          # "complimentary" | "ai_services_balance"
+    price_cents: int             # 0 when funding_source == "complimentary"
+    list_price_cents: int        # the catalog price regardless of funding source (for display)
+    ai_services_balance_cents: int
+    sufficient_balance: bool
+
+
+class ServiceConsumeRequest(BaseModel):
+    service_key: str
+    # Free-form context recorded on the AIServiceTransaction, e.g.
+    # {"proposal_id": "...", "foa_id": "..."}. Never used for pricing math.
+    reference: Optional[Dict[str, Any]] = None
+
+
+class ServiceEntitlementOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    service_key: str
+    granted_quantity: int
+    used_quantity: int
+    expires_at: Optional[datetime] = None
+
+
+class AIServiceTransactionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    user_id: Optional[str] = None
+    service_key: str
+    funding_source: str
+    price_cents: int
+    reference: Optional[Dict[str, Any]] = None
+    created_at: datetime
+
+
+class OrgServiceSummaryOut(BaseModel):
+    ai_services_balance_cents: int
+    entitlements: List[ServiceEntitlementOut]
+    transactions: List[AIServiceTransactionOut]

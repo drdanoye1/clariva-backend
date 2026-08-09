@@ -344,6 +344,15 @@ class Organization(Base):
     logo_url            = Column(String(1000), nullable=True)
     primary_color       = Column(String(20), nullable=True)  # hex, e.g. "#1d4ed8"
 
+    # Enterprise Pricing & Engineering Economics (Phase 2 — On-Demand
+    # Marketplace & Org Funding Controls). Drives complimentary-allowance
+    # lookups (ComplimentaryAllowance.plan) and future entitlement grants.
+    # free | professional | team | organization | enterprise. Defaults to
+    # "free" so every org created before this column existed (or via any
+    # path that doesn't set it explicitly) is treated as the no-paid-plan
+    # tier rather than silently granted allowances it never paid for.
+    plan = Column(String(30), default="free", nullable=False)
+
     memberships      = relationship("OrgMembership", back_populates="organization", cascade="all, delete-orphan")
     shared_proposals = relationship("OrgProposal",   back_populates="organization", cascade="all, delete-orphan")
 
@@ -1439,3 +1448,131 @@ class MarketplaceListing(Base):
     created_by     = Column(String(36), ForeignKey("users.id"), nullable=False)
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
     updated_at     = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — On-Demand AI Services Marketplace & Org Funding Controls
+# (Enterprise Public-Facing Pricing & Internal Engineering Economics spec,
+# v1.0 Aug 2026, §9.2). Deliberately named "service catalog" / "AI service
+# ___" throughout — NOT "marketplace___" — to avoid any confusion with the
+# pre-existing, unrelated MarketplaceListing above (a future 3rd-party
+# vendor/template-pack listing feature from Phase 6; this is the on-demand
+# AI-generation pricing/entitlement system instead).
+#
+# Funding source for this pass: the existing AICreditLedger.balance (Engine
+# 11, already shipped) is reinterpreted as the org's dollar-denominated
+# "AI Services balance" — $1 of balance = $1 of purchasing power, per spec
+# §6.1's stated v1 principle. This avoids standing up a second, separate
+# ledger table in the same slice that introduces the service catalog; the
+# dedicated multi-source "AI Services Fund" (deposits, spending controls,
+# per-project allocations) described in spec §6 is a later slice on top of
+# this same balance column. No existing AICreditLedger behavior changes —
+# debit()/credit()/debit_or_402() are reused as-is, just called with
+# dollar amounts instead of the old flat 1.0-credit-per-section amount.
+# ---------------------------------------------------------------------------
+
+class ServiceCatalogItem(Base):
+    """
+    Centrally-priced, on-demand AI service (spec §2.4/§3.2/§3.3/§4.1/§4.2).
+    One row per purchasable unit of AI output — a proposal complexity tier,
+    a supporting document type, Award Setup, a monthly Post-Award
+    management tier, etc. Prices are seeded once by
+    engines/service_catalog_engine.py's SERVICE_CATALOG_SEED and are the
+    single source of truth every quote/purchase reads from (acceptance
+    criterion: "service prices are controlled centrally").
+    """
+    __tablename__ = "service_catalog_items"
+
+    id                  = Column(String(36), primary_key=True, default=new_uuid)
+    service_key         = Column(String(80), nullable=False, unique=True, index=True)
+    # grant_analysis | proposal_development | supporting_document |
+    # award_setup | post_award_management
+    category            = Column(String(40), nullable=False)
+    name                = Column(String(255), nullable=False)
+    description         = Column(Text, nullable=True)
+    # e.g. "standard" | "advanced" | "complex" for proposals/post-award;
+    # null where the service has no complexity tiering (e.g. a single
+    # supporting-document type).
+    complexity          = Column(String(20), nullable=True)
+    workspace           = Column(String(30), nullable=False)  # pre_award | award | post_award
+    subscriber_price_cents = Column(Integer, nullable=False)
+    # Pay-as-you-go price for orgs with no active subscription plan. Null
+    # where the spec doesn't define a PAYG rate for this item (rare).
+    payg_price_cents    = Column(Integer, nullable=True)
+    # True for Active Award Management & Compliance (§4.2) — charged monthly
+    # per active award rather than once per generation.
+    recurring           = Column(Boolean, default=False, nullable=False)
+    active              = Column(Boolean, default=True, nullable=False)
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at          = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class ComplimentaryAllowance(Base):
+    """
+    Per-plan signup allowance (spec §2.3) — a quantity of a given service
+    granted free to a newly-onboarded org, consumed before any paid source
+    is touched. `validity_days` is measured from `OrgServiceEntitlement.
+    granted_at`, not from account creation, so re-granting (e.g. an annual
+    renewal) starts a fresh window.
+    """
+    __tablename__ = "complimentary_allowances"
+
+    id             = Column(String(36), primary_key=True, default=new_uuid)
+    plan           = Column(String(30), nullable=False)   # professional | team | organization
+    service_key    = Column(String(80), ForeignKey("service_catalog_items.service_key"), nullable=False)
+    # Null = unlimited-within-validity-window (not used by the current seed,
+    # but kept open for a future allowance type).
+    quantity       = Column(Integer, nullable=True)
+    validity_days  = Column(Integer, nullable=False, default=90)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at     = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = ()
+
+
+class OrgServiceEntitlement(Base):
+    """
+    One row per org+service: the org's live complimentary balance for that
+    service, granted from ComplimentaryAllowance at onboarding (or plan
+    upgrade) time. `used_quantity` increments on every complimentary
+    consumption; once `used_quantity >= granted_quantity` or `expires_at`
+    has passed, ServiceCatalogEngine falls through to the paid
+    AICreditLedger balance instead.
+    """
+    __tablename__ = "org_service_entitlements"
+
+    id               = Column(String(36), primary_key=True, default=new_uuid)
+    org_id           = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    service_key      = Column(String(80), ForeignKey("service_catalog_items.service_key"), nullable=False)
+    granted_quantity = Column(Integer, nullable=False, default=0)
+    used_quantity    = Column(Integer, nullable=False, default=0)
+    granted_at       = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at       = Column(DateTime(timezone=True), nullable=True)
+
+
+class AIServiceTransaction(Base):
+    """
+    Immutable record of every priced AI service consumption — complimentary
+    or paid (acceptance criteria: "every paid service records the funding
+    source and price" and "complimentary usage is distinguishable from
+    paid usage"). Named distinctly from CreditTransaction: this is the
+    service-catalog-level record (what was purchased, at what price, from
+    which funding source); CreditTransaction (already existed) remains the
+    lower-level ledger-balance debit/credit record and is still written
+    whenever funding_source == "ai_services_balance" via the existing
+    CreditEngine.debit() call.
+    """
+    __tablename__ = "ai_service_transactions"
+
+    id             = Column(String(36), primary_key=True, default=new_uuid)
+    org_id         = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    user_id        = Column(String(36), ForeignKey("users.id"), nullable=True)
+    service_key    = Column(String(80), ForeignKey("service_catalog_items.service_key"), nullable=False)
+    # complimentary | ai_services_balance (paid, via the existing
+    # AICreditLedger) — additional sources (shared fund, PO/invoice) are
+    # future values once the dedicated AI Services Fund ships.
+    funding_source = Column(String(30), nullable=False)
+    price_cents    = Column(Integer, nullable=False)   # 0 for complimentary
+    # Free-form context, e.g. {"proposal_id": "...", "complexity": "standard"}
+    reference      = Column(JSON, default=dict, nullable=True)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())

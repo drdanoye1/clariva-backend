@@ -61,6 +61,10 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         "manage_api_keys",      # issue/revoke public API keys
         "manage_branding",      # configure white-label branding (logo, brand name, primary color)
         "manage_marketplace_listings",  # publish/edit/archive this org's marketplace listings
+        # Phase 2 (v2) — On-Demand AI Services Marketplace & Org Funding
+        # Controls (Enterprise Pricing spec §9.2)
+        "purchase_ai_services",   # confirm a priced AI service quote, spending the org's complimentary allowance or paid AI Services balance
+        "manage_service_funding", # view/manage org AI Services balance, transaction history, and (future) spending controls
     }),
     "editor": frozenset({
         "invite_members",
@@ -81,6 +85,10 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         # credentials, API keys, branding, and marketplace listings are all
         # organization-identity/security-sensitive, unlike day-to-day
         # collaboration work editors already do.
+        # Phase 2 (v2) — editors do the actual proposal/document work, so they
+        # can spend the org's shared AI Services balance/allowance; only
+        # owners can see/manage the funding source itself (manage_service_funding).
+        "purchase_ai_services",
     }),
     "viewer": frozenset({
         "view_proposals",

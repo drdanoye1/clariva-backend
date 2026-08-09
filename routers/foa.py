@@ -37,11 +37,14 @@ from routers.organizations import _assert_member, _assert_permission
 from engines.foa_parser import FOAParserEngine
 from engines.template_builder import FOATemplateBuilderEngine
 from engines.funding_intelligence_engine import FundingIntelligenceEngine
+from engines.service_catalog_engine import ServiceCatalogEngine
+from engines.credit_engine import InsufficientCreditsError
 
 router = APIRouter()
 parser  = FOAParserEngine()
 builder = FOATemplateBuilderEngine()
 funding = FundingIntelligenceEngine()
+catalog_engine = ServiceCatalogEngine()
 
 
 async def _to_foa_out(record: FOARecord, db: AsyncSession) -> FOARecordOut:
@@ -451,7 +454,7 @@ async def list_foas(
                FOARecord.ai_summary, FOARecord.eligibility_summary,
                FOARecord.parsed_template, FOARecord.estimated_award_floor,
                FOARecord.estimated_award_ceiling, FOARecord.source,
-               FOARecord.external_url)
+               FOARecord.external_url, FOARecord.org_id)
         .where(FOARecord.uploaded_by == current_user.id)
         .order_by(FOARecord.created_at.desc())
     )
@@ -471,6 +474,11 @@ async def list_foas(
             "estimated_award_ceiling": r.estimated_award_ceiling,
             "source": r.source,
             "external_url": r.external_url,
+            # Phase 2 — On-Demand AI Services Marketplace: the frontend uses
+            # this to decide whether "Generate AI Summary" is free (personal
+            # record) or a priced service requiring a price confirmation
+            # (org-shared record). See foa.tsx's FOACard.
+            "org_id": r.org_id,
         }
         for r in rows
     ]
@@ -628,6 +636,27 @@ async def summarize_opportunity(
 
     if record.ai_summary:
         return await _to_foa_out(record, db)
+
+    # Phase 2 — On-Demand AI Services Marketplace (Enterprise Pricing spec
+    # §9.2): Grant Opportunity Analysis is a centrally-priced service.
+    # Charging is opt-in per org_id — the same precedent CreditEngine's
+    # existing metering already established (see credit_engine.py's design
+    # notes: "a proposal generated with no org_id is not charged anything")
+    # — so a personal, non-org-shared FOA record stays completely free to
+    # summarize, exactly as before this feature existed. For an org-shared
+    # record, this also requires purchase_ai_services (owner/editor),
+    # stricter than the plain view/member access _assert_foa_access already
+    # granted above, since this specific action spends the org's shared
+    # complimentary allowance or paid AI Services balance.
+    if record.org_id:
+        await _assert_permission(record.org_id, current_user.id, "purchase_ai_services", db)
+        try:
+            await catalog_engine.consume(
+                db, record.org_id, current_user.id, "grant_opportunity_analysis",
+                reference={"foa_id": foa_id},
+            )
+        except InsufficientCreditsError as exc:
+            raise HTTPException(status_code=402, detail=str(exc))
 
     try:
         if record.raw_text:

@@ -196,7 +196,20 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     # ever get "imported" written into this column. See Proposal.origin's
     # docstring in models/db_models.py for the full rationale.
     ("proposals", "origin", "VARCHAR(20)", "VARCHAR(20)"),
+
+    # --- organizations (Phase 2 — On-Demand AI Services Marketplace & Org
+    # Funding Controls; Enterprise Pricing spec §9.2) --------------------------
+    # Drives ComplimentaryAllowance lookups. Defaults every existing org to
+    # "free" (no paid-plan allowances) — matches Organization.plan's default
+    # in models/db_models.py so ORM-created and migration-backfilled rows
+    # agree.
+    ("organizations", "plan", "VARCHAR(30) DEFAULT 'free'", "VARCHAR(30) NOT NULL DEFAULT 'free'"),
 ]
+
+# New tables introduced by Phase 2 (service_catalog_items,
+# complimentary_allowances, org_service_entitlements,
+# ai_service_transactions) need no entry here — same
+# create_all()-handles-new-tables rule noted below.
 
 # New tables introduced by Phase 7 (project_baselines, award_conditions) need
 # no entry here either — same create_all()-handles-new-tables rule as Phase 5

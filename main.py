@@ -21,6 +21,7 @@ from routers import (
 from routers import suggest, credits, scope_of_work, collaboration, documents_library, funding_intelligence, awards
 from routers import connectors, api_keys, public_api, marketplace, invitations
 from routers import portfolio
+from routers import service_catalog
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -62,12 +63,26 @@ async def _seed_superadmin() -> None:
         logger.info("Superadmin created: %s", settings.SUPERADMIN_EMAIL)
 
 
+async def _seed_service_catalog() -> None:
+    """Idempotently seed the on-demand AI Services catalog + complimentary
+    allowances (Phase 2 — Enterprise Pricing spec §9.2). Safe to call on
+    every boot: ServiceCatalogEngine.ensure_seeded() only inserts rows for
+    service_keys / (plan, service_key) pairs that don't already exist."""
+    from database import AsyncSessionLocal
+    from engines.service_catalog_engine import ServiceCatalogEngine
+    async with AsyncSessionLocal() as db:
+        await ServiceCatalogEngine().ensure_seeded(db)
+        await db.commit()
+        logger.info("Service catalog verified/seeded.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Clariva Intelligent Grant Writing Platform...")
     await create_tables()
     logger.info("Database tables verified.")
     await _seed_superadmin()
+    await _seed_service_catalog()
     yield
     logger.info("Shutting down.")
 
@@ -116,6 +131,7 @@ app.include_router(public_api.router,    prefix="/api/v1/public",        tags=["
 app.include_router(marketplace.router,   prefix="/api/v1/marketplace",   tags=["Marketplace"])
 app.include_router(invitations.router,   prefix="/api/v1/invitations",   tags=["Invitations"])
 app.include_router(portfolio.router,     prefix="/api/v1/portfolio",     tags=["Portfolio Dashboard"])
+app.include_router(service_catalog.router, prefix="/api/v1/service-catalog", tags=["AI Services Marketplace"])
 
 
 @app.get("/health", tags=["Health"])
