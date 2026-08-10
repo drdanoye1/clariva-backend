@@ -243,6 +243,8 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     ("org_contexts", "service_geography",   "JSON",           "JSON"),
     ("org_contexts", "funding_preferences", "JSON",           "JSON"),
     ("org_contexts", "entity_type",         "VARCHAR(30)",    "VARCHAR(30)"),
+    # Funding Opportunity Intelligence, Phase 3 §4.3 (Portfolio-Level Recommendations)
+    ("org_contexts", "pursuit_capacity",    "INTEGER",        "INTEGER"),
 ]
 
 # New tables introduced by Phase 2 (service_catalog_items,

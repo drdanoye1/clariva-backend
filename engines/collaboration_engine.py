@@ -37,6 +37,7 @@ from models.db_models import (
     Notification, Team, TeamMembership, User, WorkspaceGuestAccess, WorkspaceTask,
     new_uuid,
 )
+from notifications import notify as _shared_notify
 
 # Simplest unambiguous @mention syntax: @user@example.com. Matching on
 # full email avoids the name-collision ambiguity of @firstname mentions
@@ -297,13 +298,12 @@ class CollaborationEngine:
         self, db: AsyncSession, user_id: str, type_: str, message: str,
         object_type: Optional[str] = None, object_id: Optional[str] = None,
     ) -> Notification:
-        n = Notification(
-            id=new_uuid(), user_id=user_id, type=type_, message=message,
-            object_type=object_type, object_id=object_id,
+        """Delegates to the shared notifications.py::notify() helper (see
+        that module's docstring for why) — dedupe=False preserves this
+        method's original always-write behavior exactly."""
+        return await _shared_notify(
+            db, user_id, type_, message, object_type=object_type, object_id=object_id, dedupe=False,
         )
-        db.add(n)
-        await db.flush()
-        return n
 
     async def list_notifications(
         self, db: AsyncSession, user_id: str, unread_only: bool = False, limit: int = 50,

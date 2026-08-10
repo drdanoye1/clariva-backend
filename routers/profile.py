@@ -114,6 +114,7 @@ def _ctx_to_dict(ctx: OrgContextDB) -> Dict[str, Any]:
         "service_geography":    ctx.service_geography or [],
         "funding_preferences":  ctx.funding_preferences or {},
         "entity_type":          ctx.entity_type,
+        "pursuit_capacity":     ctx.pursuit_capacity,
         "updated_at":           ctx.updated_at.isoformat() if ctx.updated_at else None,
     }
 
@@ -137,6 +138,7 @@ def _empty_profile(org_id: Optional[str], default_name: Optional[str]) -> Dict[s
         "mission_statement": None, "industries": [], "certifications": [],
         "naics_codes": [], "service_geography": [], "funding_preferences": {},
         "entity_type": None,
+        "pursuit_capacity": None,
         "updated_at": None,
     }
 
@@ -244,6 +246,7 @@ async def save_profile(
     ctx.service_geography   = body.get("service_geography", [])
     ctx.funding_preferences = body.get("funding_preferences") or {}
     ctx.entity_type         = body.get("entity_type") or None
+    ctx.pursuit_capacity    = body.get("pursuit_capacity") or None
 
     await db.flush()
     await db.refresh(ctx)   # reload server-set fields (updated_at) to avoid lazy-load outside greenlet

@@ -1144,6 +1144,35 @@ class HistoricalPerformanceOut(BaseModel):
     by_funding_range: List[PerformanceBreakdownOut] = []
 
 
+# ── Portfolio-Level Recommendations (Phase 3 §4.3) ────────────────────────────
+
+class RecommendedOpportunityOut(BaseModel):
+    foa_id: str
+    program_title: str
+    agency: str
+    deadline: Optional[str] = None
+    fit_score: int
+    recommendation: str
+    rationale: str
+
+
+class ResourceConflictOut(BaseModel):
+    foa_ids: List[str]
+    titles: List[str]
+    deadline_window_days: int
+    message: str
+
+
+class PortfolioRecommendationOut(BaseModel):
+    recommended_portfolio: List[RecommendedOpportunityOut] = []
+    by_stage: Dict[str, int] = {}
+    pursuit_capacity: Optional[int] = None
+    currently_pursuing: int = 0
+    capacity_status: Optional[str] = None  # under | at | over | None (not configured)
+    resource_conflicts: List[ResourceConflictOut] = []
+    disclaimer: str
+
+
 # ── Award & Project Management (PRD §16-17, Phase 5) ─────────────────────────
 # An Award is 1:1 with a Proposal, created explicitly (never automatically)
 # once a pipeline opportunity reaches the "awarded" stage. Everything below

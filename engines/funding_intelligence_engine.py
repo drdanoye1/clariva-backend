@@ -39,7 +39,8 @@ from fastapi import HTTPException
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.db_models import FOARecord, Notification, PipelineStageEvent, Watchlist, new_uuid
+from models.db_models import FOARecord, PipelineStageEvent, Watchlist, new_uuid
+from notifications import notify as _shared_notify
 
 GRANTS_GOV_SEARCH_URL = "https://api.grants.gov/v1/api/search2"
 GRANTS_GOV_FETCH_URL = "https://api.grants.gov/v1/api/fetchOpportunity"
@@ -213,14 +214,23 @@ class FundingIntelligenceEngine:
 
             existing = await self._get_by_external(db, source, external_id)
             if existing:
-                changed = False
+                changed_fields: List[str] = []
                 for field in ("program_title", "agency", "solicitation_number", "deadline", "external_url"):
                     if getattr(existing, field) != mapped.get(field):
                         setattr(existing, field, mapped.get(field))
-                        changed = True
+                        changed_fields.append(field)
                 existing.last_synced_at = now
-                if changed:
+                if changed_fields:
                     updated += 1
+                    # Transient, never persisted — a same-request-only signal
+                    # for engines/alerts_engine.py's "solicitation amendment"
+                    # detection (Phase 3 §4.4) so it doesn't need its own
+                    # separate diff pass over the same records. Cleared below
+                    # for records that didn't change, so a prior sync's stale
+                    # value can never leak onto an unrelated record instance.
+                    existing._changed_fields = changed_fields
+                else:
+                    existing._changed_fields = []
                 touched.append(existing)
             else:
                 record = FOARecord(
@@ -328,22 +338,14 @@ class FundingIntelligenceEngine:
                 key = (wl.owner_id, record.id)
                 if key in already_notified:
                     continue
-                existing = await db.execute(
-                    select(Notification).where(
-                        Notification.user_id == wl.owner_id, Notification.type == "watchlist_match",
-                        Notification.object_type == "foa_record", Notification.object_id == record.id,
-                    ).limit(1)
+                created = await _shared_notify(
+                    db, wl.owner_id, "watchlist_match",
+                    f'New match for watchlist "{wl.name}": {record.program_title}',
+                    object_type="foa_record", object_id=record.id, dedupe=True,
                 )
-                if existing.scalars().first():
-                    already_notified.add(key)
-                    continue
-                db.add(Notification(
-                    id=new_uuid(), user_id=wl.owner_id, type="watchlist_match",
-                    message=f'New match for watchlist "{wl.name}": {record.program_title}',
-                    object_type="foa_record", object_id=record.id,
-                ))
                 already_notified.add(key)
-                notified += 1
+                if created:
+                    notified += 1
             wl.last_run_at = now
         await db.flush()
         return notified

@@ -218,6 +218,15 @@ class OrgContextDB(Base):
     # with the least plausible existing proxy (industry/capabilities text
     # can't reliably imply this).
     entity_type           = Column(String(30), nullable=True)
+    # Funding Opportunity Intelligence, Phase 3 §4.3 (Portfolio-Level
+    # Recommendations) — how many opportunities this org/individual can
+    # actively pursue at once ("qualifying"/"pursuing" pipeline_stage
+    # combined). Nullable and never defaulted: unlike everything else
+    # this profile feeds, there is no safe proxy to infer capacity from
+    # (team_members count conflates headcount with availability), so an
+    # unset value means "capacity analysis not configured" rather than a
+    # guessed number — see engines/portfolio_recommendation_engine.py.
+    pursuit_capacity      = Column(Integer, nullable=True)
 
     created_at            = Column(DateTime(timezone=True), server_default=func.now())
     updated_at            = Column(DateTime(timezone=True), onupdate=func.now())

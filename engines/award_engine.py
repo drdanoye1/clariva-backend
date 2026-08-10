@@ -63,6 +63,7 @@ from models.db_models import (
     ScopeOfWork, StoredFile, Task, WorkPackage, new_uuid,
 )
 from models.schemas import AwardReportOut, BudgetStatusOut, PlannedVsActualOut, ProjectExecutionStatusOut
+from notifications import notify as _shared_notify
 
 _log = logging.getLogger(__name__)
 
@@ -165,11 +166,12 @@ class AwardEngine:
 
     async def _notify(self, db: AsyncSession, user_id: str, type_: str, message: str,
                        object_type: Optional[str] = None, object_id: Optional[str] = None) -> Notification:
-        n = Notification(id=new_uuid(), user_id=user_id, type=type_, message=message,
-                          object_type=object_type, object_id=object_id)
-        db.add(n)
-        await db.flush()
-        return n
+        """Delegates to the shared notifications.py::notify() helper —
+        dedupe=False preserves this method's original always-write
+        behavior exactly."""
+        return await _shared_notify(
+            db, user_id, type_, message, object_type=object_type, object_id=object_id, dedupe=False,
+        )
 
     # ── Awards ───────────────────────────────────────────────────────────────
 

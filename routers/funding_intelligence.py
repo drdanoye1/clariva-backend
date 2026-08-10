@@ -17,18 +17,22 @@ from database import get_db
 from models.db_models import User
 from models.schemas import (
     HistoricalPerformanceOut, LearningTimelineEventOut, PipelineReportOut,
-    SyncResultOut, WatchlistCreate, WatchlistOut, WatchlistUpdate,
+    PortfolioRecommendationOut, SyncResultOut, WatchlistCreate, WatchlistOut, WatchlistUpdate,
 )
 from routers.auth import get_current_user
 from routers.organizations import _assert_member, _assert_permission
 from engines.funding_intelligence_engine import FundingIntelligenceEngine
 from engines.organizational_learning_engine import OrganizationalLearningEngine
 from engines.historical_performance_engine import HistoricalFundingPerformanceEngine
+from engines.portfolio_recommendation_engine import PortfolioRecommendationEngine
+from engines.alerts_engine import AlertsEngine
 
 router = APIRouter()
 engine = FundingIntelligenceEngine()
 learning_engine = OrganizationalLearningEngine()
 performance_engine = HistoricalFundingPerformanceEngine()
+recommendation_engine = PortfolioRecommendationEngine()
+alerts_engine = AlertsEngine()
 
 
 # ── Sync (manual trigger — no background scheduler in this environment) ────
@@ -79,6 +83,14 @@ async def sync_opportunities(
         for r in results:
             if r.created_count or r.updated_count:
                 r.matched_watchlists = matched
+
+    # Intelligent Alerts (Phase 3 §4.4) — same trigger point as watchlist
+    # matching above, for the same reason (no background scheduler; see
+    # engines/alerts_engine.py's module docstring). Runs even when
+    # `all_touched` is empty, since two of its five checks (deadline-
+    # approaching, resource-conflict) sweep the whole existing pipeline
+    # rather than just what this sync happened to touch.
+    await alerts_engine.run_sync_checks(db, org_id, current_user.id, all_touched)
 
     return results
 
@@ -188,3 +200,23 @@ async def get_historical_performance(
         db, org_id=org_id, uploaded_by=None if org_id else current_user.id,
     )
     return HistoricalPerformanceOut(**performance)
+
+
+@router.get("/recommendations", response_model=PortfolioRecommendationOut)
+async def get_recommendations(
+    org_id: Optional[str] = None, limit: int = 10,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Portfolio-Level Recommendations (Phase 3 §4.3) — a Fit-Score-ranked
+    shortlist of identified/qualifying opportunities worth prioritizing,
+    plus pursuit-capacity analysis (if configured on the Funding
+    Intelligence Profile) and deadline/resource-conflict warnings across
+    actively-pursued opportunities. Every number here is a prioritization
+    aid over the caller's own data, never a win-probability estimate — see
+    the response's `disclaimer` field, which the frontend always renders."""
+    if org_id:
+        await _assert_member(org_id, current_user.id, db)
+    result = await recommendation_engine.get_recommendations(
+        db, org_id=org_id, uploaded_by=None if org_id else current_user.id, limit=limit,
+    )
+    return PortfolioRecommendationOut(**result)
