@@ -1033,6 +1033,18 @@ class FOARecordOut(BaseModel):
     complexity: Optional[str] = None
     attractiveness: Optional[str] = None
     attractiveness_reason: Optional[str] = None
+    # Funding Opportunity Intelligence, Phase 2 (Organization-Specific
+    # Matching, Ranking & Decision Intelligence) — see
+    # engines/fit_score_engine.py. Deterministic, explainable, free (no AI
+    # credit cost) — computed fresh on every /foa/pipeline read against
+    # whichever Funding Intelligence Profile (personal or org, matching
+    # this request's scope) is on file. All fields are None when there is
+    # no profile to score against yet, never a misleading default score.
+    fit_score: Optional[int] = None
+    fit_bucket: Optional[str] = None
+    fit_recommendation: Optional[str] = None
+    fit_recommendation_reason: Optional[str] = None
+    fit_categories: Optional[List[dict]] = None
 
 class PipelineStageUpdateRequest(BaseModel):
     stage: str

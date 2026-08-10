@@ -65,6 +65,9 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         # Controls (Enterprise Pricing spec §9.2)
         "purchase_ai_services",   # confirm a priced AI service quote, spending the org's complimentary allowance or paid AI Services balance
         "manage_service_funding", # view/manage org AI Services balance, transaction history, and (future) spending controls
+        # Funding Opportunity Intelligence, Phase 2 — Organization-Specific
+        # Matching, Ranking & Decision Intelligence
+        "manage_company_profile", # edit the org-shared Company/Funding Intelligence Profile (org_contexts row with org_id set) — viewing it is member-visible, editing is not
     }),
     "editor": frozenset({
         "invite_members",
@@ -89,6 +92,10 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         # can spend the org's shared AI Services balance/allowance; only
         # owners can see/manage the funding source itself (manage_service_funding).
         "purchase_ai_services",
+        # Phase 2 (Funding Opportunity Intelligence) — editors do the
+        # day-to-day pipeline/proposal work and are the ones most likely
+        # to keep the org's Funding Intelligence Profile current.
+        "manage_company_profile",
     }),
     "viewer": frozenset({
         "view_proposals",

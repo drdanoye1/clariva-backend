@@ -218,6 +218,31 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     # in models/db_models.py so ORM-created and migration-backfilled rows
     # agree.
     ("organizations", "plan", "VARCHAR(30) DEFAULT 'free'", "VARCHAR(30) NOT NULL DEFAULT 'free'"),
+
+    # --- org_contexts (Funding Opportunity Intelligence, Phase 2 —
+    # Organization-Specific Matching, Ranking & Decision Intelligence) ------
+    # Migrates the Company Profile from strictly per-user to optionally
+    # org-owned (org_id nullable, same pattern as FOARecord.org_id/
+    # Watchlist.org_id) — see OrgContextDB's docstring in
+    # models/db_models.py for the full rationale, including why user_id is
+    # no longer treated as unique. The uniqueness constraint itself is
+    # dropped separately below in POSTGRES_ONLY_STATEMENTS (SQLite has no
+    # equivalent DROP CONSTRAINT; a fresh SQLite DB created via
+    # create_all() from the current model never has the constraint in the
+    # first place, so this only matters for an existing production
+    # Postgres table).
+    ("org_contexts", "org_id",              "VARCHAR(36)", "VARCHAR(36)"),
+    # Net-new Funding Intelligence Profile fields — all nullable, no
+    # backfill: an existing profile simply shows these as empty until a
+    # user fills them in, exactly like every other additive column in
+    # this table's history.
+    ("org_contexts", "mission_statement",   "TEXT",           "TEXT"),
+    ("org_contexts", "industries",          "JSON",           "JSON"),
+    ("org_contexts", "certifications",      "JSON",           "JSON"),
+    ("org_contexts", "naics_codes",         "JSON",           "JSON"),
+    ("org_contexts", "service_geography",   "JSON",           "JSON"),
+    ("org_contexts", "funding_preferences", "JSON",           "JSON"),
+    ("org_contexts", "entity_type",         "VARCHAR(30)",    "VARCHAR(30)"),
 ]
 
 # New tables introduced by Phase 2 (service_catalog_items,
@@ -248,4 +273,13 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
 # and never needed this statement in the first place.
 POSTGRES_ONLY_STATEMENTS: List[str] = [
     "ALTER TABLE proposals ALTER COLUMN agency TYPE VARCHAR(30)",
+    # Funding Opportunity Intelligence, Phase 2 — drops the UNIQUE(user_id)
+    # constraint org_contexts was originally created with (Postgres's
+    # default name for a bare `unique=True` column is
+    # "<table>_<column>_key"), now that a user can legitimately own more
+    # than one profile row (their personal one, org_id NULL, plus any
+    # organization's shared one they created/edited). `_pg_exec()` already
+    # swallows and logs a warning on any error, so this is safe to run on
+    # every boot even after the constraint no longer exists.
+    "ALTER TABLE org_contexts DROP CONSTRAINT IF EXISTS org_contexts_user_id_key",
 ]

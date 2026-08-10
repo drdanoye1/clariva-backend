@@ -9,16 +9,17 @@ from models.db_models import OrgContextDB, Proposal, ProposalSection, ReviewerRe
 from models.schemas import ReviewerSimulation, ReviewerType
 from routers.auth import get_current_user
 from engines.reviewer_simulator import ReviewerSimulatorEngine
+from engines.company_profile import get_org_context
 
 router    = APIRouter()
 simulator = ReviewerSimulatorEngine()
 
 
 async def _load_company_profile(user_id: str, db: AsyncSession) -> dict:
-    result = await db.execute(
-        select(OrgContextDB).where(OrgContextDB.user_id == user_id)
-    )
-    ctx = result.scalar_one_or_none()
+    # Funding Opportunity Intelligence, Phase 2 — see
+    # engines/company_profile.py's module docstring: OrgContextDB.user_id
+    # is no longer unique, so this can't query it directly anymore.
+    ctx = await get_org_context(db, user_id=user_id)
     if not ctx:
         return {}
     return {

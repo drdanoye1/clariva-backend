@@ -53,14 +53,68 @@ class User(Base):
     updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
 
     proposals   = relationship("Proposal", back_populates="owner")
-    org_context = relationship("OrgContextDB", back_populates="user", uselist=False)
+    # Funding Opportunity Intelligence, Phase 2 — the `org_context`
+    # relationship (uselist=False, i.e. "exactly one or none") was removed
+    # here: OrgContextDB.user_id is no longer unique now that a user can
+    # own both a personal profile (org_id NULL) and one or more
+    # organizations' shared profiles (org_id set) — see OrgContextDB's
+    # docstring. A uselist=False relationship over a now-multi-row foreign
+    # key would raise MultipleResultsFound the moment any user has more
+    # than one OrgContextDB row, which would 500 every authenticated
+    # request for that user (get_current_user() eagerly loaded this via
+    # selectinload). It was unused elsewhere in the codebase (grepped),
+    # so removing it outright is safe — use
+    # engines/company_profile.py::get_org_context(db, user_id, org_id) for
+    # every profile lookup instead, which is explicit about which of a
+    # user's possibly-several profiles it wants.
 
 
 class OrgContextDB(Base):
+    """
+    The Company Profile — and, as of Funding Opportunity Intelligence
+    Phase 2 (Organization-Specific Matching, Ranking & Decision
+    Intelligence), also the "Funding Intelligence Profile" the Fit Score
+    engine (engines/fit_score_engine.py) scores opportunities against.
+
+    Historically this was strictly per-user (`user_id`, unique) — whoever
+    on a team happened to fill out the form "owned" the only profile, with
+    no way for it to represent a shared Organization the way FOARecord/
+    Award/Watchlist/MarketplaceListing already do via a nullable `org_id`.
+    That's a real gap for Fit Scoring: an org's pipeline (FOARecord.org_id)
+    should be scored against the ORG's profile, not against whichever
+    individual member happened to fill one out.
+
+    Migrated (per explicit product decision, not a default) to the same
+    "Personal vs Organization" pattern used everywhere else in this
+    codebase: `org_id` nullable — a personal profile (org_id IS NULL,
+    scoped by `user_id`) behaves exactly as before this migration; an
+    org-owned profile (org_id set) is shared by the whole organization and
+    editable only by owner/editor (see rbac.py's `manage_company_profile`).
+
+    IMPORTANT — `user_id` is NO LONGER globally unique. It used to be the
+    sole uniqueness key; now a user can be the creator/last-editor of
+    their own personal profile (org_id NULL) AND of one or more
+    organizations' shared profiles (org_id set), each a separate row. Any
+    query that filters on `user_id` alone without also constraining
+    `org_id` (e.g. `.is_(None)` for "the personal one") can now match more
+    than one row and must not call `.scalar_one_or_none()` blindly — see
+    engines/company_profile.py::get_org_context(), the one place this
+    lookup should happen from now on.
+    """
     __tablename__ = "org_contexts"
 
     id                    = Column(String(36), primary_key=True, default=new_uuid)
-    user_id               = Column(String(36), ForeignKey("users.id"), unique=True)
+    # Creator/last-editor, for audit — no longer unique (see class
+    # docstring). Still required: even an org-owned profile was created by
+    # someone, and the personal-profile lookup (org_id IS NULL) still
+    # needs it to find "my" profile.
+    user_id               = Column(String(36), ForeignKey("users.id"))
+    # Funding Opportunity Intelligence, Phase 2 — nullable: NULL means a
+    # personal profile (scoped by user_id, exactly like before this
+    # column existed); set means this profile belongs to that
+    # Organization and is shared by every member, matching FOARecord.org_id/
+    # Watchlist.org_id/MarketplaceListing's identical nullable pattern.
+    org_id                = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
 
     # ── Company Overview ──────────────────────────────────────────────────────
     organization_name     = Column(String(255))
@@ -128,10 +182,49 @@ class OrgContextDB(Base):
     # [{title, agency, award_number, amount, period, outcome, relevance}]
     past_performance      = Column(JSON, default=list)
 
+    # ── Funding Intelligence Profile (Funding Opportunity Intelligence,
+    # Phase 2 — Organization-Specific Matching, Ranking & Decision
+    # Intelligence) — net-new fields with no prior equivalent anywhere in
+    # this schema. These feed engines/fit_score_engine.py's Strategic/
+    # Mission Alignment, Eligibility, Applicant/Geographic Fit, and
+    # Funding Fit categories; `industry`/`core_technologies`/
+    # `company_capabilities` above continue to feed Capability Fit.
+    mission_statement     = Column(Text, nullable=True)
+    # Plural, tag-style (unlike the older singular free-text `industry`
+    # above) — e.g. ["Nanotechnology", "Materials Science", "Biotechnology"].
+    industries            = Column(JSON, nullable=True, default=list)
+    # Structured set-asides/certifications — e.g. ["8(a)", "HUBZone",
+    # "WOSB", "SDVOSB", "Minority-Owned", "Veteran-Owned"]. Distinct from
+    # the free-text "certifications" sub-key already nested inside each
+    # `facilities` item (that's equipment/lab certifications, not
+    # business set-asides — different concept, not superseded).
+    certifications        = Column(JSON, nullable=True, default=list)
+    naics_codes           = Column(JSON, nullable=True, default=list)
+    # e.g. ["National"], ["AL", "GA", "FL"], or ["International"] — the
+    # geographic footprint this organization can actually operate/deliver
+    # in, for matching against an opportunity's applicant-location
+    # restrictions (distinct from the single `firm_city/state` mailing
+    # address above, which is registration address, not service area).
+    service_geography     = Column(JSON, nullable=True, default=list)
+    # {"preferred_agencies": [...], "min_award": <float>, "max_award":
+    #  <float>, "cost_share_tolerance": "none|low|moderate|high",
+    #  "preferred_phase": "phase_i|phase_ii|either"} — all keys optional;
+    # engines/fit_score_engine.py treats a missing key as "no preference"
+    # rather than a mismatch.
+    funding_preferences   = Column(JSON, nullable=True)
+    # small_business | nonprofit | academic | tribal | government |
+    # large_business — the single most load-bearing field for Eligibility
+    # scoring against an FOA's applicant-type restrictions, and the one
+    # with the least plausible existing proxy (industry/capabilities text
+    # can't reliably imply this).
+    entity_type           = Column(String(30), nullable=True)
+
     created_at            = Column(DateTime(timezone=True), server_default=func.now())
     updated_at            = Column(DateTime(timezone=True), onupdate=func.now())
 
-    user = relationship("User", back_populates="org_context")
+    # No `user = relationship(...)` back-reference — see User.org_context's
+    # removal note above for why a 1:1-style relationship is no longer
+    # safe over this table.
 
 
 class FOARecord(Base):

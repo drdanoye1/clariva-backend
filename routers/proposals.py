@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from database import get_db
 from models.db_models import Proposal, ProposalSection, FOARecord, OrgContextDB, User
+from engines.company_profile import get_org_context
 from models.schemas import ProposalCreate, ProposalOut, SectionContent, SectionGenerateRequest
 from engines.grant_templates import get_sections as get_grant_sections, list_grant_types
 from routers.auth import get_current_user
@@ -65,8 +66,14 @@ def _sections_for_grant_type(grant_type_val: str) -> list:
 
 
 async def _load_company_profile(user_id: str, db: AsyncSession) -> dict:
-    result = await db.execute(select(OrgContextDB).where(OrgContextDB.user_id == user_id))
-    ctx = result.scalar_one_or_none()
+    # Funding Opportunity Intelligence, Phase 2 — OrgContextDB.user_id is no
+    # longer unique (a user can also own org-shared profiles), so this must
+    # go through get_org_context() rather than querying user_id directly;
+    # see engines/company_profile.py's module docstring. Personal-profile
+    # lookup only (org_id omitted) — proposal generation staying scoped to
+    # "the generating user's own profile" is unchanged behavior from before
+    # this migration.
+    ctx = await get_org_context(db, user_id=user_id)
     if not ctx:
         return {}
     return {

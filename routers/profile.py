@@ -1,23 +1,40 @@
-"""Company Profile router — CRUD for OrgContextDB (PI, team, facilities, partners, past performance)."""
+"""
+Company Profile router — CRUD for OrgContextDB (PI, team, facilities,
+partners, past performance, and — as of Funding Opportunity Intelligence
+Phase 2 — the Funding Intelligence Profile fields the Fit Score engine
+scores opportunities against: mission, industries, certifications, NAICS
+codes, service geography, funding preferences, entity type).
+
+Phase 2 migrated this from strictly per-user to optionally org-owned (see
+OrgContextDB's docstring in models/db_models.py): pass `?org_id=` to read
+or write the shared profile for that Organization instead of the calling
+user's personal one. Viewing an org's profile only requires membership;
+editing it requires the `manage_company_profile` permission (owner/editor
+— see rbac.py). Omitting `org_id` behaves exactly as before this
+migration existed — the caller's own personal profile, invisible to
+anyone else.
+"""
 
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 
 from database import get_db
 from models.db_models import OrgContextDB, User
 from routers.auth import get_current_user
+from routers.organizations import _assert_member, _assert_permission
+from engines.company_profile import get_org_context
 
 router = APIRouter()
 
 
 def _ctx_to_dict(ctx: OrgContextDB) -> Dict[str, Any]:
     return {
+        "org_id":                ctx.org_id,
         "organization_name":    ctx.organization_name,
         "industry":             ctx.industry,
         "core_technologies":    ctx.core_technologies or [],
@@ -58,57 +75,85 @@ def _ctx_to_dict(ctx: OrgContextDB) -> Dict[str, Any]:
         "facilities":           ctx.facilities or [],
         "partners":             ctx.partners or [],
         "past_performance":     ctx.past_performance or [],
+        # Funding Intelligence Profile (Phase 2)
+        "mission_statement":    ctx.mission_statement,
+        "industries":           ctx.industries or [],
+        "certifications":       ctx.certifications or [],
+        "naics_codes":          ctx.naics_codes or [],
+        "service_geography":    ctx.service_geography or [],
+        "funding_preferences":  ctx.funding_preferences or {},
+        "entity_type":          ctx.entity_type,
         "updated_at":           ctx.updated_at.isoformat() if ctx.updated_at else None,
+    }
+
+
+def _empty_profile(org_id: Optional[str], default_name: Optional[str]) -> Dict[str, Any]:
+    return {
+        "org_id": org_id,
+        "organization_name": default_name or "", "industry": "", "core_technologies": [],
+        "prior_sbir_experience": False,
+        "uei_number": None, "cage_code": None, "company_capabilities": None,
+        "ein_tax_id": None, "duns_number": None,
+        "firm_street": None, "firm_apt_suite": None, "firm_city": None,
+        "firm_state": None, "firm_zip": None, "firm_phone": None,
+        "pi_name": None, "pi_credentials": None, "pi_orcid": None,
+        "pi_degree": None, "pi_affiliation": None,
+        "pi_publications": None, "pi_prior_sbir_awards": None,
+        "pi_email": None, "pi_phone": None,
+        "bo_name": None, "bo_title": None, "bo_phone": None, "bo_email": None,
+        "acn_name": None, "acn_title": None, "acn_phone": None, "acn_email": None,
+        "team_members": [], "facilities": [], "partners": [], "past_performance": [],
+        "mission_statement": None, "industries": [], "certifications": [],
+        "naics_codes": [], "service_geography": [], "funding_preferences": {},
+        "entity_type": None,
+        "updated_at": None,
     }
 
 
 @router.get("/")
 async def get_profile(
+    org_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Get the current user's company profile."""
-    result = await db.execute(
-        select(OrgContextDB).where(OrgContextDB.user_id == current_user.id)
-    )
-    ctx = result.scalar_one_or_none()
+    """
+    Get a Company/Funding Intelligence Profile. `org_id` given -> the
+    org-shared profile (any member may view). Omitted -> the caller's own
+    personal profile, exactly as before Phase 2.
+    """
+    if org_id:
+        await _assert_member(org_id, current_user.id, db)
+    ctx = await get_org_context(db, user_id=current_user.id, org_id=org_id)
     if not ctx:
-        # Return empty profile
-        return {
-            "organization_name": current_user.organization,
-            "industry": "", "core_technologies": [],
-            "prior_sbir_experience": False,
-            "uei_number": None, "cage_code": None, "company_capabilities": None,
-            "ein_tax_id": None, "duns_number": None,
-            "firm_street": None, "firm_apt_suite": None, "firm_city": None,
-            "firm_state": None, "firm_zip": None, "firm_phone": None,
-            "pi_name": None, "pi_credentials": None, "pi_orcid": None,
-            "pi_degree": None, "pi_affiliation": None,
-            "pi_publications": None, "pi_prior_sbir_awards": None,
-            "pi_email": None, "pi_phone": None,
-            "bo_name": None, "bo_title": None, "bo_phone": None, "bo_email": None,
-            "acn_name": None, "acn_title": None, "acn_phone": None, "acn_email": None,
-            "team_members": [], "facilities": [], "partners": [], "past_performance": [],
-            "updated_at": None,
-        }
+        return _empty_profile(org_id, None if org_id else current_user.organization)
     return _ctx_to_dict(ctx)
 
 
 @router.put("/")
 async def save_profile(
     body: Dict[str, Any],
+    org_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Upsert the full company profile."""
-    result = await db.execute(
-        select(OrgContextDB).where(OrgContextDB.user_id == current_user.id)
-    )
-    ctx = result.scalar_one_or_none()
+    """
+    Upsert a Company/Funding Intelligence Profile. `org_id` given ->
+    requires `manage_company_profile` (owner/editor) and writes the
+    org-shared profile. Omitted -> the caller's personal profile, exactly
+    as before Phase 2.
+    """
+    if org_id:
+        await _assert_permission(org_id, current_user.id, "manage_company_profile", db)
 
+    ctx = await get_org_context(db, user_id=current_user.id, org_id=org_id)
     if not ctx:
-        ctx = OrgContextDB(id=str(uuid.uuid4()), user_id=current_user.id)
+        ctx = OrgContextDB(id=str(uuid.uuid4()), user_id=current_user.id, org_id=org_id)
         db.add(ctx)
+    else:
+        # Track the most recent editor even on an org-shared profile —
+        # informational only, org_id (the actual ownership/scope key) is
+        # never reassigned here.
+        ctx.user_id = current_user.id
 
     # Overview
     ctx.organization_name     = body.get("organization_name", "")
@@ -157,6 +202,15 @@ async def save_profile(
     ctx.facilities       = body.get("facilities", [])
     ctx.partners         = body.get("partners", [])
     ctx.past_performance = body.get("past_performance", [])
+
+    # Funding Intelligence Profile (Phase 2)
+    ctx.mission_statement   = body.get("mission_statement") or None
+    ctx.industries          = body.get("industries", [])
+    ctx.certifications      = body.get("certifications", [])
+    ctx.naics_codes         = body.get("naics_codes", [])
+    ctx.service_geography   = body.get("service_geography", [])
+    ctx.funding_preferences = body.get("funding_preferences") or {}
+    ctx.entity_type         = body.get("entity_type") or None
 
     await db.flush()
     await db.refresh(ctx)   # reload server-set fields (updated_at) to avoid lazy-load outside greenlet

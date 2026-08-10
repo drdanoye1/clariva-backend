@@ -18,6 +18,7 @@ from database import get_db
 from models.db_models import BudgetRecord, OrgContextDB, Proposal, User
 from routers.auth import get_current_user
 from routers.budget import _get_proposal, _calc_totals, _resolve_cap
+from engines.company_profile import get_org_context
 
 router = APIRouter()
 
@@ -64,8 +65,10 @@ async def _get_rec_and_proposal(proposal_id: str, owner_id: str, db: AsyncSessio
 
 
 async def _get_org(user_id: str, db: AsyncSession) -> str:
-    r = await db.execute(select(OrgContextDB).where(OrgContextDB.user_id == user_id))
-    ctx = r.scalar_one_or_none()
+    # Funding Opportunity Intelligence, Phase 2 — see
+    # engines/company_profile.py's module docstring: OrgContextDB.user_id
+    # is no longer unique, so this can't query it directly anymore.
+    ctx = await get_org_context(db, user_id=user_id)
     return (ctx and ctx.organization_name) or "Applicant Organization"
 
 

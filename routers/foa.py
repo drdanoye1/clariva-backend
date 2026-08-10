@@ -39,6 +39,8 @@ from engines.template_builder import FOATemplateBuilderEngine
 from engines.funding_intelligence_engine import FundingIntelligenceEngine
 from engines.service_catalog_engine import ServiceCatalogEngine
 from engines.credit_engine import InsufficientCreditsError
+from engines.company_profile import get_org_context
+from engines.fit_score_engine import FitScoreResult, score_opportunity
 
 router = APIRouter()
 parser  = FOAParserEngine()
@@ -47,13 +49,18 @@ funding = FundingIntelligenceEngine()
 catalog_engine = ServiceCatalogEngine()
 
 
-async def _to_foa_out(record: FOARecord, db: AsyncSession) -> FOARecordOut:
+async def _to_foa_out(record: FOARecord, db: AsyncSession, fit: Optional[FitScoreResult] = None) -> FOARecordOut:
     """
     Version 3.0 architecture upgrade, Phase 14 (Renewal Loop Closure) — now
     async so it can resolve `originating_award_id` into a human-readable
     label/link target for the (rare) records created as a renewal. This is
     a single extra query only when that field is set — the overwhelming
     majority of FOARecords have it None and pay no extra cost.
+
+    `fit` (Funding Opportunity Intelligence, Phase 2) is precomputed by the
+    caller — see `list_pipeline` below — because it depends on the
+    Funding Intelligence Profile for the *request's* scope (personal vs. a
+    given org), which is loaded once per request, not once per record.
     """
     originating_proposal_id: Optional[str] = None
     originating_award_label: Optional[str] = None
@@ -85,6 +92,11 @@ async def _to_foa_out(record: FOARecord, db: AsyncSession) -> FOARecordOut:
         intelligence_report=record.intelligence_report, eligibility_status=record.eligibility_status,
         complexity=record.complexity, attractiveness=record.attractiveness,
         attractiveness_reason=record.attractiveness_reason,
+        fit_score=fit.overall_score if fit else None,
+        fit_bucket=fit.bucket if fit else None,
+        fit_recommendation=fit.recommendation if fit else None,
+        fit_recommendation_reason=fit.recommendation_reason if fit else None,
+        fit_categories=[c.to_dict() for c in fit.categories] if fit else None,
     )
 
 
@@ -396,6 +408,14 @@ async def list_pipeline(
     `keyword`, which fetches new records from Grants.gov/SAM.gov. See
     FundingIntelligenceEngine.list_pipeline()'s docstring for the
     distinction; this just threads the param through.
+
+    Funding Opportunity Intelligence, Phase 2 — each record also gets a
+    Fit Score (see engines/fit_score_engine.py) computed against whichever
+    Funding Intelligence Profile matches this request's scope (the org's
+    shared profile when `org_id` is given, else the caller's personal
+    one). The profile is loaded once for the whole list, not once per
+    record. If no profile exists yet, every record's fit fields are simply
+    None — no AI call, no extra cost either way.
     """
     if org_id:
         await _assert_member(org_id, current_user.id, db)
@@ -404,7 +424,8 @@ async def list_pipeline(
         pipeline_stage=pipeline_stage, source=source, assigned_to=assigned_to,
         keyword=keyword,
     )
-    return [await _to_foa_out(r, db) for r in records]
+    profile = await get_org_context(db, user_id=current_user.id, org_id=org_id)
+    return [await _to_foa_out(r, db, fit=score_opportunity(r, profile)) for r in records]
 
 
 @router.get("/compare", response_model=List[FOARecordOut])

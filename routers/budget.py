@@ -19,6 +19,7 @@ from config import settings
 from database import get_db
 from models.db_models import BudgetRecord, OrgContextDB, Proposal, User
 from routers.auth import get_current_user
+from engines.company_profile import get_org_context
 
 router = APIRouter()
 
@@ -266,9 +267,11 @@ async def generate_justification(
     if not rec:
         raise HTTPException(status_code=404, detail="Save a budget first before generating justification.")
 
-    # Load profile for org name and PI
-    pr = await db.execute(select(OrgContextDB).where(OrgContextDB.user_id == current_user.id))
-    ctx = pr.scalar_one_or_none()
+    # Load profile for org name and PI. Funding Opportunity Intelligence,
+    # Phase 2 — see engines/company_profile.py's module docstring:
+    # OrgContextDB.user_id is no longer unique, so this can't query it
+    # directly anymore.
+    ctx = await get_org_context(db, user_id=current_user.id)
     org_name = (ctx and ctx.organization_name) or "the applicant organization"
 
     body = {
