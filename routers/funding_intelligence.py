@@ -129,12 +129,19 @@ async def delete_watchlist(
 
 @router.get("/pipeline-report", response_model=PipelineReportOut)
 async def get_pipeline_report(
-    org_id: Optional[str] = None,
+    org_id: Optional[str] = None, keyword: Optional[str] = None,
     db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
 ):
     """Portfolio-level win rate, cycle time, and pipeline value (PRD §15) —
-    over an org's shared pipeline, or the current user's personal one."""
+    over an org's shared pipeline, or the current user's personal one.
+    `keyword`, when given, scopes these totals to the same non-destructive
+    substring-filtered subset the pipeline board is currently showing
+    (Funding Opportunity Intelligence Phase 1's keyword-filter fix), so
+    "Total Opportunities" reflects what's actually on screen rather than
+    the org's whole unfiltered pipeline."""
     if org_id:
         await _assert_member(org_id, current_user.id, db)
-    report = await engine.get_pipeline_report(db, org_id=org_id, uploaded_by=None if org_id else current_user.id)
+    report = await engine.get_pipeline_report(
+        db, org_id=org_id, uploaded_by=None if org_id else current_user.id, keyword=keyword,
+    )
     return PipelineReportOut(**report)

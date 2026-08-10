@@ -380,6 +380,7 @@ async def parse_foa_url(
 async def list_pipeline(
     org_id: Optional[str] = None, pipeline_stage: Optional[str] = None,
     source: Optional[str] = None, assigned_to: Optional[str] = None,
+    keyword: Optional[str] = None,
     db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
 ):
     """
@@ -388,12 +389,20 @@ async def list_pipeline(
     dicts. This returns the full FOARecordOut shape (pipeline stage,
     Bid/No-Go, sync metadata) and, when `org_id` is given, the whole org's
     shared pipeline rather than just "my" records.
+
+    `keyword` (added alongside Funding Opportunity Intelligence Phase 1's
+    keyword-filter fix) is a non-destructive substring filter over
+    already-synced records — NOT the same as POST /funding/sync's
+    `keyword`, which fetches new records from Grants.gov/SAM.gov. See
+    FundingIntelligenceEngine.list_pipeline()'s docstring for the
+    distinction; this just threads the param through.
     """
     if org_id:
         await _assert_member(org_id, current_user.id, db)
     records = await funding.list_pipeline(
         db, org_id=org_id, uploaded_by=None if org_id else current_user.id,
         pipeline_stage=pipeline_stage, source=source, assigned_to=assigned_to,
+        keyword=keyword,
     )
     return [await _to_foa_out(r, db) for r in records]
 

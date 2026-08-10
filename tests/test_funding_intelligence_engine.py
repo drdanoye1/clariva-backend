@@ -412,6 +412,36 @@ def test_list_pipeline_filters_by_org_stage_and_source(client, engine):
 
     org_records, personal_records, synced_only = _run(_body())
     assert len(org_records) == 2
+
+
+# Funding Opportunity Intelligence, Phase 1 (keyword-filter fix) — confirms
+# `list_pipeline(keyword=...)` narrows an already-synced pipeline by a
+# case-insensitive substring match, independent of org/stage/source
+# filters, and that it's a pure read (no records are created/removed/
+# modified) — distinct from fundingApi.sync's keyword, which hits
+# Grants.gov's live API.
+def test_list_pipeline_keyword_filters_existing_records(client, engine):
+    org_id = _id("org")
+
+    async def _body():
+        async with AsyncSessionLocal() as db:
+            await _make_foa(db, org_id=org_id, program_title="Nanomaterials for Sensor Research", agency="NSF")
+            await _make_foa(db, org_id=org_id, program_title="Rural Broadband Expansion", agency="USDA-RD",
+                             eligibility_summary="Open to nonprofit nanotechnology consortia.")
+            await _make_foa(db, org_id=org_id, program_title="Suicide Prevention Peer Support Services", agency="HHS-NIH11")
+            await db.commit()
+        async with AsyncSessionLocal() as db:
+            title_match = await engine.list_pipeline(db, org_id=org_id, keyword="nanomaterials")
+            eligibility_match = await engine.list_pipeline(db, org_id=org_id, keyword="nanotechnology")
+            no_match = await engine.list_pipeline(db, org_id=org_id, keyword="quantum")
+            everything = await engine.list_pipeline(db, org_id=org_id)
+            return title_match, eligibility_match, no_match, everything
+
+    title_match, eligibility_match, no_match, everything = _run(_body())
+    assert len(everything) == 3
+    assert len(title_match) == 1 and title_match[0].program_title == "Nanomaterials for Sensor Research"
+    assert len(eligibility_match) == 1 and eligibility_match[0].program_title == "Rural Broadband Expansion"
+    assert no_match == []
     assert len(personal_records) == 1
     assert len(synced_only) == 1
     assert synced_only[0].source == "grants_gov"

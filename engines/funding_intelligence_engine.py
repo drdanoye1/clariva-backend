@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.db_models import FOARecord, Notification, PipelineStageEvent, Watchlist, new_uuid
@@ -382,7 +382,27 @@ class FundingIntelligenceEngine:
     async def list_pipeline(
         self, db: AsyncSession, org_id: Optional[str] = None, uploaded_by: Optional[str] = None,
         pipeline_stage: Optional[str] = None, source: Optional[str] = None, assigned_to: Optional[str] = None,
+        keyword: Optional[str] = None,
     ) -> List[FOARecord]:
+        """
+        `keyword`, if given, narrows an already-synced pipeline by a simple
+        case-insensitive substring match across the fields a user would
+        actually recognize an opportunity by (title, agency,
+        solicitation number, eligibility read, AI summary/brief). This is
+        NOT the same thing as the sync keyword (POST /funding/sync's
+        `keyword`, which is sent to Grants.gov's search API to pull in NEW
+        matching records from the outside world) — this filters what's
+        already sitting in the pipeline table, non-destructively, so a
+        user narrowing "NanoResearch, Inc"'s 80+ broadly-synced
+        opportunities down to ones actually mentioning e.g. "nanomaterials"
+        doesn't need to trigger another live Grants.gov call to do it.
+        This is a deliberately simple substring filter, not the
+        organization-profile fit-scoring from the Funding Opportunity
+        Intelligence roadmap's Phase 2 (Funding Intelligence Profile /
+        FOFS) — that's a separate, larger, explicitly-deferred piece of
+        work; this just stops obviously-irrelevant results from cluttering
+        the view today.
+        """
         query = select(FOARecord)
         if org_id:
             query = query.where(FOARecord.org_id == org_id)
@@ -394,6 +414,15 @@ class FundingIntelligenceEngine:
             query = query.where(FOARecord.source == source)
         if assigned_to:
             query = query.where(FOARecord.assigned_to == assigned_to)
+        if keyword:
+            like = f"%{keyword.strip()}%"
+            query = query.where(or_(
+                FOARecord.program_title.ilike(like),
+                FOARecord.agency.ilike(like),
+                FOARecord.solicitation_number.ilike(like),
+                FOARecord.eligibility_summary.ilike(like),
+                FOARecord.ai_summary.ilike(like),
+            ))
         result = await db.execute(query.order_by(FOARecord.created_at.desc()))
         return list(result.scalars().all())
 
@@ -403,8 +432,11 @@ class FundingIntelligenceEngine:
 
     # ── Pipeline reporting ───────────────────────────────────────────────────
 
-    async def get_pipeline_report(self, db: AsyncSession, org_id: Optional[str] = None, uploaded_by: Optional[str] = None) -> Dict[str, Any]:
-        records = await self.list_pipeline(db, org_id=org_id, uploaded_by=uploaded_by)
+    async def get_pipeline_report(
+        self, db: AsyncSession, org_id: Optional[str] = None, uploaded_by: Optional[str] = None,
+        keyword: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        records = await self.list_pipeline(db, org_id=org_id, uploaded_by=uploaded_by, keyword=keyword)
 
         by_stage: Dict[str, int] = {}
         for r in records:
