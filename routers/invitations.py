@@ -16,7 +16,7 @@ WorkspaceGuestAccess links.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -57,12 +57,20 @@ async def _load_invitation(token: str, db: AsyncSession) -> Invitation:
 
 
 def _invitation_validity(invitation: Invitation) -> Optional[str]:
-    """None = valid; otherwise a short reason code for why it isn't."""
+    """None = valid; otherwise a short reason code for why it isn't.
+
+    invitation.expires_at comes from a DateTime(timezone=True) column, so on
+    Postgres (production) SQLAlchemy hands back a timezone-aware datetime —
+    comparing that against a naive datetime.utcnow() raises TypeError
+    ("can't compare offset-naive and offset-aware datetimes"), which was an
+    uncaught exception producing a bare 500 on this endpoint. SQLite (the
+    test DB) doesn't enforce tz-awareness on read, so this never surfaced in
+    the test suite. Always compare against a tz-aware "now" here."""
     if invitation.status == "revoked":
         return "revoked"
     if invitation.status == "accepted":
         return "accepted"
-    if invitation.expires_at and invitation.expires_at < datetime.utcnow():
+    if invitation.expires_at and invitation.expires_at < datetime.now(timezone.utc):
         return "expired"
     return None
 
@@ -144,7 +152,7 @@ async def accept_invitation(token: str, body: InvitationAcceptRequest, db: Async
         db.add(TeamMembership(id=str(uuid.uuid4()), team_id=invitation.team_id, user_id=user.id))
 
     invitation.status = "accepted"
-    invitation.accepted_at = datetime.utcnow()
+    invitation.accepted_at = datetime.now(timezone.utc)
     await db.flush()
     await db.refresh(user)
 

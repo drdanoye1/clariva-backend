@@ -3,7 +3,7 @@
 from __future__ import annotations
 import secrets
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -225,13 +225,13 @@ async def invite_member(
             invitation.role = body.role
             invitation.team_id = body.team_id
             invitation.department_id = body.department_id
-            invitation.expires_at = datetime.utcnow() + timedelta(days=INVITATION_EXPIRY_DAYS)
+            invitation.expires_at = datetime.now(timezone.utc) + timedelta(days=INVITATION_EXPIRY_DAYS)
         else:
             invitation = Invitation(
                 id=str(uuid.uuid4()), org_id=org_id, email=body.email, role=body.role,
                 team_id=body.team_id, department_id=body.department_id,
                 token=secrets.token_urlsafe(32), invited_by=current_user.id,
-                expires_at=datetime.utcnow() + timedelta(days=INVITATION_EXPIRY_DAYS),
+                expires_at=datetime.now(timezone.utc) + timedelta(days=INVITATION_EXPIRY_DAYS),
             )
             db.add(invitation)
         await db.flush()
@@ -318,7 +318,7 @@ async def resend_invitation(
     if invitation.status != "pending":
         raise HTTPException(status_code=400, detail=f"Cannot resend a {invitation.status} invitation.")
 
-    invitation.expires_at = datetime.utcnow() + timedelta(days=INVITATION_EXPIRY_DAYS)
+    invitation.expires_at = datetime.now(timezone.utc) + timedelta(days=INVITATION_EXPIRY_DAYS)
     await db.flush()
 
     org = await _get_org_or_404(org_id, db)
