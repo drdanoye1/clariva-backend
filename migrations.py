@@ -156,6 +156,20 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     # rather than in a batch migration.
     ("foa_records", "ai_summary",              "TEXT",                             "TEXT"),
 
+    # --- foa_records (Funding Opportunity Intelligence, Phase 1 — Grant
+    # Finding Workspace Upgrade) --------------------------------------------
+    # Upgrades the paid "Generate AI Summary" service into a structured,
+    # 14-section pursuit-decision report. `intelligence_report` holds the
+    # full JSON; the four columns after it are cached headline
+    # classifications for fast card rendering. All nullable — existing
+    # records simply show no report until analyzed on demand, exactly like
+    # ai_summary's own backfill-on-demand precedent above.
+    ("foa_records", "intelligence_report",     "JSON",                             "JSON"),
+    ("foa_records", "eligibility_status",      "VARCHAR(30)",                      "VARCHAR(30)"),
+    ("foa_records", "complexity",              "VARCHAR(20)",                      "VARCHAR(20)"),
+    ("foa_records", "attractiveness",          "VARCHAR(20)",                      "VARCHAR(20)"),
+    ("foa_records", "attractiveness_reason",   "TEXT",                             "TEXT"),
+
     # --- organizations (Phase 6 — Integrations & Marketplace, PRD §20 white-label) --
     # All nullable/defaulted — an org with none of these set renders exactly
     # like today (Clariva-branded, no change in behavior).

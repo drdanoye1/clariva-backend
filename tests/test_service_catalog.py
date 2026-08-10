@@ -328,6 +328,27 @@ def _insert_foa(**overrides) -> str:
     return _run(_body())
 
 
+def _fake_report(brief: str) -> dict:
+    """Mirrors FOAParserEngine.analyze_opportunity()'s return shape (see
+    engines/foa_parser.py) — Funding Opportunity Intelligence, Phase 1."""
+    return {
+        "report": {
+            "executive_brief": brief,
+            "eligibility_assessment": {"status": "Eligible", "explanation": "Looks eligible.", "issues": []},
+            "complexity": {"level": "Moderate", "reason": "Standard requirements."},
+            "opportunity_attractiveness": {"level": "High", "reason": "Strong strategic fit."},
+            "disclaimer": "This report is AI-generated decision support...",
+            "human_in_the_loop_note": "A qualified person must review this report...",
+        },
+        "summary": brief,
+        "eligibility_status": "Eligible",
+        "eligibility_summary": "Looks eligible.",
+        "complexity": "Moderate",
+        "attractiveness": "High",
+        "attractiveness_reason": "Strong strategic fit.",
+    }
+
+
 def test_personal_foa_summarize_is_never_charged(client, registered_user, monkeypatch):
     import routers.foa as foa_router
 
@@ -336,14 +357,19 @@ def test_personal_foa_summarize_is_never_charged(client, registered_user, monkey
         ai_summary=None, org_id=None,
     )
 
-    async def fake_summarize(raw_text):
-        return {"summary": "A personal-use summary.", "eligibility_summary": None}
+    async def fake_analyze(raw_text):
+        return _fake_report("A personal-use brief.")
 
-    monkeypatch.setattr(foa_router.parser, "summarize", fake_summarize)
+    monkeypatch.setattr(foa_router.parser, "analyze_opportunity", fake_analyze)
 
     resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
     assert resp.status_code == 200, resp.text
-    assert resp.json()["ai_summary"] == "A personal-use summary."
+    body = resp.json()
+    assert body["ai_summary"] == "A personal-use brief."
+    assert body["intelligence_report"]["executive_brief"] == "A personal-use brief."
+    assert body["eligibility_status"] == "Eligible"
+    assert body["complexity"] == "Moderate"
+    assert body["attractiveness"] == "High"
     # No AIServiceTransaction should have been written for a personal record.
 
     async def _count_transactions():
@@ -366,14 +392,17 @@ def test_org_scoped_foa_summarize_consumes_complimentary_allowance(client, regis
         ai_summary=None, org_id=org_id,
     )
 
-    async def fake_summarize(raw_text):
-        return {"summary": "An org-scoped summary.", "eligibility_summary": None}
+    async def fake_analyze(raw_text):
+        return _fake_report("An org-scoped brief.")
 
-    monkeypatch.setattr(foa_router.parser, "summarize", fake_summarize)
+    monkeypatch.setattr(foa_router.parser, "analyze_opportunity", fake_analyze)
 
     resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
     assert resp.status_code == 200, resp.text
-    assert resp.json()["ai_summary"] == "An org-scoped summary."
+    body = resp.json()
+    assert body["ai_summary"] == "An org-scoped brief."
+    assert body["intelligence_report"]["disclaimer"]
+    assert body["intelligence_report"]["human_in_the_loop_note"]
 
     async def _get_transaction():
         from models.db_models import AIServiceTransaction
@@ -409,9 +438,9 @@ def test_org_scoped_foa_summarize_402s_when_no_allowance_and_no_balance(client, 
     )
 
     async def fail_if_called(raw_text):
-        raise AssertionError("summarize() should never run when the charge is rejected")
+        raise AssertionError("analyze_opportunity() should never run when the charge is rejected")
 
-    monkeypatch.setattr(foa_router.parser, "summarize", fail_if_called)
+    monkeypatch.setattr(foa_router.parser, "analyze_opportunity", fail_if_called)
 
     resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
     assert resp.status_code == 402

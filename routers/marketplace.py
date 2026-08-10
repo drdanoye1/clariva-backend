@@ -17,10 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models.db_models import User
-from models.schemas import MarketplaceListingCreate, MarketplaceListingOut, MarketplaceListingUpdate
+from models.schemas import (
+    MarketplaceListingCreate, MarketplaceListingOut, MarketplaceListingUpdate,
+    MarketplacePurchaseOut, MarketplacePurchaseRequest,
+)
 from routers.auth import get_current_user
-from routers.organizations import _assert_permission
+from routers.organizations import _assert_member, _assert_permission
 from engines.marketplace_engine import MarketplaceEngine
+from audit import log_action
 
 router = APIRouter()
 engine = MarketplaceEngine()
@@ -72,3 +76,41 @@ async def delete_listing(listing_id: str, db: AsyncSession = Depends(get_db), cu
     await engine.delete_listing(db, listing_id)
     await db.commit()
     return {"deleted": True}
+
+
+# ── Purchases (Phase 4 — Marketplace Monetization) ──────────────────────────
+# Buying a listing spends the buyer org's shared AI Services balance — same
+# monetary consequence as confirming a service-catalog quote in
+# routers/service_catalog.py, so it's gated by the identical
+# `purchase_ai_services` permission (owner + editor) rather than a new one.
+
+@router.get("/purchases", response_model=List[MarketplacePurchaseOut])
+async def list_purchases(
+    org_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Every listing this org already owns — any member may view this (same
+    visibility model as viewing entitlements/credit balance elsewhere),
+    even though only owner/editor can actually spend to buy one."""
+    await _assert_member(org_id, current_user.id, db)
+    return await engine.list_purchases_for_org(db, org_id)
+
+
+@router.post("/{listing_id}/purchase", response_model=MarketplacePurchaseOut)
+async def purchase_listing(
+    listing_id: str, payload: MarketplacePurchaseRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Charges payload.buyer_org_id's AI Services balance for a published
+    listing and records the purchase. The engine itself validates the
+    listing is published, priced, not the buyer's own, and not already
+    owned before ever touching the ledger."""
+    await _assert_permission(payload.buyer_org_id, current_user.id, "purchase_ai_services", db)
+    purchase = await engine.purchase_listing(db, listing_id, payload.buyer_org_id, current_user.id)
+    await db.commit()
+
+    await log_action(
+        db, actor_id=current_user.id, action="marketplace.listing_purchased",
+        org_id=payload.buyer_org_id, object_type="marketplace_purchase", object_id=purchase.id,
+        detail={"listing_id": listing_id, "price_cents_paid": purchase.price_cents_paid},
+    )
+    return purchase

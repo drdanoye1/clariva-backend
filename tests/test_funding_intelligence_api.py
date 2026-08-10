@@ -255,18 +255,40 @@ def test_list_foas_includes_ai_summary_and_eligibility_fields(client, registered
     assert row["has_parsed_template"] is True
 
 
+def _fake_intelligence_result(brief: str, eligibility_summary=None) -> dict:
+    """Mirrors FOAParserEngine.analyze_opportunity()'s return shape —
+    Funding Opportunity Intelligence, Phase 1 (see engines/foa_parser.py)."""
+    return {
+        "report": {
+            "executive_brief": brief,
+            "eligibility_assessment": {"status": "Eligible", "explanation": eligibility_summary, "issues": []},
+            "complexity": {"level": "Moderate", "reason": "Standard requirements."},
+            "opportunity_attractiveness": {"level": "Moderate", "reason": "Reasonable fit."},
+            "disclaimer": "This report is AI-generated decision support...",
+            "human_in_the_loop_note": "A qualified person must review this report...",
+        },
+        "summary": brief,
+        "eligibility_status": "Eligible",
+        "eligibility_summary": eligibility_summary,
+        "complexity": "Moderate",
+        "attractiveness": "Moderate",
+        "attractiveness_reason": "Reasonable fit.",
+    }
+
+
 def test_summarize_is_noop_when_already_summarized(client, registered_user, monkeypatch):
     import routers.foa as foa_router
 
     foa_id = _insert_foa_sync(
         uploaded_by=registered_user["user_id"], raw_text="Some solicitation text.",
         ai_summary="Already summarized.",
+        intelligence_report={"executive_brief": "Already summarized.", "disclaimer": "x", "human_in_the_loop_note": "y"},
     )
 
     async def fail_if_called(raw_text):
-        raise AssertionError("summarize() should not be called when ai_summary is already set")
+        raise AssertionError("analyze_opportunity() should not be called when intelligence_report is already set")
 
-    monkeypatch.setattr(foa_router.parser, "summarize", fail_if_called)
+    monkeypatch.setattr(foa_router.parser, "analyze_opportunity", fail_if_called)
 
     resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
     assert resp.status_code == 200, resp.text
@@ -281,17 +303,20 @@ def test_summarize_generates_from_existing_raw_text(client, registered_user, mon
         ai_summary=None, eligibility_summary=None,
     )
 
-    async def fake_summarize(raw_text):
+    async def fake_analyze(raw_text):
         assert raw_text == "Full solicitation text goes here."
-        return {"summary": "Funds AI research.", "eligibility_summary": "US small businesses."}
+        return _fake_intelligence_result("Funds AI research.", "US small businesses.")
 
-    monkeypatch.setattr(foa_router.parser, "summarize", fake_summarize)
+    monkeypatch.setattr(foa_router.parser, "analyze_opportunity", fake_analyze)
 
     resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["ai_summary"] == "Funds AI research."
     assert body["eligibility_summary"] == "US small businesses."
+    assert body["intelligence_report"]["executive_brief"] == "Funds AI research."
+    assert body["intelligence_report"]["disclaimer"]
+    assert body["intelligence_report"]["human_in_the_loop_note"]
 
 
 def test_summarize_falls_back_to_grants_gov_enrichment_when_no_raw_text(client, registered_user, monkeypatch):
@@ -320,8 +345,12 @@ def test_summarize_falls_back_to_grants_gov_enrichment_when_no_raw_text(client, 
             "summary": "Funds clean energy research.", "eligibility_summary": None,
         }
 
+    async def fake_analyze(raw_text):
+        return _fake_intelligence_result("Funds clean energy research.")
+
     monkeypatch.setattr(foa_router.funding, "fetch_grants_gov_detail", fake_fetch_detail)
     monkeypatch.setattr(foa_router.parser, "parse", fake_parse)
+    monkeypatch.setattr(foa_router.parser, "analyze_opportunity", fake_analyze)
 
     resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
     assert resp.status_code == 200, resp.text

@@ -1018,6 +1018,21 @@ class FOARecordOut(BaseModel):
     originating_proposal_id: Optional[str] = None
     originating_award_label: Optional[str] = None
     renewal_notes: Optional[str] = None
+    # Funding Opportunity Intelligence, Phase 1 (Grant Finding Workspace
+    # Upgrade) — the structured, 14-section pursuit-decision report that
+    # POST /foa/{foa_id}/summarize now produces (see
+    # engines/foa_parser.py::analyze_opportunity), plus cached headline
+    # classifications so opportunity cards can show an eligibility/
+    # complexity/attractiveness indicator without unpacking the full report.
+    # None until a record has been analyzed. Typed as a loose dict (not a
+    # nested Pydantic model) so the report's internal shape can evolve
+    # without another schema/migration round-trip — the frontend renders it
+    # defensively field-by-field.
+    intelligence_report: Optional[dict] = None
+    eligibility_status: Optional[str] = None
+    complexity: Optional[str] = None
+    attractiveness: Optional[str] = None
+    attractiveness_reason: Optional[str] = None
 
 class PipelineStageUpdateRequest(BaseModel):
     stage: str
@@ -1664,6 +1679,18 @@ class MarketplaceListingOut(BaseModel):
     created_by: str
     created_at: datetime
     updated_at: Optional[datetime] = None
+
+class MarketplacePurchaseRequest(BaseModel):
+    buyer_org_id: str
+
+class MarketplacePurchaseOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    listing_id: str
+    buyer_org_id: str
+    purchased_by: str
+    price_cents_paid: int
+    created_at: datetime
 
 
 # ── Phase 2 — On-Demand AI Services Marketplace & Org Funding Controls ──

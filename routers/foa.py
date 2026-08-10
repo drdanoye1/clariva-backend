@@ -82,6 +82,9 @@ async def _to_foa_out(record: FOARecord, db: AsyncSession) -> FOARecordOut:
         created_at=record.created_at, has_parsed_template=record.parsed_template is not None,
         originating_award_id=record.originating_award_id, originating_proposal_id=originating_proposal_id,
         originating_award_label=originating_award_label, renewal_notes=record.renewal_notes,
+        intelligence_report=record.intelligence_report, eligibility_status=record.eligibility_status,
+        complexity=record.complexity, attractiveness=record.attractiveness,
+        attractiveness_reason=record.attractiveness_reason,
     )
 
 
@@ -454,7 +457,10 @@ async def list_foas(
                FOARecord.ai_summary, FOARecord.eligibility_summary,
                FOARecord.parsed_template, FOARecord.estimated_award_floor,
                FOARecord.estimated_award_ceiling, FOARecord.source,
-               FOARecord.external_url, FOARecord.org_id)
+               FOARecord.external_url, FOARecord.org_id,
+               FOARecord.intelligence_report, FOARecord.eligibility_status,
+               FOARecord.complexity, FOARecord.attractiveness,
+               FOARecord.attractiveness_reason)
         .where(FOARecord.uploaded_by == current_user.id)
         .order_by(FOARecord.created_at.desc())
     )
@@ -479,6 +485,15 @@ async def list_foas(
             # record) or a priced service requiring a price confirmation
             # (org-shared record). See foa.tsx's FOACard.
             "org_id": r.org_id,
+            # Funding Opportunity Intelligence, Phase 1 — the structured
+            # report (once analyzed) plus cached indicators so the card can
+            # show eligibility/complexity/attractiveness without a second
+            # request. See engines/foa_parser.py::analyze_opportunity.
+            "intelligence_report": r.intelligence_report,
+            "eligibility_status": r.eligibility_status,
+            "complexity": r.complexity,
+            "attractiveness": r.attractiveness,
+            "attractiveness_reason": r.attractiveness_reason,
         }
         for r in rows
     ]
@@ -610,31 +625,35 @@ async def summarize_opportunity(
     foa_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
 ):
     """
-    On-demand backfill for `ai_summary`/`eligibility_summary` on FOAs that
-    predate those fields — Version 3.0 architecture upgrade, Phase 16
-    (cont'd). User feedback: the FOA Library only ever showed a title and
-    deadline, with no way to judge an opportunity before clicking "Use
-    this FOA." Rather than batch-reprocessing every existing record (an
-    upfront AI cost for opportunities nobody may ever open), this
-    generates the summary the first time a user expands that specific
-    card, using whichever source text is already available:
+    "Analyze Opportunity" — Funding Opportunity Intelligence, Phase 1 (Grant
+    Finding Workspace Upgrade). Endpoint path/name kept as `/summarize` for
+    backward compatibility with existing clients and the already-built
+    price-quote/confirm flow (foa.tsx, pipeline.tsx), but the underlying
+    service now produces a full structured pursuit-decision report instead
+    of a two-field summary — see engines/foa_parser.py::analyze_opportunity.
+    Superseded predecessor: Version 3.0 architecture upgrade, Phase 16
+    (cont'd), which only backfilled `ai_summary`/`eligibility_summary`.
 
-    1. If `ai_summary` is already set, this is a no-op (returns as-is) —
-       calling it repeatedly, e.g. from a UI that doesn't track "already
-       generated" state, never re-spends AI credits.
+    1. If `intelligence_report` is already set, this is a no-op (returns
+       as-is) — calling it repeatedly never re-spends AI credits. (Records
+       analyzed before this upgrade shipped only have the old
+       `ai_summary`/`eligibility_summary` fields and no
+       `intelligence_report` yet, so they'll be upgraded to the full report
+       the next time a user opens them — this is a one-time re-spend for
+       those specific opportunities, consistent with this codebase's
+       existing "backfill on next open" precedent rather than a batch
+       re-processing job.)
     2. If `raw_text` is present (every upload/parse-text/parse-url record
-       has this), run the cheap `FOAParserEngine.summarize()` prompt
-       against it — no need to redo the full section/weights extraction.
-    3. If there's no raw_text but this is a Grants.gov-synced record with
-       a link, fetch the synopsis and run it through the full parser
-       (mirrors `enrich`, which also usefully populates `parsed_template`
-       so "View Full Analysis" has requirements/evaluation criteria too).
-    4. Otherwise, there's nothing to summarize from — 400.
+       has this), run `FOAParserEngine.analyze_opportunity()` against it.
+    3. If there's no raw_text but this is a Grants.gov-synced record with a
+       link, fetch the synopsis, run it through the full parser (mirrors
+       `enrich`, populating `parsed_template` too), then analyze it.
+    4. Otherwise, there's nothing to analyze — 400.
     """
     record = await _get_foa_or_404(db, foa_id)
     await _assert_foa_access(record, current_user, db)
 
-    if record.ai_summary:
+    if record.intelligence_report:
         return await _to_foa_out(record, db)
 
     # Phase 2 — On-Demand AI Services Marketplace (Enterprise Pricing spec
@@ -643,7 +662,7 @@ async def summarize_opportunity(
     # existing metering already established (see credit_engine.py's design
     # notes: "a proposal generated with no org_id is not charged anything")
     # — so a personal, non-org-shared FOA record stays completely free to
-    # summarize, exactly as before this feature existed. For an org-shared
+    # analyze, exactly as before this feature existed. For an org-shared
     # record, this also requires purchase_ai_services (owner/editor),
     # stricter than the plain view/member access _assert_foa_access already
     # granted above, since this specific action spends the org's shared
@@ -659,11 +678,7 @@ async def summarize_opportunity(
             raise HTTPException(status_code=402, detail=str(exc))
 
     try:
-        if record.raw_text:
-            result = await parser.summarize(record.raw_text)
-            record.ai_summary = result.get("summary")
-            record.eligibility_summary = result.get("eligibility_summary") or record.eligibility_summary
-        elif record.source == "grants_gov" and record.external_url:
+        if not record.raw_text and record.source == "grants_gov" and record.external_url:
             opp_id = record.external_url.rstrip("/").split("/")[-1]
             detail = await funding.fetch_grants_gov_detail(opp_id)
             synopsis = detail.get("synopsis") or {}
@@ -679,12 +694,22 @@ async def summarize_opportunity(
             record.eligibility_summary = ", ".join(
                 a.get("description", "") for a in (synopsis.get("applicantTypes") or []) if a.get("description")
             ) or template.eligibility_summary or record.eligibility_summary
-            record.ai_summary = template.summary
-        else:
+
+        if not record.raw_text:
             raise HTTPException(
                 status_code=400,
-                detail="No content available to generate a summary for this opportunity.",
+                detail="No content available to analyze for this opportunity.",
             )
+
+        result = await parser.analyze_opportunity(record.raw_text)
+        record.intelligence_report = result["report"]
+        record.ai_summary = result.get("summary") or record.ai_summary
+        record.eligibility_summary = result.get("eligibility_summary") or record.eligibility_summary
+        record.eligibility_status = result.get("eligibility_status")
+        record.complexity = result.get("complexity")
+        record.attractiveness = result.get("attractiveness")
+        record.attractiveness_reason = result.get("attractiveness_reason")
+
         await db.flush()
         await db.refresh(record)
     except HTTPException:

@@ -110,6 +110,74 @@ FOA TEXT:
 {foa_text}
 """
 
+# Funding Opportunity Intelligence, Phase 1 ("Clariva Funding Opportunity
+# Intelligence Product Definition Specification — Grant Finding Workspace
+# Upgrade") — the paid AI service backing POST /foa/{foa_id}/summarize.
+# Replaces the two-field SUMMARIZE_ONLY_PROMPT above with a structured,
+# 14-section report that answers "is this worth pursuing, why, what would
+# it take to compete, and what should we do next" instead of a plain
+# paragraph. Every ranking/status/level below must be explainable in plain
+# language — never an unexplained numeric score or an unsupported
+# win-probability claim (e.g. never "83% chance of winning").
+INTELLIGENCE_REPORT_PROMPT = """You are a senior federal/private grants strategist producing a Funding Opportunity Intelligence Report for an organization deciding whether to pursue this opportunity. Every judgment you make must be explained in plain language grounded in the text below — never output an unexplained score, and never state or imply a win-probability percentage.
+
+Analyze the following funding opportunity text and return ONLY a JSON object with this exact structure:
+{{
+  "executive_brief": "<3-5 sentences: what this funds, who it's for, and the core ask — enough for a reader to decide whether to keep reading>",
+  "funding_information": {{
+    "award_floor": <number or null>,
+    "award_ceiling": <number or null>,
+    "total_program_funding": <number or null>,
+    "expected_number_of_awards": <integer or null>,
+    "period_of_performance": "<string, e.g. '24 months', or null>"
+  }},
+  "eligibility_assessment": {{
+    "status": "<Eligible|Conditional|Unlikely|Requires Verification>",
+    "explanation": "<plain-language explanation for the status above>",
+    "issues": ["<specific eligibility issue or open question, if any>"]
+  }},
+  "funding_priorities": ["<priority/topic area the funder cares about>"],
+  "requirements": ["<concrete requirement an applicant must satisfy>"],
+  "evaluation_criteria": [
+    {{"criterion": "<name>", "weight": "<e.g. '30%' or 'Not specified'>", "practical_implication": "<what this means for how the proposal should be written>"}}
+  ],
+  "required_documents": ["<document/attachment the application must include>"],
+  "cost_share": {{"required": <true|false|null>, "details": "<cost-share/match requirement, or 'None identified'>"}},
+  "deadline_analysis": "<how much lead time this gives and what that implies for readiness>",
+  "complexity": {{"level": "<Low|Moderate|High|Very High>", "reason": "<what drives this complexity rating>"}},
+  "key_risks": [
+    {{"risk": "<specific risk to pursuing or winning this>", "severity": "<Low|Medium|High>"}}
+  ],
+  "opportunity_attractiveness": {{"level": "<High|Moderate|Low>", "reason": "<plain-language justification, never a numeric score>"}},
+  "go_no_go_considerations": ["<factor the organization should weigh — NOT a recommendation to bid or not bid>"],
+  "recommended_next_actions": ["<concrete next step, e.g. 'Confirm cost-share capacity with finance' or 'Assign a technical lead to review Section 3'>"]
+}}
+
+If the text doesn't state a field, use null (for numbers) or a brief honest statement like "Not specified in the available text" (for strings) rather than inventing information.
+
+FOA TEXT:
+{foa_text}
+"""
+
+# Fixed, non-AI-generated text appended to every report — not something the
+# model is trusted to phrase consistently or to remember to include. Per
+# explicit product requirement: "Each report must include disclaimer and
+# must always include human in the loop."
+INTELLIGENCE_REPORT_DISCLAIMER = (
+    "This report is AI-generated decision support based on the text of this "
+    "opportunity as parsed by Clariva. It is not legal, financial, or "
+    "compliance advice, and it may contain errors or omissions. Always "
+    "verify eligibility, deadlines, funding amounts, and requirements "
+    "against the official solicitation and funder guidance before acting."
+)
+HUMAN_IN_THE_LOOP_NOTE = (
+    "A qualified person at your organization must review this report and "
+    "make the final pursue/no-pursue decision. Clariva does not submit "
+    "applications, commit your organization, or make Go/No-Go decisions on "
+    "its own — every recommendation here is an input to your team's "
+    "judgment, not a substitute for it."
+)
+
 
 class FOAParserEngine:
     """
@@ -271,6 +339,88 @@ class FOAParserEngine:
             "summary": parsed.get("summary") or None,
             "eligibility_summary": parsed.get("eligibility_summary") or None,
         }
+
+    async def analyze_opportunity(self, raw_text: str) -> Dict[str, Any]:
+        """
+        Funding Opportunity Intelligence, Phase 1 — the paid "Analyze
+        Opportunity" service. Upgrades from the two-field summarize() above
+        into a structured, 14-section pursuit-decision report (see
+        INTELLIGENCE_REPORT_PROMPT) so the output answers "is this worth
+        pursuing, why, what would it take to compete, and what should we do
+        next" instead of a plain paragraph.
+
+        Returns a dict with:
+          - "report": the full structured report (dict), always containing
+            a "disclaimer" and "human_in_the_loop_note" field — these two
+            are fixed, non-AI-generated strings appended here rather than
+            trusted to the model, per explicit product requirement.
+          - "summary": a short plain-language string derived from
+            executive_brief, so callers can keep populating the existing
+            `ai_summary` column for list-view backward compatibility.
+          - "eligibility_status", "eligibility_summary", "complexity",
+            "attractiveness", "attractiveness_reason": cached scalar
+            classifications for fast card rendering (FOARecord's
+            corresponding columns).
+        """
+        truncated = raw_text[:12000]
+        response = await self.client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert federal grant strategist. Always return "
+                        "valid JSON only. Never state or imply a numeric win "
+                        "probability."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": INTELLIGENCE_REPORT_PROMPT.format(foa_text=truncated),
+                },
+            ],
+            temperature=0.1,
+        )
+        raw_json = response.choices[0].message.content or ""
+        parsed = self._parse_json(raw_json)
+        report = self._normalize_intelligence_report(parsed)
+
+        eligibility = report.get("eligibility_assessment") or {}
+        complexity = report.get("complexity") or {}
+        attractiveness = report.get("opportunity_attractiveness") or {}
+
+        return {
+            "report": report,
+            "summary": report.get("executive_brief"),
+            "eligibility_status": eligibility.get("status"),
+            "eligibility_summary": eligibility.get("explanation"),
+            "complexity": complexity.get("level"),
+            "attractiveness": attractiveness.get("level"),
+            "attractiveness_reason": attractiveness.get("reason"),
+        }
+
+    def _normalize_intelligence_report(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill in safe defaults for any field the model omitted, and
+        always attach the fixed disclaimer/human-in-the-loop text."""
+        data.setdefault("executive_brief", None)
+        data.setdefault("funding_information", {})
+        data.setdefault("eligibility_assessment", {"status": "Requires Verification", "explanation": None, "issues": []})
+        data.setdefault("funding_priorities", [])
+        data.setdefault("requirements", [])
+        data.setdefault("evaluation_criteria", [])
+        data.setdefault("required_documents", [])
+        data.setdefault("cost_share", {"required": None, "details": None})
+        data.setdefault("deadline_analysis", None)
+        data.setdefault("complexity", {"level": "Moderate", "reason": None})
+        data.setdefault("key_risks", [])
+        data.setdefault("opportunity_attractiveness", {"level": "Moderate", "reason": None})
+        data.setdefault("go_no_go_considerations", [])
+        data.setdefault("recommended_next_actions", [])
+        # Always present, always this exact text — see module-level
+        # INTELLIGENCE_REPORT_DISCLAIMER / HUMAN_IN_THE_LOOP_NOTE docstrings.
+        data["disclaimer"] = INTELLIGENCE_REPORT_DISCLAIMER
+        data["human_in_the_loop_note"] = HUMAN_IN_THE_LOOP_NOTE
+        return data
 
     def _normalize(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Ensure required fields exist with defaults."""

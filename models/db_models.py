@@ -9,7 +9,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean, Column, DateTime, Float, ForeignKey,
-    Integer, String, Text, JSON
+    Integer, String, Text, JSON, UniqueConstraint
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 from sqlalchemy.sql import func
@@ -201,6 +201,34 @@ class FOARecord(Base):
     # above) rather than requiring a caller to unpack `parsed_template` just
     # to render the FOA Library list, which stays a lightweight query.
     ai_summary               = Column(Text, nullable=True)
+
+    # --- Funding Opportunity Intelligence, Phase 1 (Grant Finding Workspace
+    # Upgrade — "Clariva Funding Opportunity Intelligence Product Definition
+    # Specification") -------------------------------------------------------
+    # The paid AI service upgrades from a plain-language summary into a
+    # structured, 14-section pursuit-decision report (executive brief,
+    # funding info, eligibility assessment, priorities, requirements,
+    # evaluation criteria, required documents, cost share, deadline
+    # analysis, complexity, key risks, attractiveness, go/no-go
+    # considerations, recommended next actions) plus a disclaimer and
+    # human-in-the-loop note on every report — see
+    # engines/foa_parser.py::analyze_opportunity(). Stored as one JSON blob
+    # so the shape can evolve without another migration; `ai_summary` and
+    # `eligibility_summary` above are left untouched and still populated
+    # from the same report for backward compatibility with the FOA Library
+    # list view and any code that only needs the short-form read.
+    intelligence_report      = Column(JSON, nullable=True)
+    # Cached, queryable copies of the report's headline classifications, so
+    # opportunity cards (FOA Library, Funding Pipeline board) can render an
+    # eligibility/complexity/attractiveness indicator without unpacking the
+    # full intelligence_report JSON for every row in a list.
+    # Eligible | Conditional | Unlikely | Requires Verification
+    eligibility_status       = Column(String(30), nullable=True)
+    # Low | Moderate | High | Very High
+    complexity               = Column(String(20), nullable=True)
+    # High | Moderate | Low
+    attractiveness           = Column(String(20), nullable=True)
+    attractiveness_reason    = Column(Text, nullable=True)
 
     proposals = relationship("Proposal", back_populates="foa")
 
@@ -1576,3 +1604,45 @@ class AIServiceTransaction(Base):
     # Free-form context, e.g. {"proposal_id": "...", "complexity": "standard"}
     reference      = Column(JSON, default=dict, nullable=True)
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class MarketplacePurchase(Base):
+    """
+    Phase 4 (Marketplace Monetization) — records a buyer org's one-time
+    purchase of a published MarketplaceListing (PRD §20), paid from the
+    buyer's shared AI Services balance (the same AICreditLedger Engine 21
+    debits from for on-demand AI services — one dollar-denominated
+    balance, one purchasing mechanism, per the pricing spec's "$1 balance
+    = $1 purchasing power" principle). See engines/marketplace_engine.py's
+    purchase_listing() for the debit + validation logic.
+
+    Revenue model (v1, explicit product decision): the platform collects
+    the payment; no credit is issued to the vendor org. A real
+    revenue-share/vendor-payout ledger is deliberately out of scope until
+    there are actual third-party vendors to pay out — see ARCHITECTURE.md.
+
+    A purchase is a permanent entitlement, one per (listing, buyer org) —
+    enforced by the unique constraint below, not just in application code,
+    so a double-click or retry can never double-charge.
+
+    Important scoping note: MarketplaceListing itself has no attached
+    deliverable content yet (no file, no connector config, no capability
+    flag — see that model's docstring). So today, owning a
+    MarketplacePurchase means "this org paid for this listing and it's
+    marked Purchased in the UI" — it does not yet unlock a downloadable
+    file, activate a connector, or enable an AI capability. What a
+    purchase actually delivers, per listing_type, is separate future work.
+    """
+    __tablename__ = "marketplace_purchases"
+    __table_args__ = (
+        UniqueConstraint("listing_id", "buyer_org_id", name="uq_marketplace_purchase_listing_buyer"),
+    )
+
+    id               = Column(String(36), primary_key=True, default=new_uuid)
+    listing_id       = Column(String(36), ForeignKey("marketplace_listings.id"), nullable=False, index=True)
+    buyer_org_id     = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    purchased_by     = Column(String(36), ForeignKey("users.id"), nullable=False)
+    # Snapshot of MarketplaceListing.price_cents at purchase time — the
+    # listing's price may change later; this is what was actually charged.
+    price_cents_paid = Column(Integer, nullable=False)
+    created_at       = Column(DateTime(timezone=True), server_default=func.now())
