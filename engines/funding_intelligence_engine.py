@@ -30,6 +30,7 @@ archive-expired action.
 """
 from __future__ import annotations
 
+import html as html_lib
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -59,6 +60,22 @@ def _parse_mmddyyyy(value: Optional[str]) -> Optional[datetime]:
         return datetime.strptime(value, "%m/%d/%Y")
     except ValueError:
         return None
+
+
+def _decode_title(value: Optional[str]) -> Optional[str]:
+    """Both Grants.gov's search2 API and SAM.gov's opportunities API return
+    titles with literal HTML entities (e.g. "NIEHS Worker Training
+    Program&rsquo;s SBIR..." instead of an apostrophe, "...Initiative
+    &ndash; Abu Dhabi" instead of an en dash) rather than plain text.
+    React/JSX renders a string's actual characters, not markup, so an
+    un-decoded title shows the literal "&rsquo;" on screen — this is the
+    one place every synced title passes through on its way into
+    program_title, so decoding here fixes it everywhere the title is later
+    displayed (pipeline cards, FOA library, the Organizational Learning
+    timeline, exports, etc.) without patching each render site."""
+    if not value:
+        return value
+    return html_lib.unescape(value)
 
 
 class FundingIntelligenceEngine:
@@ -104,7 +121,15 @@ class FundingIntelligenceEngine:
         opp_id = hit.get("id")
         return {
             "external_id": hit.get("number") or str(opp_id) if opp_id else None,
-            "program_title": hit.get("title") or "Untitled Opportunity",
+            # Grants.gov's search2 API returns titles HTML-entity-encoded
+            # (e.g. "&rsquo;", "&ndash;") — decode once here, at the one
+            # place every synced title passes through, rather than in every
+            # place a title later gets rendered. Since _upsert_hits below
+            # re-applies this mapper and overwrites program_title whenever
+            # the mapped value differs from what's stored, the next Sync
+            # Now click also self-heals any titles that were already synced
+            # with raw entities before this fix, with no backfill needed.
+            "program_title": _decode_title(hit.get("title")) or "Untitled Opportunity",
             "agency": (hit.get("agencyCode") or "OTHER")[:20],
             "solicitation_number": hit.get("number"),
             "deadline": _parse_mmddyyyy(hit.get("closeDate")),
@@ -139,7 +164,9 @@ class FundingIntelligenceEngine:
     def _map_sam_gov_hit(self, hit: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "external_id": hit.get("noticeId") or hit.get("solicitationNumber"),
-            "program_title": hit.get("title") or "Untitled Opportunity",
+            # Same HTML-entity-encoded-title issue as Grants.gov — see
+            # _map_grants_gov_hit's comment above.
+            "program_title": _decode_title(hit.get("title")) or "Untitled Opportunity",
             "agency": (hit.get("fullParentPathName") or "OTHER").split(".")[0][:20],
             "solicitation_number": hit.get("solicitationNumber"),
             "deadline": _parse_sam_date(hit.get("responseDeadLine")),
