@@ -374,6 +374,27 @@ class Proposal(Base):
     project_knowledge = relationship("ProjectKnowledge", back_populates="proposal", uselist=False, cascade="all, delete-orphan")
 
 
+class ProposalStatusEvent(Base):
+    """
+    One row per Proposal.status transition — mirrors PipelineStageEvent
+    (Phase 4, above) exactly, for exactly the same reason: `status` alone
+    only records the current value, so "proposals started, abandoned and
+    submitted" (Version 3.0 upgrade, Phase 3.1 — Organizational Learning,
+    docs/Clariva Funding Opportunity Intelligence product definition
+    upgrade for monetization_1.docx §4.1) had no queryable history before
+    this. Written by routers/proposals.py::update_proposal whenever the
+    incoming body actually changes `status`.
+    """
+    __tablename__ = "proposal_status_events"
+
+    id           = Column(String(36), primary_key=True, default=new_uuid)
+    proposal_id  = Column(String(36), ForeignKey("proposals.id"), nullable=False, index=True)
+    from_status  = Column(String(30), nullable=True)   # null for the initial "draft" event, if ever logged
+    to_status    = Column(String(30), nullable=False)
+    changed_by   = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class ProposalSection(Base):
     __tablename__ = "proposal_sections"
 

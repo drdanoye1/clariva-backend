@@ -20,7 +20,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -30,6 +30,37 @@ from routers.organizations import _assert_member, _assert_permission
 from engines.company_profile import get_org_context
 
 router = APIRouter()
+
+# Mirrors the String(n) column caps in models.db_models.OrgContextDB.
+# Saving used to hit these limits silently — SQLAlchemy/asyncpg would raise
+# a raw DataError, which (with no exception handler in main.py) surfaced to
+# the frontend as a bare, non-JSON 500 that just read "Save failed." with
+# no indication of which field or why. Checking here up front turns that
+# into a specific, actionable 422 instead.
+_MAX_LENGTHS = {
+    "organization_name": 255, "industry": 255,
+    "uei_number": 20, "cage_code": 10,
+    "ein_tax_id": 15, "duns_number": 13,
+    "firm_street": 255, "firm_apt_suite": 100, "firm_city": 100,
+    "firm_state": 50, "firm_zip": 12, "firm_phone": 30,
+    "pi_orcid": 25, "pi_degree": 100, "pi_phone": 30,
+    "bo_title": 150, "bo_phone": 30,
+    "acn_title": 150, "acn_phone": 30,
+    "entity_type": 30,
+}
+
+
+def _check_lengths(body: Dict[str, Any]) -> None:
+    violations = [
+        f"{field} (max {limit} characters, got {len(body[field])})"
+        for field, limit in _MAX_LENGTHS.items()
+        if isinstance(body.get(field), str) and len(body[field]) > limit
+    ]
+    if violations:
+        raise HTTPException(
+            status_code=422,
+            detail="These fields are too long to save: " + "; ".join(violations) + ". Please shorten them and try again.",
+        )
 
 
 def _ctx_to_dict(ctx: OrgContextDB) -> Dict[str, Any]:
@@ -144,6 +175,8 @@ async def save_profile(
     """
     if org_id:
         await _assert_permission(org_id, current_user.id, "manage_company_profile", db)
+
+    _check_lengths(body)
 
     ctx = await get_org_context(db, user_id=current_user.id, org_id=org_id)
     if not ctx:

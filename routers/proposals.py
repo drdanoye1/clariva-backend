@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from database import get_db
-from models.db_models import Proposal, ProposalSection, FOARecord, OrgContextDB, User
+from models.db_models import Proposal, ProposalSection, ProposalStatusEvent, FOARecord, OrgContextDB, User, new_uuid
 from engines.company_profile import get_org_context
 from models.schemas import ProposalCreate, ProposalOut, SectionContent, SectionGenerateRequest
 from engines.grant_templates import get_sections as get_grant_sections, list_grant_types
@@ -447,6 +447,19 @@ async def update_proposal(
         VALID = {"draft", "in_review", "optimizing", "ready", "submitted", "approved"}
         if body.status not in VALID:
             raise HTTPException(status_code=400, detail=f"Invalid status: {body.status}")
+        # Version 3.0 upgrade, Phase 3.1 (Organizational Learning) — record
+        # every status change as a discrete, timestamped event, mirroring
+        # PipelineStageEvent's rationale exactly: `status` alone only ever
+        # shows the current value, which made "proposals started, abandoned
+        # and submitted" impossible to reconstruct historically. Only log a
+        # genuine transition (skip a no-op PATCH that resends the same
+        # status), same guard PipelineStageEvent's writer uses.
+        if body.status != proposal.status:
+            db.add(ProposalStatusEvent(
+                id=new_uuid(), proposal_id=proposal.id,
+                from_status=proposal.status, to_status=body.status,
+                changed_by=current_user.id,
+            ))
         proposal.status = body.status
     # Taxonomy overrides — allow fixing existing proposals without deletion
     if body.grant_type is not None:

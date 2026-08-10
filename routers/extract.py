@@ -99,6 +99,44 @@ Schema:
 extraction_notes should describe what you found and any important caveats.
 Return ONLY the JSON object — no markdown fences, no explanation outside the JSON."""
 
+# Optional hints the user can supply (via the document-type tiles in the
+# Import from Document UI) telling the model what kind of document this is,
+# so it can weight its attention toward the fields that document type
+# actually tends to contain instead of scanning everything with equal
+# priority. Purely a prompt nudge — the schema/output shape never changes,
+# so the frontend preview rendering doesn't need to know about this at all.
+DOC_TYPE_HINTS: dict[str, str] = {
+    "capability_statement": (
+        "The user has indicated this is a Capability Statement. These documents "
+        "typically describe the organization itself — prioritize organization_name, "
+        "industry, core_technologies, company_capabilities, uei_number, cage_code, "
+        "and past_performance."
+    ),
+    "cv_biosketch": (
+        "The user has indicated this is a CV / Biosketch for a Principal Investigator. "
+        "Prioritize pi_name, pi_degree, pi_affiliation, pi_orcid, pi_publications, and "
+        "pi_credentials — pull degrees, publication counts, and prior grant/award history "
+        "into pi_credentials or past_performance as appropriate."
+    ),
+    "team_roster": (
+        "The user has indicated this is a Team Roster / Org Chart. Prioritize populating "
+        "the team_members array as completely as possible — name, title, role, "
+        "credentials, effort_pct, years_exp, and orcid for every person listed."
+    ),
+    "facilities_description": (
+        "The user has indicated this is a Facilities Description. Prioritize populating "
+        "the facilities array as completely as possible — name, type, description, "
+        "certifications, sq_footage, and location for every facility listed."
+    ),
+}
+
+
+def _doc_type_hint(doc_type: Optional[str]) -> str:
+    if not doc_type:
+        return ""
+    hint = DOC_TYPE_HINTS.get(doc_type)
+    return f"\n\n{hint}" if hint else ""
+
 
 def _extract_text_from_pdf(content: bytes) -> str:
     """Extract text from PDF using pdfplumber (better layout) with pypdf fallback."""
@@ -177,17 +215,18 @@ def _ai_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail="An unexpected error occurred. Please try again or contact support.")
 
 
-async def _call_gpt_text(text: str, source_hint: str) -> dict:
+async def _call_gpt_text(text: str, source_hint: str, doc_type: Optional[str] = None) -> dict:
     """Send extracted text to GPT-4o for structured extraction."""
     client = _get_client()
     # Truncate to ~15k chars to stay within token limits
     text_truncated = text[:15000] + ("...[truncated]" if len(text) > 15000 else "")
+    system_prompt = EXTRACTION_SYSTEM + _doc_type_hint(doc_type)
 
     try:
         response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": EXTRACTION_SYSTEM},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Source: {source_hint}\n\n---\n\n{text_truncated}"},
             ],
             temperature=0.1,
@@ -205,17 +244,18 @@ async def _call_gpt_text(text: str, source_hint: str) -> dict:
         raise HTTPException(status_code=500, detail="The AI returned an unexpected response. Please try again.")
 
 
-async def _call_gpt_vision(image_bytes: bytes, content_type: str, source_hint: str) -> dict:
+async def _call_gpt_vision(image_bytes: bytes, content_type: str, source_hint: str, doc_type: Optional[str] = None) -> dict:
     """Send image to GPT-4o vision for structured extraction."""
     client = _get_client()
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     mime = content_type if content_type.startswith("image/") else "image/jpeg"
+    system_prompt = EXTRACTION_SYSTEM + _doc_type_hint(doc_type)
 
     try:
         response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": EXTRACTION_SYSTEM},
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": [
@@ -242,6 +282,7 @@ async def _call_gpt_vision(image_bytes: bytes, content_type: str, source_hint: s
 async def extract_profile(
     file: Optional[UploadFile] = File(None),
     pasted_text: Optional[str] = Form(None),
+    doc_type: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -249,6 +290,11 @@ async def extract_profile(
     Extract profile fields from a document or pasted text.
     Accepts: PDF, DOCX, DOC, PNG, JPG, GIF, WEBP, or plain text.
     Returns structured profile JSON for preview before saving.
+
+    doc_type is an optional hint from the Import from Document UI's tiles
+    (capability_statement / cv_biosketch / team_roster / facilities_description)
+    — unrecognized or missing values are silently ignored, so this never
+    blocks extraction if the frontend sends something unexpected.
     """
     if not file and not pasted_text:
         raise HTTPException(status_code=400, detail="Provide either a file or pasted text.")
@@ -260,34 +306,34 @@ async def extract_profile(
         fname_lower = filename.lower()
 
         if _is_image(content_type, filename):
-            extracted = await _call_gpt_vision(content, content_type, filename)
+            extracted = await _call_gpt_vision(content, content_type, filename, doc_type)
 
         elif fname_lower.endswith(".pdf") or content_type == "application/pdf":
             text = _extract_text_from_pdf(content)
             if not text.strip():
                 raise HTTPException(status_code=422, detail="PDF appears to be scanned/image-only. Try uploading as image instead.")
-            extracted = await _call_gpt_text(text, filename)
+            extracted = await _call_gpt_text(text, filename, doc_type)
 
         elif fname_lower.endswith((".docx", ".doc")) or "word" in content_type:
             text = _extract_text_from_docx(content)
-            extracted = await _call_gpt_text(text, filename)
+            extracted = await _call_gpt_text(text, filename, doc_type)
 
         elif fname_lower.endswith(".txt") or content_type.startswith("text/"):
             text = content.decode("utf-8", errors="replace")
-            extracted = await _call_gpt_text(text, filename)
+            extracted = await _call_gpt_text(text, filename, doc_type)
 
         else:
             # Try as text, fall back gracefully
             try:
                 text = content.decode("utf-8", errors="replace")
-                extracted = await _call_gpt_text(text, filename)
+                extracted = await _call_gpt_text(text, filename, doc_type)
             except Exception:
                 raise HTTPException(
                     status_code=415,
                     detail=f"Unsupported file type: {content_type or fname_lower}. Use PDF, DOCX, image, or TXT."
                 )
     else:
-        extracted = await _call_gpt_text(pasted_text, "pasted text")
+        extracted = await _call_gpt_text(pasted_text, "pasted text", doc_type)
 
     # Clean up: remove null values but keep empty arrays
     cleaned = {k: v for k, v in extracted.items() if v is not None or isinstance(v, list)}

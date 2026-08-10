@@ -16,14 +16,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models.db_models import User
 from models.schemas import (
-    PipelineReportOut, SyncResultOut, WatchlistCreate, WatchlistOut, WatchlistUpdate,
+    HistoricalPerformanceOut, LearningTimelineEventOut, PipelineReportOut,
+    SyncResultOut, WatchlistCreate, WatchlistOut, WatchlistUpdate,
 )
 from routers.auth import get_current_user
 from routers.organizations import _assert_member, _assert_permission
 from engines.funding_intelligence_engine import FundingIntelligenceEngine
+from engines.organizational_learning_engine import OrganizationalLearningEngine
+from engines.historical_performance_engine import HistoricalFundingPerformanceEngine
 
 router = APIRouter()
 engine = FundingIntelligenceEngine()
+learning_engine = OrganizationalLearningEngine()
+performance_engine = HistoricalFundingPerformanceEngine()
 
 
 # ── Sync (manual trigger — no background scheduler in this environment) ────
@@ -145,3 +150,41 @@ async def get_pipeline_report(
         db, org_id=org_id, uploaded_by=None if org_id else current_user.id, keyword=keyword,
     )
     return PipelineReportOut(**report)
+
+
+# ── Organizational Learning & Historical Performance (Version 3.0 upgrade, ──
+# Phase 3.1) — same "Personal / one Organization" single-scope selector as
+# every other endpoint in this router.
+
+@router.get("/learning-timeline", response_model=List[LearningTimelineEventOut])
+async def get_learning_timeline(
+    org_id: Optional[str] = None, limit: int = 100,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """A chronological feed of what this pipeline has actually done —
+    opportunities discovered, stage/Bid-No-Go transitions, proposal status
+    changes, funded/not-funded outcomes, and award creation/closeout —
+    assembled from tables that already exist for their own reasons (see
+    engines/organizational_learning_engine.py's module docstring)."""
+    if org_id:
+        await _assert_member(org_id, current_user.id, db)
+    events = await learning_engine.get_timeline(
+        db, org_id=org_id, uploaded_by=None if org_id else current_user.id, limit=limit,
+    )
+    return [LearningTimelineEventOut(**e) for e in events]
+
+
+@router.get("/historical-performance", response_model=HistoricalPerformanceOut)
+async def get_historical_performance(
+    org_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Descriptive win-rate/cycle-time/dollar-value analytics, broken down
+    by agency, program type, and funding range — purely historical, never
+    an estimated probability of winning a specific future opportunity."""
+    if org_id:
+        await _assert_member(org_id, current_user.id, db)
+    performance = await performance_engine.get_performance(
+        db, org_id=org_id, uploaded_by=None if org_id else current_user.id,
+    )
+    return HistoricalPerformanceOut(**performance)

@@ -1112,6 +1112,38 @@ class PipelineReportOut(BaseModel):
     pipeline_value: float = 0.0                # sum of estimated_award_ceiling across non-terminal stages
 
 
+# ── Organizational Learning & Historical Performance (Version 3.0 upgrade, ──
+# Phase 3.1 — docs/Clariva Funding Opportunity Intelligence product
+# definition upgrade for monetization_1.docx §4.1-4.2) ──────────────────────
+
+class LearningTimelineEventOut(BaseModel):
+    event_type: str            # opportunity_discovered | stage_change | proposal_status_change | outcome_recorded | award_created | award_closed
+    occurred_at: datetime
+    title: str
+    description: Optional[str] = None
+    foa_id: Optional[str] = None
+    proposal_id: Optional[str] = None
+    award_id: Optional[str] = None
+
+class PerformanceBreakdownOut(BaseModel):
+    label: str
+    total: int
+    awarded: int
+    lost: int
+    win_rate: Optional[float] = None
+
+class HistoricalPerformanceOut(BaseModel):
+    total_opportunities: int
+    by_stage: Dict[str, int]
+    win_rate: Optional[float] = None
+    avg_cycle_time_days: Optional[float] = None
+    pipeline_value: float = 0.0
+    total_awarded_funding: float = 0.0         # sum of actual Award.total_award_value, not the FOA's estimated ceiling
+    by_agency: List[PerformanceBreakdownOut] = []
+    by_program_type: List[PerformanceBreakdownOut] = []
+    by_funding_range: List[PerformanceBreakdownOut] = []
+
+
 # ── Award & Project Management (PRD §16-17, Phase 5) ─────────────────────────
 # An Award is 1:1 with a Proposal, created explicitly (never automatically)
 # once a pipeline opportunity reaches the "awarded" stage. Everything below
