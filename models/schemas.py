@@ -1173,6 +1173,46 @@ class PortfolioRecommendationOut(BaseModel):
     disclaimer: str
 
 
+# ── Bulk Opportunity Intelligence (Phase 3 §4.5) ──────────────────────────────
+# Two-step "cheap ranking, then paid deep analysis only on what you pick"
+# flow — see engines/fit_score_engine.py::score_opportunity (free) and
+# routers/foa.py::_analyze_single_opportunity (paid, per-item) for the
+# reused engines this wraps. Team/Organization/Enterprise plan tiers only.
+
+class BulkRankRequest(BaseModel):
+    foa_ids: List[str]
+    org_id: Optional[str] = None
+
+class BulkRankResultOut(BaseModel):
+    foa_id: str
+    program_title: str
+    agency: str
+    pipeline_stage: str
+    fit_score: Optional[int] = None
+    fit_bucket: Optional[str] = None
+    fit_recommendation: Optional[str] = None
+
+class BulkRankResponseOut(BaseModel):
+    results: List[BulkRankResultOut] = []
+    disclaimer: str
+
+class BulkAnalyzeRequest(BaseModel):
+    foa_ids: List[str]
+    org_id: Optional[str] = None
+
+class BulkAnalyzeResultOut(BaseModel):
+    foa_id: str
+    program_title: str
+    success: bool
+    already_analyzed: bool = False
+    error: Optional[str] = None
+
+class BulkAnalyzeResponseOut(BaseModel):
+    results: List[BulkAnalyzeResultOut] = []
+    analyzed_count: int
+    failed_count: int
+
+
 # ── Award & Project Management (PRD §16-17, Phase 5) ─────────────────────────
 # An Award is 1:1 with a Proposal, created explicitly (never automatically)
 # once a pipeline opportunity reaches the "awarded" stage. Everything below

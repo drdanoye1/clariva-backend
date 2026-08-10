@@ -29,8 +29,9 @@ from sqlalchemy import select
 from database import get_db
 from models.db_models import Award, FOARecord, Proposal, User
 from models.schemas import (
-    BidNoGoRequest, FOARecordOut, FOATemplate, FOAUploadResponse,
-    PipelineStageEventOut, PipelineStageUpdateRequest,
+    BidNoGoRequest, BulkAnalyzeRequest, BulkAnalyzeResponseOut, BulkAnalyzeResultOut,
+    BulkRankRequest, BulkRankResponseOut, BulkRankResultOut, FOARecordOut, FOATemplate,
+    FOAUploadResponse, PipelineStageEventOut, PipelineStageUpdateRequest,
 )
 from routers.auth import get_current_user
 from routers.organizations import _assert_member, _assert_permission
@@ -679,12 +680,33 @@ async def summarize_opportunity(
        link, fetch the synopsis, run it through the full parser (mirrors
        `enrich`, populating `parsed_template` too), then analyze it.
     4. Otherwise, there's nothing to analyze — 400.
+
+    The actual work is in `_analyze_single_opportunity()` below — Phase 3
+    §4.5 (Bulk Opportunity Intelligence) reuses that exact helper in a loop
+    for the bulk-analyze endpoint, so single-record and bulk analysis can
+    never silently diverge in behavior.
     """
     record = await _get_foa_or_404(db, foa_id)
     await _assert_foa_access(record, current_user, db)
+    await _analyze_single_opportunity(db, record, current_user)
+    return await _to_foa_out(record, db)
 
+
+async def _analyze_single_opportunity(db: AsyncSession, record: FOARecord, current_user: User) -> None:
+    """
+    Core "Analyze Opportunity" logic, extracted verbatim from
+    `summarize_opportunity` above (Phase 3 §4.5 — Bulk Opportunity
+    Intelligence) so the single-record endpoint and the new bulk-analyze
+    endpoint run the identical charge/parse/write sequence rather than two
+    copies that can drift. Mutates `record` in place and raises
+    HTTPException on any failure (idempotent no-op, 402 insufficient
+    credits, 400 no content, or a cleaned parse error) — the single
+    endpoint lets that propagate directly; the bulk endpoint catches it
+    per-item so one failed opportunity doesn't abort the whole batch.
+    Caller is responsible for `_assert_foa_access` beforehand.
+    """
     if record.intelligence_report:
-        return await _to_foa_out(record, db)
+        return  # idempotent no-op — never re-spend
 
     # Phase 2 — On-Demand AI Services Marketplace (Enterprise Pricing spec
     # §9.2): Grant Opportunity Analysis is a centrally-priced service.
@@ -695,14 +717,14 @@ async def summarize_opportunity(
     # analyze, exactly as before this feature existed. For an org-shared
     # record, this also requires purchase_ai_services (owner/editor),
     # stricter than the plain view/member access _assert_foa_access already
-    # granted above, since this specific action spends the org's shared
-    # complimentary allowance or paid AI Services balance.
+    # granted by the caller, since this specific action spends the org's
+    # shared complimentary allowance or paid AI Services balance.
     if record.org_id:
         await _assert_permission(record.org_id, current_user.id, "purchase_ai_services", db)
         try:
             await catalog_engine.consume(
                 db, record.org_id, current_user.id, "grant_opportunity_analysis",
-                reference={"foa_id": foa_id},
+                reference={"foa_id": record.id},
             )
         except InsufficientCreditsError as exc:
             raise HTTPException(status_code=402, detail=str(exc))
@@ -747,4 +769,146 @@ async def summarize_opportunity(
     except Exception as exc:
         raise _clean_parse_error(exc)
 
-    return await _to_foa_out(record, db)
+
+# ── Bulk Opportunity Intelligence (Phase 3 §4.5) ──────────────────────────────
+# "Allow Team, Organization and Enterprise users to qualify sets of
+# opportunities. Use low-cost ranking first, then deeper analysis only on
+# selected high-potential opportunities. Architect for separately priced
+# bulk analysis or institutional entitlements." Deliberately built as two
+# calls, not one: /bulk/rank is free (reuses the same deterministic Fit
+# Score every card already shows — engines/fit_score_engine.py), so a team
+# can rank a large set of newly-synced opportunities at zero cost, then
+# /bulk/analyze spends real AI credits (via the exact same
+# `_analyze_single_opportunity` helper the single-record "Analyze
+# Opportunity" button uses, looped) only on the subset the team actually
+# selects after seeing the ranking — never the whole set automatically.
+# "Separately priced... or institutional entitlements" is satisfied for
+# free by reusing `ServiceCatalogEngine.consume()` per item: it already
+# checks each org's complimentary allowance/entitlement before falling
+# back to paid credits, so nothing bulk-specific needed inventing on the
+# pricing side.
+
+BULK_ALLOWED_PLANS = ("team", "organization", "enterprise")
+BULK_MAX_ITEMS = 50  # guards against a single request looping 500+ paid AI calls
+
+
+async def _assert_bulk_tier(db: AsyncSession, org_id: str) -> None:
+    """Bulk qualification is a Team/Organization/Enterprise plan feature —
+    the one place in this codebase that gates a feature by `Organization.
+    plan` rather than by role/permission alone (see rbac.py's docstring:
+    everything else here is enforced by "org_id present + role
+    permission," with no prior plan-tier gate). Reuses
+    ServiceCatalogEngine._get_org_plan() rather than querying
+    Organization.plan directly, so this stays in sync with whatever that
+    engine considers the org's plan (defaults to "free" the same way)."""
+    plan = await catalog_engine._get_org_plan(db, org_id)
+    if plan not in BULK_ALLOWED_PLANS:
+        raise HTTPException(
+            status_code=403,
+            detail="Bulk Opportunity Intelligence is available on Team, Organization, and Enterprise plans.",
+        )
+
+
+@router.post("/bulk/rank", response_model=BulkRankResponseOut)
+async def bulk_rank_opportunities(
+    body: BulkRankRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Step 1 of Bulk Opportunity Intelligence — free. Ranks the given
+    opportunities by the org's existing Fit Score, so a team can qualify a
+    large synced batch without spending anything before deciding which
+    ones are worth the paid deep-analysis step below."""
+    # Auth/tier checks run BEFORE the empty-list/over-limit short-circuits
+    # below — see the identical note in bulk_analyze_opportunities.
+    if not body.org_id:
+        raise HTTPException(status_code=400, detail="Bulk qualification requires an organization context.")
+    await _assert_member(body.org_id, current_user.id, db)
+    await _assert_bulk_tier(db, body.org_id)
+
+    if not body.foa_ids:
+        return BulkRankResponseOut(results=[], disclaimer="")
+    if len(body.foa_ids) > BULK_MAX_ITEMS:
+        raise HTTPException(status_code=400, detail=f"Bulk requests are limited to {BULK_MAX_ITEMS} opportunities at a time.")
+
+    result = await db.execute(
+        select(FOARecord).where(FOARecord.id.in_(body.foa_ids), FOARecord.org_id == body.org_id)
+    )
+    records = list(result.scalars().all())
+    profile = await get_org_context(db, org_id=body.org_id)
+
+    ranked: List[BulkRankResultOut] = []
+    for r in records:
+        fit = score_opportunity(r, profile)
+        ranked.append(BulkRankResultOut(
+            foa_id=r.id, program_title=r.program_title, agency=r.agency, pipeline_stage=r.pipeline_stage,
+            fit_score=fit.overall_score if fit else None,
+            fit_bucket=fit.bucket if fit else None,
+            fit_recommendation=fit.recommendation if fit else None,
+        ))
+    ranked.sort(key=lambda x: x.fit_score if x.fit_score is not None else -1, reverse=True)
+
+    return BulkRankResponseOut(
+        results=ranked,
+        disclaimer=(
+            "Free ranking pass only — no AI credits spent. Fit Score is a deterministic "
+            "comparison against your Funding Intelligence Profile, never a win-probability "
+            "estimate. Select the opportunities worth a deeper look before running paid analysis."
+        ),
+    )
+
+
+@router.post("/bulk/analyze", response_model=BulkAnalyzeResponseOut)
+async def bulk_analyze_opportunities(
+    body: BulkAnalyzeRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Step 2 of Bulk Opportunity Intelligence — paid, only on the
+    opportunities the caller explicitly selected after seeing /bulk/rank's
+    free results. Loops `_analyze_single_opportunity` (the exact same
+    logic the single-record "Analyze Opportunity" endpoint runs) one FOA
+    at a time; each item's charge/parse failure is caught individually so
+    one bad opportunity (e.g. no content available) doesn't abort or
+    partially-charge for the rest of the batch."""
+    # Auth/tier checks run BEFORE the empty-list/over-limit short-circuits
+    # below on purpose — an empty or absent foa_ids must never let an
+    # unauthorized caller (wrong org, wrong role, wrong plan) skip past
+    # authorization just because there was nothing to actually charge for.
+    if not body.org_id:
+        raise HTTPException(status_code=400, detail="Bulk qualification requires an organization context.")
+    await _assert_permission(body.org_id, current_user.id, "purchase_ai_services", db)
+    await _assert_bulk_tier(db, body.org_id)
+
+    if not body.foa_ids:
+        return BulkAnalyzeResponseOut(results=[], analyzed_count=0, failed_count=0)
+    if len(body.foa_ids) > BULK_MAX_ITEMS:
+        raise HTTPException(status_code=400, detail=f"Bulk requests are limited to {BULK_MAX_ITEMS} opportunities at a time.")
+
+    result = await db.execute(
+        select(FOARecord).where(FOARecord.id.in_(body.foa_ids), FOARecord.org_id == body.org_id)
+    )
+    records = {r.id: r for r in result.scalars().all()}
+
+    results: List[BulkAnalyzeResultOut] = []
+    analyzed_count = 0
+    failed_count = 0
+    for foa_id in body.foa_ids:
+        record = records.get(foa_id)
+        if not record:
+            results.append(BulkAnalyzeResultOut(
+                foa_id=foa_id, program_title="(not found)", success=False, error="Opportunity not found in this organization.",
+            ))
+            failed_count += 1
+            continue
+
+        already_analyzed = bool(record.intelligence_report)
+        try:
+            await _analyze_single_opportunity(db, record, current_user)
+            results.append(BulkAnalyzeResultOut(
+                foa_id=record.id, program_title=record.program_title, success=True, already_analyzed=already_analyzed,
+            ))
+            analyzed_count += 1
+        except HTTPException as exc:
+            results.append(BulkAnalyzeResultOut(
+                foa_id=record.id, program_title=record.program_title, success=False, error=str(exc.detail),
+            ))
+            failed_count += 1
+
+    return BulkAnalyzeResponseOut(results=results, analyzed_count=analyzed_count, failed_count=failed_count)
