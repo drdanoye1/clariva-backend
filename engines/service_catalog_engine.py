@@ -200,6 +200,19 @@ SERVICE_CATALOG_SEED: List[Dict] = [
         "complexity": "complex", "workspace": "post_award",
         "subscriber_price_cents": 25000, "payg_price_cents": None, "recurring": True,
     },
+    # --- Funding Opportunity Intelligence, Phase 3 §4.6 / Funding Strategy --
+    # Intelligence (org-level strategic synthesis) --------------------------
+    # Priced in the same band as the heavier planning documents ($35-$50)
+    # rather than the single-opportunity Grant Opportunity Analysis ($10):
+    # this reads across the org's whole pipeline, historical performance,
+    # and profile in one call, not a single FOA.
+    {
+        "service_key": "funding_strategy_intelligence", "category": "grant_analysis",
+        "name": "Funding Strategy Intelligence",
+        "description": "AI-synthesized organizational funding strategy: priority agencies/programs, target funding, quarterly pursuit calendar, capability gaps, partnership strategy, and proposal resource plan — generated from the org's pipeline, historical performance, and Funding Intelligence Profile.",
+        "complexity": None, "workspace": "pre_award",
+        "subscriber_price_cents": 3500, "payg_price_cents": 4000, "recurring": False,
+    },
 ]
 
 # --- §2.3 / Complimentary signup allowances (90-day validity baseline) -----

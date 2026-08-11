@@ -1769,3 +1769,38 @@ class MarketplacePurchase(Base):
     # listing's price may change later; this is what was actually charged.
     price_cents_paid = Column(Integer, nullable=False)
     created_at       = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class FundingStrategyPlan(Base):
+    """
+    Funding Opportunity Intelligence, Phase 3 §4.6 — Funding Strategy
+    Intelligence. Holds the org's current AI-synthesized strategic funding
+    plan: priority agencies/programs, target funding, a quarterly pursuit
+    calendar, capability gaps, partnership strategy, and a proposal
+    resource plan — see engines/funding_strategy_engine.py for the
+    generation logic and its exact JSON schema.
+
+    One row per org (`org_id` unique — get-or-create/upsert pattern, the
+    same "current state, not history" shape OrgContextDB uses for the
+    single-profile-per-org case). Every POST /funding-intelligence/strategy
+    call overwrites this org's existing row rather than versioning a
+    separate history table: the plan is a point-in-time synthesis of the
+    org's CURRENT pipeline + historical performance + profile, not an
+    audit trail of past syntheses. A dedicated history table is
+    straightforward to add later (append instead of upsert) if a future
+    requirement needs "what did the strategy say last quarter" — nothing
+    here forecloses that.
+
+    `plan` is the full normalized JSON object returned to the frontend
+    (see FundingStrategyEngine._normalize_plan for the fixed key set and
+    the disclaimer/human-in-the-loop note that are always attached,
+    mirroring foa_parser.py's INTELLIGENCE_REPORT_DISCLAIMER convention).
+    """
+    __tablename__ = "funding_strategy_plans"
+
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    org_id        = Column(String(36), ForeignKey("organizations.id"), nullable=False, unique=True, index=True)
+    plan          = Column(JSON, nullable=False, default=dict)
+    generated_by  = Column(String(36), ForeignKey("users.id"), nullable=True)
+    generated_at  = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())

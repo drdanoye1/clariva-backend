@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models.db_models import User
 from models.schemas import (
-    HistoricalPerformanceOut, LearningTimelineEventOut, PipelineReportOut,
+    FundingStrategyPlanOut, HistoricalPerformanceOut, LearningTimelineEventOut, PipelineReportOut,
     PortfolioRecommendationOut, SyncResultOut, WatchlistCreate, WatchlistOut, WatchlistUpdate,
 )
 from routers.auth import get_current_user
@@ -26,6 +26,9 @@ from engines.organizational_learning_engine import OrganizationalLearningEngine
 from engines.historical_performance_engine import HistoricalFundingPerformanceEngine
 from engines.portfolio_recommendation_engine import PortfolioRecommendationEngine
 from engines.alerts_engine import AlertsEngine
+from engines.funding_strategy_engine import FundingStrategyEngine
+from engines.service_catalog_engine import ServiceCatalogEngine
+from engines.credit_engine import InsufficientCreditsError
 
 router = APIRouter()
 engine = FundingIntelligenceEngine()
@@ -33,6 +36,8 @@ learning_engine = OrganizationalLearningEngine()
 performance_engine = HistoricalFundingPerformanceEngine()
 recommendation_engine = PortfolioRecommendationEngine()
 alerts_engine = AlertsEngine()
+strategy_engine = FundingStrategyEngine()
+catalog_engine = ServiceCatalogEngine()
 
 
 # ── Sync (manual trigger — no background scheduler in this environment) ────
@@ -220,3 +225,53 @@ async def get_recommendations(
         db, org_id=org_id, uploaded_by=None if org_id else current_user.id, limit=limit,
     )
     return PortfolioRecommendationOut(**result)
+
+
+# ── Funding Strategy Intelligence (Phase 3 §4.6) ──────────────────────────────
+# Org-only, unlike every endpoint above this line: there is no personal
+# equivalent of an institutional funding strategy, so `org_id` is required
+# rather than optional here, and both endpoints gate through
+# organizations.py's assertions the same way every other org-scoped action
+# in this codebase does. GET is free/read-only (view the last-generated
+# plan); POST /strategy/generate is the paid action that actually calls
+# GPT-4o and re-synthesizes the plan — priced via the
+# "funding_strategy_intelligence" service catalog entry ($35 subscriber /
+# $40 PAYG, service_catalog_engine.py), same purchase_ai_services gate and
+# 402-on-insufficient-credits handling as Analyze Opportunity.
+
+@router.get("/strategy", response_model=Optional[FundingStrategyPlanOut])
+async def get_funding_strategy(
+    org_id: str,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Read-only fetch of the org's last-generated Funding Strategy plan —
+    no AI call, no charge. Returns null if a plan has never been generated
+    for this org yet (frontend should show a "Generate" call to action)."""
+    await _assert_member(org_id, current_user.id, db)
+    plan = await strategy_engine.get_plan(db, org_id)
+    return FundingStrategyPlanOut(**plan) if plan else None
+
+
+@router.post("/strategy/generate", response_model=FundingStrategyPlanOut)
+async def generate_funding_strategy(
+    org_id: str,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Generates (or regenerates) the org's Funding Strategy Intelligence
+    plan: priority agencies/programs, target funding, a quarterly pursuit
+    calendar, capability gaps, partnership strategy, and a proposal
+    resource plan, synthesized from the org's pipeline, historical
+    performance, and Funding Intelligence Profile (see
+    engines/funding_strategy_engine.py). Overwrites this org's previously
+    generated plan, if any — see FundingStrategyPlan's model docstring for
+    why this is "current state," not a versioned history."""
+    await _assert_permission(org_id, current_user.id, "purchase_ai_services", db)
+    try:
+        await catalog_engine.consume(
+            db, org_id, current_user.id, "funding_strategy_intelligence",
+            reference={"org_id": org_id},
+        )
+    except InsufficientCreditsError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
+    plan = await strategy_engine.generate_plan(db, org_id, current_user.id)
+    return FundingStrategyPlanOut(**plan)

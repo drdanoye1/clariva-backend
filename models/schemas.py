@@ -1213,6 +1213,56 @@ class BulkAnalyzeResponseOut(BaseModel):
     failed_count: int
 
 
+# ── Funding Strategy Intelligence (Phase 3 §4.6) ───────────────────────────────
+# Org-level strategic synthesis — see engines/funding_strategy_engine.py.
+# GenerateOut and the read-only GetOut share the exact same shape (both are
+# built by that engine's _to_out()) so the frontend can render either
+# response through one component.
+
+class PriorityAgencyProgramOut(BaseModel):
+    agency: Optional[str] = None
+    program_area: Optional[str] = None
+    rationale: Optional[str] = None
+
+class TargetFundingOut(BaseModel):
+    annual_target: Optional[str] = None
+    rationale: Optional[str] = None
+
+class QuarterlyPursuitEntryOut(BaseModel):
+    quarter: Optional[str] = None
+    focus: Optional[str] = None
+    notes: Optional[str] = None
+
+class CapabilityGapOut(BaseModel):
+    gap: Optional[str] = None
+    impact: Optional[str] = None
+    recommended_action: Optional[str] = None
+
+class PartnershipStrategyEntryOut(BaseModel):
+    partner_type: Optional[str] = None
+    rationale: Optional[str] = None
+    target_profile: Optional[str] = None
+
+class ProposalResourcePlanEntryOut(BaseModel):
+    period: Optional[str] = None
+    resource_need: Optional[str] = None
+    rationale: Optional[str] = None
+
+class FundingStrategyPlanOut(BaseModel):
+    org_id: str
+    generated_by: Optional[str] = None
+    generated_at: Optional[datetime] = None
+    executive_summary: Optional[str] = None
+    priority_agencies_programs: List[PriorityAgencyProgramOut] = []
+    target_funding: TargetFundingOut = TargetFundingOut()
+    quarterly_pursuit_calendar: List[QuarterlyPursuitEntryOut] = []
+    capability_gaps: List[CapabilityGapOut] = []
+    partnership_strategy: List[PartnershipStrategyEntryOut] = []
+    proposal_resource_plan: List[ProposalResourcePlanEntryOut] = []
+    disclaimer: str
+    human_in_the_loop_note: str
+
+
 # ── Award & Project Management (PRD §16-17, Phase 5) ─────────────────────────
 # An Award is 1:1 with a Proposal, created explicitly (never automatically)
 # once a pipeline opportunity reaches the "awarded" stage. Everything below
