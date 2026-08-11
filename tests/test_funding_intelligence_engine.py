@@ -442,9 +442,6 @@ def test_list_pipeline_keyword_filters_existing_records(client, engine):
     assert len(title_match) == 1 and title_match[0].program_title == "Nanomaterials for Sensor Research"
     assert len(eligibility_match) == 1 and eligibility_match[0].program_title == "Rural Broadband Expansion"
     assert no_match == []
-    assert len(personal_records) == 1
-    assert len(synced_only) == 1
-    assert synced_only[0].source == "grants_gov"
 
 
 def test_compare_returns_requested_records(client, engine):

@@ -67,7 +67,7 @@ async def _make_proposal(db, owner_id: str, **overrides) -> Proposal:
 # ── ProposalStatusEvent (routers/proposals.py::update_proposal) ─────────────
 
 def test_status_change_logs_event_and_noop_does_not(client, registered_user):
-    created = client.post(
+    resp = client.post(
         "/api/v1/proposals/",
         json={
             "title": "Status Event Test", "agency": "NSF", "phase": "phase_i", "grant_type": "sbir",
@@ -75,10 +75,13 @@ def test_status_change_logs_event_and_noop_does_not(client, registered_user):
                 "organization_name": "Acme", "industry": "Biotech",
                 "core_technologies": [], "prior_sbir_experience": False,
             },
+            "research_focus": "Status-change instrumentation test",
+            "innovation_description": "N/A — this proposal exists only to exercise status-event logging",
         },
         headers=registered_user["headers"],
-    ).json()
-    proposal_id = created["proposal_id"]
+    )
+    assert resp.status_code == 201, resp.text
+    proposal_id = resp.json()["proposal_id"]
 
     client.patch(f"/api/v1/proposals/{proposal_id}", json={"status": "in_review"}, headers=registered_user["headers"])
     # Re-sending the SAME status must not write a second, redundant event.

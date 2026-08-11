@@ -215,7 +215,7 @@ def _create_org_row(name: str) -> str:
     org_id = new_uuid()
     async def _body():
         async with AsyncSessionLocal() as db:
-            db.add(Organization(id=org_id, name=name, plan="free"))
+            db.add(Organization(id=org_id, name=name, created_by=new_uuid(), plan="free"))
             await db.commit()
     _run(_body())
     return org_id
@@ -239,8 +239,8 @@ def test_get_marketplace_conversion(client, econ_engine):
             buyer2 = new_uuid()
             db.add(User(id=buyer1, email=f"{buyer1}@example.com", hashed_password="x", full_name="B1", organization="O"))
             db.add(User(id=buyer2, email=f"{buyer2}@example.com", hashed_password="x", full_name="B2", organization="O"))
-            org1 = Organization(id=new_uuid(), name="Buyer Org 1", plan="free")
-            org2 = Organization(id=new_uuid(), name="Buyer Org 2", plan="free")
+            org1 = Organization(id=new_uuid(), name="Buyer Org 1", created_by=buyer1, plan="free")
+            org2 = Organization(id=new_uuid(), name="Buyer Org 2", created_by=buyer2, plan="free")
             db.add_all([org1, org2])
             creator = new_uuid()
             db.add(User(id=creator, email=f"{creator}@example.com", hashed_password="x", full_name="Creator", organization="O"))
@@ -296,8 +296,8 @@ def test_get_complimentary_conversion(client, econ_engine):
 
     async def _body():
         async with AsyncSessionLocal() as db:
-            org_converted = Organization(id=new_uuid(), name="Converted Org", plan="free")
-            org_free_only = Organization(id=new_uuid(), name="Free-Only Org", plan="free")
+            org_converted = Organization(id=new_uuid(), name="Converted Org", created_by=new_uuid(), plan="free")
+            org_free_only = Organization(id=new_uuid(), name="Free-Only Org", created_by=new_uuid(), plan="free")
             db.add_all([org_converted, org_free_only])
             await db.flush()
             # org_converted used the complimentary allowance, then later paid.

@@ -371,14 +371,18 @@ def test_personal_foa_summarize_is_never_charged(client, registered_user, monkey
     assert body["complexity"] == "Moderate"
     assert body["attractiveness"] == "High"
     # No AIServiceTransaction should have been written for a personal record.
+    # Scoped to this FOA's own id (via the reference column) rather than a
+    # global count: the test DB is shared across the whole suite (see
+    # conftest.py), so a global count would be polluted by every other test
+    # file's transactions.
 
-    async def _count_transactions():
+    async def _transactions_for_this_foa():
         from models.db_models import AIServiceTransaction
         async with AsyncSessionLocal() as db:
             result = await db.execute(select(AIServiceTransaction))
-            return len(result.scalars().all())
+            return [t for t in result.scalars().all() if (t.reference or {}).get("foa_id") == foa_id]
 
-    assert _run(_count_transactions()) == 0
+    assert _run(_transactions_for_this_foa()) == []
 
 
 def test_org_scoped_foa_summarize_consumes_complimentary_allowance(client, registered_user, monkeypatch):

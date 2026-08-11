@@ -337,19 +337,27 @@ def test_activate_award_stays_free_for_personal_unshared_award(client, registere
     assert row.award_status == "active"
     assert row.post_award_tier is None  # tier is only assigned on the org-scoped charging path
 
-    async def _total_transactions():
+    # The test DB is shared across the whole pytest session (see conftest.py),
+    # so a global "zero transactions anywhere" count would be polluted by
+    # earlier tests' orgs — filter to transactions referencing this specific
+    # award instead.
+    async def _transactions_for_this_award():
         async with AsyncSessionLocal() as db:
             result = await db.execute(select(AIServiceTransaction))
-            return len(result.scalars().all())
-    assert _run(_total_transactions()) == 0
+            return [t for t in result.scalars().all() if (t.reference or {}).get("award_id") == award["id"]]
+    assert _run(_transactions_for_this_award()) == []
 
 
 def test_activate_award_bills_page_overage_in_100_page_blocks(client, registered_user, monkeypatch):
     import routers.awards as awards_router
     # Deterministic page count regardless of what pdfplumber/pypdf make of
     # fake PDF bytes — 340 pages -> 190 pages over the 150 included ->
-    # ceil(190/100) = 2 additional_pages blocks.
+    # ceil(190/100) = 2 additional_pages blocks. _extract_text_from_pdf runs
+    # first in intake_award_document and raises 422 on non-real PDF bytes,
+    # so it needs stubbing out too — this test only cares about page-count
+    # billing math, not text extraction.
     monkeypatch.setattr(awards_router, "_count_pdf_pages", lambda content: 340)
+    monkeypatch.setattr(awards_router, "_extract_text_from_pdf", lambda content: "fake extracted text")
 
     org_id = _create_org(client, registered_user["headers"])
     _set_org_plan(org_id, "free")
@@ -388,6 +396,7 @@ def test_activate_award_402s_when_overage_unaffordable_even_if_base_fee_is(clien
     partial charge, no partial activation), not just a partial bill."""
     import routers.awards as awards_router
     monkeypatch.setattr(awards_router, "_count_pdf_pages", lambda content: 340)  # 2 overage blocks
+    monkeypatch.setattr(awards_router, "_extract_text_from_pdf", lambda content: "fake extracted text")
 
     org_id = _create_org(client, registered_user["headers"])
     _set_org_plan(org_id, "free")

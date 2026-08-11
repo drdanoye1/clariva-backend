@@ -320,7 +320,10 @@ def test_report_endpoint_returns_structured_view(client, registered_user):
 def _fake_narrative(monkeypatch, text: str = "A fine report narrative.") -> None:
     import routers.awards as awards_router
 
-    async def fake_generate_report_narrative(report, proposal, additional_context=None):
+    async def fake_generate_report_narrative(
+        report, proposal, additional_context=None,
+        db=None, org_id=None, user_id=None, price_cents_charged=0,
+    ):
         return text
 
     monkeypatch.setattr(awards_router.engine, "generate_report_narrative", fake_generate_report_narrative)
@@ -870,7 +873,14 @@ def test_quick_intake_document_requires_edit_access_to_award(client, registered_
 
 # ── Phase C: original file preservation + GET /awards/{id}/files ──────────────
 
-def test_intake_document_persists_original_file_and_is_listed(client, registered_user):
+def test_intake_document_persists_original_file_and_is_listed(client, registered_user, monkeypatch):
+    # Fake, non-parseable PDF bytes make _extract_text_from_pdf raise a real
+    # 422 ("Could not extract text from PDF") — this test only cares about
+    # original-file preservation/listing, not text extraction, so stub it
+    # out the same way test_billing_wireup.py's overage tests do.
+    import routers.awards as awards_router
+    monkeypatch.setattr(awards_router, "_extract_text_from_pdf", lambda content: "fake extracted text")
+
     org_id = _create_org(client, registered_user["headers"])
     resp = client.post(
         "/api/v1/awards/intake",

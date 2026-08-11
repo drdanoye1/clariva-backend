@@ -58,6 +58,16 @@ from notifications import notify
 DEADLINE_WARNING_DAYS = 7
 
 
+def _naive(dt: Optional[datetime]) -> Optional[datetime]:
+    """Strip tzinfo so deadline math works whether the value came back
+    tz-aware (PostgreSQL) or naive (SQLite) — same helper/rationale as
+    engines/award_engine.py's _naive() and routers/invitations.py's local
+    copy."""
+    if dt is not None and dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
+
+
 class AlertsEngine:
     def __init__(self):
         self.fi_engine = FundingIntelligenceEngine()
@@ -142,8 +152,13 @@ class AlertsEngine:
         active = [r for r in records if r.pipeline_stage in ACTIVE_PURSUIT_STAGES and r.deadline]
         if not active:
             return 0
-        now = datetime.now(timezone.utc)
-        soon = [r for r in active if now <= r.deadline <= now + timedelta(days=DEADLINE_WARNING_DAYS)]
+        # FOARecord.deadline comes back tz-aware on Postgres (production) but
+        # naive on SQLite (tests) — comparing a tz-aware "now" against a
+        # naive deadline raises TypeError on SQLite. Strip tzinfo from both
+        # sides before comparing, same fix/rationale as routers/invitations.py's
+        # _invitation_validity() and engines/award_engine.py's _naive().
+        now = _naive(datetime.now(timezone.utc))
+        soon = [r for r in active if now <= _naive(r.deadline) <= now + timedelta(days=DEADLINE_WARNING_DAYS)]
         if not soon:
             return 0
 
@@ -158,7 +173,7 @@ class AlertsEngine:
             p = proposal_by_foa.get(r.id)
             if p and p.status != "draft":
                 continue  # a proposal exists and has moved past draft — not "incomplete" anymore
-            days_left = (r.deadline - now).days
+            days_left = (_naive(r.deadline) - now).days
             gap = "no proposal started yet" if not p else "proposal still in draft"
             created = await notify(
                 db, user_id, "deadline_approaching",

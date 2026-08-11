@@ -159,10 +159,15 @@ def test_bulk_rank_ranks_descending_and_stays_free(client, monkeypatch):
     assert body["disclaimer"]
 
     # Ranking must never write an AIServiceTransaction — it's the free step.
+    # Scoped to this test's own org_id rather than a global count: the test
+    # DB is shared across the whole suite (see conftest.py), so a global
+    # count would be polluted by every other test file's orgs.
     async def _count_transactions():
         from models.db_models import AIServiceTransaction
         async with AsyncSessionLocal() as db:
-            result = await db.execute(select(AIServiceTransaction))
+            result = await db.execute(
+                select(AIServiceTransaction).where(AIServiceTransaction.org_id == org_id)
+            )
             return len(result.scalars().all())
     assert _run(_count_transactions()) == 0
 

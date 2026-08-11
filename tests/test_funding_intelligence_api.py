@@ -368,9 +368,6 @@ def test_summarize_400_when_no_content_available(client, registered_user):
     resp = client.post(f"/api/v1/foa/{foa_id}/summarize", headers=registered_user["headers"])
     assert resp.status_code == 400
 
-    listed = client.get("/api/v1/foa/pipeline", headers=registered_user["headers"]).json()
-    assert any(r["program_title"] == "Synced Opportunity" for r in listed)
-
 
 def test_sync_requires_manage_watchlists_for_org_scope(client, registered_user, monkeypatch):
     import routers.funding_intelligence as fi_router

@@ -56,21 +56,32 @@ async def _load_invitation(token: str, db: AsyncSession) -> Invitation:
     return invitation
 
 
+def _naive(dt: Optional[datetime]) -> Optional[datetime]:
+    """Strip tzinfo so a comparison works regardless of which backend handed
+    the value back — same helper/rationale as engines/award_engine.py's
+    _naive(). Reused as a plain (not imported) local copy rather than
+    importing across the router/engine boundary."""
+    if dt is not None and dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
+
+
 def _invitation_validity(invitation: Invitation) -> Optional[str]:
     """None = valid; otherwise a short reason code for why it isn't.
 
-    invitation.expires_at comes from a DateTime(timezone=True) column, so on
-    Postgres (production) SQLAlchemy hands back a timezone-aware datetime —
-    comparing that against a naive datetime.utcnow() raises TypeError
-    ("can't compare offset-naive and offset-aware datetimes"), which was an
-    uncaught exception producing a bare 500 on this endpoint. SQLite (the
-    test DB) doesn't enforce tz-awareness on read, so this never surfaced in
-    the test suite. Always compare against a tz-aware "now" here."""
+    invitation.expires_at comes from a DateTime(timezone=True) column. On
+    Postgres (production) SQLAlchemy hands back a timezone-aware datetime;
+    on SQLite (the test DB) it comes back naive. A previous version of this
+    function always compared against a tz-aware `datetime.now(timezone.utc)`
+    to fix the Postgres case — which broke the SQLite case instead,
+    "can't compare offset-naive and offset-aware datetimes" either way,
+    just from whichever side was actually naive. Stripping tzinfo from BOTH
+    sides before comparing works on both backends."""
     if invitation.status == "revoked":
         return "revoked"
     if invitation.status == "accepted":
         return "accepted"
-    if invitation.expires_at and invitation.expires_at < datetime.now(timezone.utc):
+    if invitation.expires_at and _naive(invitation.expires_at) < _naive(datetime.now(timezone.utc)):
         return "expired"
     return None
 
