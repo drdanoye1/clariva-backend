@@ -22,7 +22,7 @@ from typing import List, Optional
 
 import httpx
 import openai
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -172,6 +172,45 @@ def _clean_parse_error(exc: Exception) -> HTTPException:
     )
 
 
+# ── Manual-add source grouping (upload / parse-text / parse-url) ────────────
+#
+# Grants.gov/SAM.gov sync already tags every record with `source` so
+# results can be grouped/filtered by where they came from. Manual adds
+# (upload a file, paste text, paste a URL) always collapsed into a single
+# generic "manual" bucket regardless of what was actually added — a state
+# grants portal RFP, a private foundation's call for proposals, and a World
+# Bank/UN procurement notice a user found and pasted in all looked
+# identical. There's no free, reliable API for any of those three (state/
+# local funding has no Grants.gov equivalent; Candid's foundation API is a
+# paid product; World Bank/UNGM only expose raw historical/procurement
+# archives with no working "currently open" filter — see
+# docs/ARCHITECTURE.md's funding-sources section), so rather than build a
+# sync integration against data that isn't reliably filterable, the
+# opportunity is on making the manual path fast and properly categorized.
+MANUAL_SOURCE_TYPES = {"manual", "state_local", "foundation", "international"}
+
+
+async def _resolve_manual_source(
+    db: AsyncSession, current_user: User, org_id: Optional[str], source_type: Optional[str],
+) -> tuple:
+    """Shared validation for the three manual-add endpoints below.
+    `source_type` groups a manually-added opportunity the same way `source`
+    already groups synced ones (grants_gov/sam_gov). `org_id`, when given,
+    shares the new record into that org's pipeline the same way sync's
+    org_id already does — gated by the same "manage_watchlists" permission
+    sync itself requires for org-scoped writes, so this doesn't open a
+    looser write path than the one that already exists. Returns
+    (org_id, resolved_source)."""
+    if source_type and source_type not in MANUAL_SOURCE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown source_type '{source_type}'. Use one of: {', '.join(sorted(MANUAL_SOURCE_TYPES))}.",
+        )
+    if org_id:
+        await _assert_permission(org_id, current_user.id, "manage_watchlists", db)
+    return org_id, (source_type or "manual")
+
+
 # ── HTML → plain text helper ──────────────────────────────────────────────────
 
 class _TextExtractor(HTMLParser):
@@ -214,10 +253,21 @@ def _html_to_text(html: str) -> str:
 @router.post("/upload", response_model=FOAUploadResponse)
 async def upload_foa(
     file: UploadFile = File(...),
+    org_id: Optional[str] = Form(None),
+    source_type: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Upload a FOA PDF, DOCX, or TXT file. Parses it and builds a dynamic template."""
+    """Upload a FOA PDF, DOCX, or TXT file. Parses it and builds a dynamic template.
+
+    `source_type` (manual/state_local/foundation/international — see
+    `_resolve_manual_source` above) groups this opportunity the same way
+    Grants.gov/SAM.gov sync's `source` field already groups synced ones.
+    `org_id` shares it straight into that org's pipeline instead of the
+    caller's personal library, gated by the same permission org-scoped
+    sync writes already require.
+    """
+    org_id, resolved_source = await _resolve_manual_source(db, current_user, org_id, source_type)
     ACCEPTED = {
         "application/pdf",
         "text/plain",
@@ -239,6 +289,8 @@ async def upload_foa(
 
         record = FOARecord(
             id=str(uuid.uuid4()),
+            org_id=org_id,
+            source=resolved_source,
             agency=template.agency.value,
             program_title=template.program_title,
             solicitation_number=template.solicitation_number,
@@ -267,10 +319,14 @@ async def upload_foa(
 @router.post("/parse-text", response_model=FOAUploadResponse)
 async def parse_foa_text(
     text: str = Body(..., embed=True),
+    org_id: Optional[str] = Body(None, embed=True),
+    source_type: Optional[str] = Body(None, embed=True),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Parse pasted FOA text directly (no file upload needed)."""
+    """Parse pasted FOA text directly (no file upload needed). See
+    `upload_foa` above for what `org_id`/`source_type` do."""
+    org_id, resolved_source = await _resolve_manual_source(db, current_user, org_id, source_type)
     if not text or len(text.strip()) < 50:
         raise HTTPException(status_code=400, detail="Please paste at least 50 characters of FOA text.")
     try:
@@ -279,6 +335,8 @@ async def parse_foa_text(
 
         record = FOARecord(
             id=str(uuid.uuid4()),
+            org_id=org_id,
+            source=resolved_source,
             agency=template.agency.value,
             program_title=template.program_title,
             solicitation_number=template.solicitation_number,
@@ -307,10 +365,14 @@ async def parse_foa_text(
 @router.post("/parse-url", response_model=FOAUploadResponse)
 async def parse_foa_url(
     url: str = Body(..., embed=True),
+    org_id: Optional[str] = Body(None, embed=True),
+    source_type: Optional[str] = Body(None, embed=True),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Fetch a URL (grants.gov, agency site, PDF link, etc.) and parse it as a FOA."""
+    """Fetch a URL (grants.gov, agency site, PDF link, etc.) and parse it as
+    a FOA. See `upload_foa` above for what `org_id`/`source_type` do."""
+    org_id, resolved_source = await _resolve_manual_source(db, current_user, org_id, source_type)
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
@@ -366,6 +428,8 @@ async def parse_foa_url(
 
         record = FOARecord(
             id=str(uuid.uuid4()),
+            org_id=org_id,
+            source=resolved_source,
             agency=template.agency.value,
             program_title=template.program_title,
             solicitation_number=template.solicitation_number,
