@@ -159,6 +159,12 @@ async def list_my_organizations(
             "member_count": member_count,
             "proposal_count": proposal_count,
             "created_at": org.created_at.isoformat() if org.created_at else None,
+            # Post-launch addendum (real-money payment wiring): surfaced so
+            # org.tsx can show the org's current plan and, if it's a paid
+            # one, when it renews/expires. See Organization.plan_expires_at's
+            # docstring in models/db_models.py.
+            "plan": org.plan,
+            "plan_expires_at": org.plan_expires_at.isoformat() if org.plan_expires_at else None,
         })
     return result
 

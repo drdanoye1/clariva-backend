@@ -268,6 +268,15 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     # "awards with no tier are skipped, not defaulted" guard).
     ("awards", "post_award_tier",          "VARCHAR(20)", "VARCHAR(20)"),
     ("awards", "post_award_last_billed_at", "DATETIME",    "TIMESTAMPTZ"),
+
+    # --- organizations (post-launch addendum — real-money payment wiring) -----
+    # Nullable, no backfill: every existing org reads as "no active paid
+    # subscription" (NULL), which is correct for all of them today — nothing
+    # before this column existed ever actually activated a plan via Square,
+    # since the webhook that sets this column didn't exist yet either. See
+    # Organization.plan_expires_at's docstring in models/db_models.py and
+    # scripts/downgrade_expired_plans.py.
+    ("organizations", "plan_expires_at", "DATETIME", "TIMESTAMPTZ"),
 ]
 
 # New tables introduced by Phase 2 (service_catalog_items,
@@ -286,6 +295,9 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
 # marketplace_listings) need no entry here — see the note above
 # COLUMN_MIGRATIONS: Base.metadata.create_all() creates any table that
 # doesn't exist yet, for both SQLite and PostgreSQL, automatically.
+
+# square_webhook_events (post-launch addendum — real-money payment wiring)
+# is a new table too, same rule: no entry needed here.
 
 # New tables introduced after the initial schema (AuditLog, AICreditLedger,
 # CreditTransaction, CreditAllocation, ...) do NOT need an entry here —

@@ -510,6 +510,22 @@ class Organization(Base):
     # tier rather than silently granted allowances it never paid for.
     plan = Column(String(30), default="free", nullable=False)
 
+    # Real-money payment wiring (post-launch addendum — closes the gap where
+    # Square checkout succeeded but nothing in the app ever changed).
+    # Square's Payment Links API charges once; it is not a recurring
+    # subscription object on Square's side, so this app is the sole source
+    # of truth for "is this org's paid plan still current." Set by
+    # routers/payments.py's webhook handler at the moment a plan checkout is
+    # confirmed (now + 30 days for monthly plan_ids, +365 for the "_annual"
+    # variants — see PLANS in payments.py). NULL means "no active paid
+    # subscription" (either always-free, or a paid plan that already lapsed
+    # and was downgraded — see scripts/downgrade_expired_plans.py, the daily
+    # Heroku Scheduler job that flips `plan` back to "free" and clears this
+    # column once it's in the past). Deliberately NOT used to gate
+    # complimentary-allowance eligibility in service_catalog_engine.py — that
+    # engine keys off `plan` alone, same as before this column existed.
+    plan_expires_at = Column(DateTime(timezone=True), nullable=True)
+
     memberships      = relationship("OrgMembership", back_populates="organization", cascade="all, delete-orphan")
     shared_proposals = relationship("OrgProposal",   back_populates="organization", cascade="all, delete-orphan")
 
@@ -1938,3 +1954,25 @@ class PlatformCostConfig(Base):
     label       = Column(String(200), nullable=False)
     value_cents = Column(Float, nullable=False, default=0.0)
     updated_at  = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class SquareWebhookEvent(Base):
+    """
+    Idempotency guard for routers/payments.py's Square webhook handler.
+    Square redelivers webhooks on any non-2xx response (and occasionally
+    just because — their docs describe delivery as "at least once"), so the
+    handler must tolerate seeing the same event twice without double-
+    activating a plan or double-crediting a Fund top-up. Standard pattern:
+    try to INSERT the event's id before doing anything else; a unique-
+    constraint violation means "already processed this one, return 200 and
+    do nothing." Rows are never read for any other purpose and are never
+    cleaned up (webhook volume for this app is low enough that unbounded
+    growth here is a non-issue; revisit with a retention job only if that
+    changes).
+    """
+    __tablename__ = "square_webhook_events"
+
+    id               = Column(String(36), primary_key=True, default=new_uuid)
+    square_event_id  = Column(String(120), unique=True, nullable=False, index=True)
+    event_type       = Column(String(60), nullable=True)   # informational only, e.g. "payment.updated"
+    processed_at     = Column(DateTime(timezone=True), server_default=func.now())

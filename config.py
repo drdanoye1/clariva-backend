@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     SQUARE_LOCATION_ID: str = ""
     # Webhook signature key (set in Square dashboard)
     SQUARE_WEBHOOK_SIGNATURE_KEY: str = ""
+    # The exact notification URL configured for this webhook subscription in
+    # the Square dashboard (Developer Dashboard -> Webhooks -> Subscription
+    # -> Notification URL). Square's HMAC signature is computed over
+    # (this URL + raw request body), so it must match byte-for-byte —
+    # including scheme and trailing slash/no-slash — or every signature
+    # check fails. Can't be derived from the incoming request reliably
+    # (Heroku's router rewrites scheme/host headers), so it's a separate,
+    # explicitly-set config var. e.g.
+    # "https://atifixia-api.herokuapp.com/api/v1/payments/webhook"
+    SQUARE_WEBHOOK_NOTIFICATION_URL: str = ""
 
     # Transactional email (Resend) — used to send org-member invitation
     # emails (routers/invitations.py). Degrades gracefully exactly like
