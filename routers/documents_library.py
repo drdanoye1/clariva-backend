@@ -34,14 +34,15 @@ from routers.proposals import _get_proposal_or_404, _load_company_profile
 from engines.document_library_engine import DocumentLibraryEngine
 from engines.scope_of_work_engine import ScopeOfWorkEngine
 from engines.supporting_documents_engine import SUPPORTING_DOCUMENT_TYPES, SupportingDocumentsEngine
-from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
+from engines.credit_engine import InsufficientCreditsError
+from engines.service_catalog_engine import ServiceCatalogEngine
 from audit import log_action
 
 router = APIRouter()
 engine = DocumentLibraryEngine()
 supporting_docs_engine = SupportingDocumentsEngine()
 sow_engine = ScopeOfWorkEngine()
-credit_engine = CreditEngine()
+catalog_engine = ServiceCatalogEngine()
 
 
 async def _to_document_out(db: AsyncSession, doc) -> DocumentOut:
@@ -97,16 +98,29 @@ async def generate_supporting_document(
     grounded in the given proposal's Project Knowledge Base and the user's
     org profile, then saves it as a normal versioned Document in this org's
     library — no separate storage path. Requires the same `manage_documents`
-    permission as a manual document creation, plus one AI-generation credit
-    debit, same metering contract as scope_of_work.py's generate-* endpoints."""
+    permission as a manual document creation.
+
+    Charging (Phase 3 §4.7 billing wire-up): each doc_type maps 1:1 to a
+    `doc_*` service catalog entry (e.g. "cover_letter" -> "doc_cover_letter")
+    — priced individually ($5-$85, see SERVICE_CATALOG_SEED) rather than the
+    flat GENERATION_COST every other AI call in this app defaults to, since
+    the catalog's whole point is per-service pricing for exactly these
+    supporting documents. `service_catalog_engine.consume()` applies the
+    org's complimentary allowance first (doc_* entries share one bucket, see
+    `_find_available_entitlement`'s docstring) before charging the paid AI
+    Services balance, same as every other catalog-priced service."""
     if body.doc_type not in SUPPORTING_DOCUMENT_TYPES:
         raise HTTPException(status_code=400, detail=f"Unknown supporting document type '{body.doc_type}'.")
     await _assert_permission(org_id, current_user.id, "manage_documents", db)
     proposal = await _get_proposal_or_404(body.proposal_id, current_user.id, db)
-    await debit_or_402(
-        credit_engine, db, org_id, current_user.id, GENERATION_COST,
-        reason=f"supporting_document:{body.doc_type}:{body.proposal_id}",
-    )
+    service_key = f"doc_{body.doc_type}"
+    try:
+        txn = await catalog_engine.consume(
+            db, org_id, current_user.id, service_key,
+            reference={"proposal_id": body.proposal_id, "doc_type": body.doc_type},
+        )
+    except InsufficientCreditsError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
     project_knowledge = await sow_engine.get_or_create_project_knowledge(db, body.proposal_id)
     company_profile = await _load_company_profile(current_user.id, db)
     content = await supporting_docs_engine.generate(
@@ -114,7 +128,7 @@ async def generate_supporting_document(
         recipient_name=body.recipient_name, recipient_organization=body.recipient_organization,
         additional_context=body.additional_context,
         db=db, org_id=org_id, user_id=current_user.id,
-        price_cents_charged=int(GENERATION_COST * 100),
+        price_cents_charged=txn.price_cents,
     )
     meta = SUPPORTING_DOCUMENT_TYPES[body.doc_type]
     title = f"{meta['label']} — {proposal.title}"

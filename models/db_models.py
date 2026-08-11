@@ -369,6 +369,12 @@ class Proposal(Base):
     # to be opened in the proposal editor — it exists only so its Award has
     # somewhere to point.
     origin                 = Column(String(20), nullable=True)
+    # Phase 3 §4.7 billing wire-up — set True the first time
+    # generate_all_sections() charges this proposal's one-time
+    # proposal_development_{tier} catalog fee (org-scoped generation only;
+    # see routers/proposals.py). Guards against re-charging on every
+    # subsequent "fill remaining sections" or regeneration call.
+    development_fee_charged = Column(Boolean, default=False)
     version                = Column(Integer, default=1)
     created_at             = Column(DateTime(timezone=True), server_default=func.now())
     updated_at             = Column(DateTime(timezone=True), onupdate=func.now())
@@ -995,6 +1001,13 @@ class StoredFile(Base):
     content_type       = Column(String(100), nullable=True)
     size_bytes         = Column(Integer, nullable=True)
     checksum           = Column(String(64), nullable=True)  # SHA-256 hex digest
+    # Phase 3 §4.7 billing wire-up — real PDF page count (pdfplumber), used
+    # to bill award_setup_additional_pages beyond the 150 pages included
+    # with award_setup_activation (see routers/awards.py's activate_award).
+    # NULL for non-PDF uploads (DOCX/TXT have no equivalent "page" concept
+    # this app can count) and for any StoredFile predating this column —
+    # treated as 0 pages by the billing sum, never as a page-count error.
+    page_count         = Column(Integer, nullable=True)
     created_by         = Column(String(36), ForeignKey("users.id"), nullable=False)
     created_at         = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -1218,6 +1231,20 @@ class Award(Base):
     # Award Received stage and must not be retroactively gated behind a
     # baseline that was never captured for them.
     award_status                    = Column(String(20), nullable=False, default="received", index=True)
+    # Phase 3 §4.7 billing wire-up — "standard" | "advanced" | "complex",
+    # derived once from total_award_value at activate_award() and never
+    # recomputed (a later amendment changing the award's value doesn't
+    # retroactively re-tier it — same "point-in-time snapshot" precedent as
+    # AIServiceTransaction's price). NULL until activation, and permanently
+    # NULL for an award that predates this column — see
+    # scripts/run_monthly_billing.py's docstring for how billing treats
+    # a NULL tier (skipped, never defaulted).
+    post_award_tier                 = Column(String(20), nullable=True)
+    # Last successful post_award_management_{tier} charge — guards
+    # scripts/run_monthly_billing.py against double-billing the same award
+    # within one calendar month if the script is ever run more than once in
+    # a period.
+    post_award_last_billed_at       = Column(DateTime(timezone=True), nullable=True)
     created_by                      = Column(String(36), ForeignKey("users.id"), nullable=False)
     created_at                      = Column(DateTime(timezone=True), server_default=func.now())
     updated_at                      = Column(DateTime(timezone=True), onupdate=func.now())

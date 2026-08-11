@@ -1323,6 +1323,9 @@ class AwardOut(BaseModel):
     terms: Optional[str] = None
     status: str
     award_status: str = "received"  # received | active | closed — see Award.award_status docstring
+    # Phase 3 §4.7 billing wire-up — see Award.post_award_tier's docstring.
+    post_award_tier: Optional[str] = None
+    post_award_last_billed_at: Optional[datetime] = None
     created_by: str
     created_at: datetime
     updated_at: Optional[datetime] = None

@@ -19,11 +19,15 @@ from config import settings
 from database import get_db
 from models.db_models import BudgetRecord, OrgContextDB, Proposal, User
 from routers.auth import get_current_user
+from routers.organizations import _assert_member
 from engines.company_profile import get_org_context
 from engines import usage_tracking
 from engines.usage_tracking import usage_from_response
+from engines.credit_engine import InsufficientCreditsError
+from engines.service_catalog_engine import ServiceCatalogEngine
 
 router = APIRouter()
+catalog_engine = ServiceCatalogEngine()
 
 AGENCY_CAPS: Dict[str, Dict[str, float]] = {
     "NSF":    {"Phase I": 275_000,  "Phase II": 1_000_000},
@@ -260,14 +264,35 @@ async def save_budget(
 @router.post("/{proposal_id}/generate-justification")
 async def generate_justification(
     proposal_id: str,
+    org_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """org_id is optional and additive, same contract as proposals.py's
+    generate_section: pass it to charge this generation against that org's
+    "doc_budget_justification" catalog entitlement/balance (Phase 3 §4.7
+    billing wire-up). Omit it and generation stays free/personal, exactly
+    as this endpoint has always behaved."""
     proposal = await _get_proposal(proposal_id, current_user.id, db)
     r = await db.execute(select(BudgetRecord).where(BudgetRecord.proposal_id == proposal_id))
     rec = r.scalar_one_or_none()
     if not rec:
         raise HTTPException(status_code=404, detail="Save a budget first before generating justification.")
+
+    # Charging happens AFTER the budget-exists check above (not before) so a
+    # call with no saved budget 404s cleanly with nothing charged — same
+    # "validate eligibility before taking payment" ordering as
+    # routers/awards.py::activate_award.
+    txn = None
+    if org_id:
+        await _assert_member(org_id, current_user.id, db)
+        try:
+            txn = await catalog_engine.consume(
+                db, org_id, current_user.id, "doc_budget_justification",
+                reference={"proposal_id": proposal_id},
+            )
+        except InsufficientCreditsError as exc:
+            raise HTTPException(status_code=402, detail=str(exc))
 
     # Load profile for org name and PI. Funding Opportunity Intelligence,
     # Phase 2 — see engines/company_profile.py's module docstring:
@@ -402,15 +427,17 @@ CRITICAL FORMATTING RULES — the output will be inserted directly into a federa
     except Exception as exc:
         raise _ai_error(exc)
     justification = response.choices[0].message.content.strip()
-    # Phase 3 §4.7 — Administrator-Only Engineering Economics. This
-    # endpoint is unmetered (free) — see module docstring, no
-    # debit_or_402 call site here — so price_cents_charged stays 0; we
-    # still record COGS for margin math.
+    # Phase 3 §4.7 — Administrator-Only Engineering Economics. Personal use
+    # (no org_id) stays unmetered/free — price_cents_charged is 0 and no
+    # AIServiceTransaction exists — but COGS is still recorded for margin
+    # math. Org-scoped use was wired to the "doc_budget_justification"
+    # catalog price above (billing wire-up); txn.price_cents reflects
+    # whatever was actually charged (0 if a complimentary allowance covered it).
     prompt_tokens, completion_tokens = usage_from_response(response)
     await usage_tracking.record_usage(
-        db, org_id=None, user_id=current_user.id, operation="budget:justification",
+        db, org_id=org_id, user_id=current_user.id, operation="budget:justification",
         model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-        price_cents_charged=0, reference={"proposal_id": proposal_id},
+        price_cents_charged=txn.price_cents if txn else 0, reference={"proposal_id": proposal_id},
     )
     # Post-process: strip SBIR language for non-SBIR grants
     from engines.proposal_generator import _sanitize_sbir_content

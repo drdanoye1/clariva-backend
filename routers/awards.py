@@ -17,10 +17,11 @@ engines/collaboration_engine.py::decide_approval_request).
 """
 from __future__ import annotations
 
+import io
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import storage
@@ -48,9 +49,10 @@ from routers.extract import _extract_text_from_docx, _extract_text_from_pdf
 from routers.budget import _extract_budget_from_text, apply_budget_dict
 from workspace_access import ProposalAccess, assert_can_edit, assert_can_view
 from engines.award_engine import AwardEngine, _naive
-from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
+from engines.credit_engine import CreditEngine, GENERATION_COST, InsufficientCreditsError, debit_or_402
 from engines.document_library_engine import DocumentLibraryEngine
 from engines.scope_of_work_engine import ScopeOfWorkEngine
+from engines.service_catalog_engine import ServiceCatalogEngine
 from engines import usage_tracking
 
 router = APIRouter()
@@ -58,6 +60,14 @@ engine = AwardEngine()
 credit_engine = CreditEngine()
 document_engine = DocumentLibraryEngine()
 scope_engine = ScopeOfWorkEngine()
+catalog_engine = ServiceCatalogEngine()
+
+# Phase 3 §4.7 billing wire-up — Award Setup & Activation includes AI
+# processing of up to this many pages (award_setup_activation's catalog
+# description); anything beyond is billed per 100-page block via
+# award_setup_additional_pages. See activate_award() below.
+AWARD_SETUP_INCLUDED_PAGES = 150
+AWARD_SETUP_PAGE_BLOCK = 100
 
 
 def _to_award_out(award: Award, proposal_title: Optional[str] = None) -> AwardOut:
@@ -69,6 +79,7 @@ def _to_award_out(award: Award, proposal_title: Optional[str] = None) -> AwardOu
         period_of_performance_end=award.period_of_performance_end,
         total_award_value=award.total_award_value, terms=award.terms, status=award.status,
         award_status=award.award_status,
+        post_award_tier=award.post_award_tier, post_award_last_billed_at=award.post_award_last_billed_at,
         created_by=award.created_by, created_at=award.created_at, updated_at=award.updated_at,
         proposal_title=proposal_title,
     )
@@ -147,6 +158,43 @@ _INTAKE_CONTENT_TYPES = {
 }
 
 
+def _count_pdf_pages(content: bytes) -> Optional[int]:
+    """Real page count via pdfplumber, with a pypdf fallback — same two
+    libraries and try/fallback shape as routers/extract.py's
+    _extract_text_from_pdf(), just returning len(pages) instead of text.
+    Returns None (not 0) on total failure, so a StoredFile.page_count of
+    None unambiguously means "couldn't be determined," never "empty PDF" —
+    _get_award_intake_page_count() below treats both the same for billing
+    (a page count that can't be read can't be billed for), but the
+    distinction matters for anyone reading the raw column later."""
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        pass
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(io.BytesIO(content)).pages)
+    except Exception:
+        return None
+
+
+async def _get_award_intake_page_count(db: AsyncSession, award_id: str) -> int:
+    """Sum of every intake StoredFile's page_count for this award — only
+    PDFs contribute (DOCX/TXT uploads have page_count=None, since neither
+    format has pdfplumber's notion of a page; see StoredFile.page_count's
+    docstring). Used by activate_award() below to bill
+    award_setup_additional_pages beyond the 150 pages included with
+    award_setup_activation."""
+    result = await db.execute(
+        select(func.sum(StoredFile.page_count)).where(
+            StoredFile.object_type == "award_document", StoredFile.object_id == award_id,
+        )
+    )
+    return result.scalar() or 0
+
+
 @router.post("/{award_id}/intake/document", response_model=DocumentOut)
 async def intake_award_document(
     award_id: str, org_id: str = Form(...), file: UploadFile = File(...),
@@ -187,8 +235,10 @@ async def intake_award_document(
     content = await file.read()
     filename = file.filename or "document"
     lower = filename.lower()
+    page_count: Optional[int] = None
     if lower.endswith(".pdf"):
         text = _extract_text_from_pdf(content)
+        page_count = _count_pdf_pages(content)
     elif lower.endswith(".docx"):
         text = _extract_text_from_docx(content)
     elif lower.endswith(".txt"):
@@ -224,7 +274,8 @@ async def intake_award_document(
         db.add(StoredFile(
             id=new_uuid(), org_id=org_id, object_type="award_document", object_id=award_id,
             storage_key=storage_key, original_filename=filename, content_type=content_type,
-            size_bytes=len(content), checksum=storage.sha256_hex(content), created_by=current_user.id,
+            size_bytes=len(content), checksum=storage.sha256_hex(content), page_count=page_count,
+            created_by=current_user.id,
         ))
 
     await db.commit()
@@ -462,12 +513,62 @@ async def update_award(
 # award mutation is (assert_can_edit via _get_award_and_access), not by
 # rbac.py's "activate_award" permission — see that permission's docstring.
 
+def _post_award_tier_from_value(total_award_value: Optional[float]) -> str:
+    """standard/advanced/complex, thresholded on the award's total dollar
+    value — a confirmed number by activation time, unlike a proposal's
+    pre-award ceiling estimate (see routers/proposals.py's
+    _derive_proposal_tier() for that separate, FOA-complexity-first
+    derivation). Bands roughly track this codebase's own SBIR/STTR Phase
+    caps (see AGENCY_CAPS above): most Phase I awards land "standard,"
+    most Phase II "advanced," only unusually large or multi-year awards
+    "complex." A missing/zero value defaults to "standard" rather than
+    raising — activation must never block on incomplete award data."""
+    if not total_award_value or total_award_value <= 0:
+        return "standard"
+    if total_award_value < 500_000:
+        return "standard"
+    if total_award_value < 2_000_000:
+        return "advanced"
+    return "complex"
+
+
 @router.post("/{award_id}/activate", response_model=ProjectBaselineOut)
 async def activate_award(
     award_id: str, payload: ActivateProjectRequest = ActivateProjectRequest(),
     db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
 ):
-    await _get_award_and_access(award_id, current_user, db, require_edit=True)
+    """Locks the first ProjectBaseline (see AwardEngine.activate_award) and,
+    for org-scoped awards only (personal/unshared awards stay free, same
+    "org_id optional and additive" contract every other paid AI/service
+    call in this app uses), charges the one-time Award Setup & Activation
+    fee plus per-100-page overage beyond the 150 pages included (Phase 3
+    §4.7 billing wire-up). Charging happens BEFORE engine.activate_award()
+    so a 402 (insufficient balance) aborts cleanly with nothing written —
+    engine.activate_award() itself still has the final word on eligibility
+    (raises 400 if this award isn't in "received" status), which is why
+    the charge is gated on that same precondition here rather than trusting
+    this router not to be called twice."""
+    award, access = await _get_award_and_access(award_id, current_user, db, require_edit=True)
+
+    if award.award_status == "received" and award.org_id:
+        await _assert_member(award.org_id, current_user.id, db)
+        try:
+            await catalog_engine.consume(
+                db, award.org_id, current_user.id, "award_setup_activation",
+                reference={"award_id": award_id},
+            )
+            total_pages = await _get_award_intake_page_count(db, award_id)
+            overage_pages = max(0, total_pages - AWARD_SETUP_INCLUDED_PAGES)
+            overage_blocks = (overage_pages + AWARD_SETUP_PAGE_BLOCK - 1) // AWARD_SETUP_PAGE_BLOCK
+            for _ in range(overage_blocks):
+                await catalog_engine.consume(
+                    db, award.org_id, current_user.id, "award_setup_additional_pages",
+                    reference={"award_id": award_id, "total_intake_pages": total_pages},
+                )
+        except InsufficientCreditsError as exc:
+            raise HTTPException(status_code=402, detail=str(exc))
+        award.post_award_tier = _post_award_tier_from_value(award.total_award_value)
+
     baseline = await engine.activate_award(db, award_id, payload.model_dump(), created_by=current_user.id)
     await db.commit()
     return baseline

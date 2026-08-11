@@ -245,6 +245,29 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     ("org_contexts", "entity_type",         "VARCHAR(30)",    "VARCHAR(30)"),
     # Funding Opportunity Intelligence, Phase 3 §4.3 (Portfolio-Level Recommendations)
     ("org_contexts", "pursuit_capacity",    "INTEGER",        "INTEGER"),
+
+    # --- Phase 3 §4.7 billing wire-up — real charging for previously-seeded-
+    # but-unwired service catalog entries (award_setup_*, proposal_development_*,
+    # post_award_management_*). See docs/ARCHITECTURE.md for the full design.
+    ("stored_files", "page_count", "INTEGER", "INTEGER"),
+    # Proposal: tracks whether the one-time proposal_development_{tier} fee
+    # has already been charged for this proposal's first full-draft
+    # generation — see routers/proposals.py::generate_all_sections. Default
+    # FALSE for every existing proposal (none of them were ever charged this
+    # fee, since it didn't exist before this migration) — never retroactively
+    # billed.
+    ("proposals", "development_fee_charged", "BOOLEAN DEFAULT 0", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    # Award: post_award_management_{tier} recurring billing state — tier is
+    # derived once at activation from total_award_value (see
+    # routers/awards.py::activate_award) and never recomputed; last_billed_at
+    # guards scripts/run_monthly_billing.py against double-billing the same
+    # award twice in one calendar month. Both NULL for every award that
+    # predates this column — an award activated before this migration simply
+    # isn't billed until the next activation-equivalent event backfills its
+    # tier (out of scope here; see the billing script's docstring for the
+    # "awards with no tier are skipped, not defaulted" guard).
+    ("awards", "post_award_tier",          "VARCHAR(20)", "VARCHAR(20)"),
+    ("awards", "post_award_last_billed_at", "DATETIME",    "TIMESTAMPTZ"),
 ]
 
 # New tables introduced by Phase 2 (service_catalog_items,

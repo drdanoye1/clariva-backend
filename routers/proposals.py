@@ -21,7 +21,8 @@ from engines.grant_templates import get_sections as get_grant_sections, list_gra
 from routers.auth import get_current_user
 from engines.proposal_generator import ProposalGeneratorEngine
 from engines.workflow_engine import WorkflowEngine
-from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
+from engines.credit_engine import CreditEngine, GENERATION_COST, InsufficientCreditsError, debit_or_402
+from engines.service_catalog_engine import ServiceCatalogEngine
 from engines import usage_tracking
 from routers.organizations import _assert_member
 from audit import log_action
@@ -48,6 +49,40 @@ class SectionEdit(BaseModel):
 router        = APIRouter()
 generator     = ProposalGeneratorEngine()
 workflow      = WorkflowEngine()
+catalog_engine = ServiceCatalogEngine()
+
+
+def _derive_proposal_tier(foa: Optional[FOARecord]) -> str:
+    """standard/advanced/complex — auto-derived (an explicit product
+    decision: no manual tier selector) for the one-time
+    proposal_development_{tier} catalog fee (Phase 3 §4.7 billing
+    wire-up). Primary signal is the linked FOA's own AI-assessed
+    complexity rating (foa_parser.py's analyze_opportunity(), one of
+    "Low"/"Moderate"/"High"/"Very High" — see FOARecord.complexity),
+    since that's opportunity-specific and already vetted by the user
+    running Grant Opportunity Analysis. Falls back to the FOA's estimated
+    award ceiling (rough dollar-amount bands, same bands
+    routers/awards.py's _post_award_tier_from_value uses for the
+    post-award side of this billing wire-up) when no complexity rating
+    exists yet — e.g. the user never ran Grant Opportunity Analysis on
+    this FOA. Defaults to "standard" with no FOA at all (a proposal
+    created without a Funding Opportunity Intelligence entry) — this must
+    never block generation on missing data."""
+    if foa is None:
+        return "standard"
+    if foa.complexity:
+        return {
+            "Low": "standard", "Moderate": "standard",
+            "High": "advanced", "Very High": "complex",
+        }.get(foa.complexity, "standard")
+    ceiling = foa.estimated_award_ceiling
+    if ceiling:
+        if ceiling < 500_000:
+            return "standard"
+        if ceiling < 2_000_000:
+            return "advanced"
+        return "complex"
+    return "standard"
 credit_engine = CreditEngine()
 
 
@@ -354,7 +389,18 @@ async def generate_all_sections(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """See generate_section() for the org_id / credit-metering contract."""
+    """See generate_section() for the org_id / credit-metering contract.
+
+    Phase 3 §4.7 billing wire-up: the FIRST time this proposal's whole
+    draft is generated (every section still empty, and the one-time fee
+    hasn't already been charged — see Proposal.development_fee_charged),
+    org-scoped calls are charged the real proposal_development_{tier}
+    catalog price (auto-derived, see _derive_proposal_tier()) instead of
+    the flat per-section GENERATION_COST. Any subsequent call — filling in
+    a few remaining sections, or regenerating after the first draft
+    already exists — falls back to the original flat per-section fee,
+    since the tier price specifically covers "full draft," not incremental
+    touch-ups. Personal (no org_id) use stays free either way, unchanged."""
     proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
     company_profile = await _load_company_profile(current_user.id, db)
 
@@ -367,12 +413,30 @@ async def generate_all_sections(
 
     # Only generate sections that are empty — skip already-filled ones
     empty_sections = [s for s in sections if not (s.content and s.content.strip())]
+    is_first_full_draft = (
+        bool(sections) and len(empty_sections) == len(sections) and not proposal.development_fee_charged
+    )
 
     if empty_sections and org_id:
         await _assert_member(org_id, current_user.id, db)
-        await debit_or_402(credit_engine, db, org_id, current_user.id,
-                            GENERATION_COST * len(empty_sections),
-                            reason=f"proposal_generation:all:{proposal_id}")
+        if is_first_full_draft:
+            foa = None
+            if proposal.foa_id:
+                foa_result = await db.execute(select(FOARecord).where(FOARecord.id == proposal.foa_id))
+                foa = foa_result.scalar_one_or_none()
+            tier = _derive_proposal_tier(foa)
+            try:
+                await catalog_engine.consume(
+                    db, org_id, current_user.id, f"proposal_development_{tier}",
+                    reference={"proposal_id": proposal_id, "tier": tier},
+                )
+            except InsufficientCreditsError as exc:
+                raise HTTPException(status_code=402, detail=str(exc))
+            proposal.development_fee_charged = True
+        else:
+            await debit_or_402(credit_engine, db, org_id, current_user.id,
+                                GENERATION_COST * len(empty_sections),
+                                reason=f"proposal_generation:all:{proposal_id}")
 
     if empty_sections:
         # Fire all AI calls in parallel — reduces total time from O(n*15s) to O(15s)
@@ -403,13 +467,20 @@ async def generate_all_sections(
             section.page_estimate    = result["page_estimate"]
             section.compliance_flags = result.get("missing_flags", [])
 
-            # Phase 3 §4.7 — Administrator-Only Engineering Economics.
+            # Phase 3 §4.7 — Administrator-Only Engineering Economics. COGS
+            # is recorded per section regardless of billing path (it's a
+            # real per-call OpenAI cost either way). price_cents_charged is
+            # 0 here when is_first_full_draft — the real revenue for that
+            # path was already recorded once, as its own
+            # AIServiceTransaction, by catalog_engine.consume() above; a
+            # per-section value here would double-count against a lump-sum
+            # tier fee that has nothing to do with section count.
             usage = result.get("_usage") or {}
             await usage_tracking.record_usage(
                 db, operation="proposal:generate_section", model=usage.get("model", settings.OPENAI_MODEL),
                 prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0),
                 org_id=org_id, user_id=current_user.id,
-                price_cents_charged=int(GENERATION_COST * 100) if org_id else 0,
+                price_cents_charged=0 if (is_first_full_draft or not org_id) else int(GENERATION_COST * 100),
                 reference={"proposal_id": proposal_id, "section_id": section.section_id},
             )
 
