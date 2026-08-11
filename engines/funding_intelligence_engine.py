@@ -191,10 +191,30 @@ class FundingIntelligenceEngine:
 
     # ── Shared upsert-by-external-id logic ──────────────────────────────────
 
-    async def _get_by_external(self, db: AsyncSession, source: str, external_id: str) -> Optional[FOARecord]:
-        result = await db.execute(
-            select(FOARecord).where(FOARecord.source == source, FOARecord.external_id == external_id)
-        )
+    async def _get_by_external(
+        self, db: AsyncSession, source: str, external_id: str,
+        org_id: Optional[str], user_id: str,
+    ) -> Optional[FOARecord]:
+        """Dedup lookup for a sync hit, scoped the same way list_pipeline()
+        scopes what a caller can see (org-wide if org_id is given, else
+        personal-and-unshared). This used to match on (source, external_id)
+        alone with no tenant scoping at all — fine for a single tester, but
+        a real bug once more than one org exists: Grants.gov/SAM.gov serve
+        the same public opportunity catalog to everyone, so the first org
+        to ever sync a given opportunity would silently "claim" that row
+        forever, and every other org's later sync of the same opportunity
+        would just update that first org's row (bumping `updated`) instead
+        of creating a pipeline entry of its own — list_pipeline's strict
+        org_id/uploaded_by filter would then correctly show nothing for
+        the second org, even right after a "Sync complete" success message.
+        Scoping the lookup itself fixes this: each org (or each personal,
+        unshared user) now gets its own FOARecord row per opportunity."""
+        query = select(FOARecord).where(FOARecord.source == source, FOARecord.external_id == external_id)
+        if org_id:
+            query = query.where(FOARecord.org_id == org_id)
+        else:
+            query = query.where(FOARecord.org_id.is_(None), FOARecord.uploaded_by == user_id)
+        result = await db.execute(query)
         return result.scalar_one_or_none()
 
     async def _upsert_hits(
@@ -212,7 +232,7 @@ class FundingIntelligenceEngine:
             if not external_id:
                 continue  # can't dedupe without a stable external key — skip rather than risk duplicates
 
-            existing = await self._get_by_external(db, source, external_id)
+            existing = await self._get_by_external(db, source, external_id, org_id, user_id)
             if existing:
                 changed_fields: List[str] = []
                 for field in ("program_title", "agency", "solicitation_number", "deadline", "external_url"):

@@ -120,6 +120,51 @@ def test_sync_grants_gov_upserts_on_rerun(client, engine, monkeypatch):
     assert touched2[0].program_title == "Updated Title"
 
 
+def test_sync_grants_gov_second_org_gets_its_own_record_not_first_orgs(client, engine, monkeypatch):
+    """Regression test for a real bug: Grants.gov/SAM.gov serve the same
+    public opportunity catalog to every org, so two different orgs syncing
+    the same live opportunity used to collide on the (source, external_id)
+    dedup lookup with no tenant scoping — the second org's sync would just
+    update the first org's row (bumping `updated`) instead of creating a
+    pipeline entry of its own, so the second org's pipeline stayed empty
+    even after a "Sync complete" success response. _get_by_external now
+    scopes the dedup lookup by org_id (or personal/uploaded_by when
+    org_id is None), matching list_pipeline's own scoping, so each org
+    gets its own row per opportunity."""
+    org_a = _id("org")
+    org_b = _id("org")
+    fixed_number = f"TEST-OPP-{uuid.uuid4().hex[:12]}"
+
+    async def fake_fetch(**kwargs):
+        return [_grants_gov_hit(number=fixed_number, title="Shared Opportunity")]
+
+    monkeypatch.setattr(engine, "fetch_grants_gov", fake_fetch)
+
+    async def _body():
+        async with AsyncSessionLocal() as db:
+            ca, ua, _ = await engine.sync_grants_gov(db, org_a, "user-a")
+            await db.commit()
+        async with AsyncSessionLocal() as db:
+            cb, ub, touched_b = await engine.sync_grants_gov(db, org_b, "user-b")
+            await db.commit()
+            return ca, ua, cb, ub, touched_b
+
+    ca, ua, cb, ub, touched_b = _run(_body())
+    assert ca == 1 and ua == 0  # org A creates its own row
+    assert cb == 1 and ub == 0  # org B must ALSO create its own row (not update org A's)
+    assert touched_b[0].org_id == org_b
+
+    async def _list_body():
+        async with AsyncSessionLocal() as db:
+            pipeline_a = await engine.list_pipeline(db, org_id=org_a)
+            pipeline_b = await engine.list_pipeline(db, org_id=org_b)
+            return pipeline_a, pipeline_b
+
+    pipeline_a, pipeline_b = _run(_list_body())
+    assert any(r.external_id == fixed_number for r in pipeline_a)
+    assert any(r.external_id == fixed_number for r in pipeline_b)
+
+
 def test_sync_grants_gov_skips_hits_without_external_id(client, engine, monkeypatch):
     org_id = _id("org")
 
