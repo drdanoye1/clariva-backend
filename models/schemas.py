@@ -1977,6 +1977,14 @@ class OrgAdminOut(BaseModel):
     name: str
     plan: str
     created_at: datetime
+    # Superadmin credit-grant addendum — the org's current AI Services
+    # (AICreditLedger) balance, so the admin org list doubles as a
+    # balance-at-a-glance view without a second request per org. Read-only
+    # here; grant more via POST /admin/organizations/{org_id}/credits/grant.
+    # Defaults to the same DEFAULT_STARTING_BALANCE a ledger would get on
+    # first real use, for an org that hasn't touched AI credits yet (no
+    # ledger row created just by listing it).
+    ai_credit_balance: float = 100.0
 
 
 class OrgPlanUpdateRequest(BaseModel):

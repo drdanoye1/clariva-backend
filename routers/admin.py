@@ -10,12 +10,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from database import get_db
-from models.db_models import Organization, User, Proposal
-from models.schemas import OrgAdminOut, OrgPlanUpdateRequest
+from models.db_models import AICreditLedger, Organization, User, Proposal
+from models.schemas import CreditBalanceOut, CreditTopupRequest, OrgAdminOut, OrgPlanUpdateRequest
 from routers.auth import get_current_user
+from routers.credits import _balance_out
+from engines.credit_engine import CreditEngine, DEFAULT_STARTING_BALANCE
 from audit import log_action
 
 router = APIRouter()
+credit_engine = CreditEngine()
 
 
 # ── Superadmin dependency ─────────────────────────────────────────────────────
@@ -139,7 +142,74 @@ async def admin_list_organizations(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(select(Organization).order_by(Organization.name))
-    return result.scalars().all()
+    orgs = result.scalars().all()
+
+    # Bulk-fetch existing ledgers rather than calling
+    # credit_engine.get_or_create_ledger() per org — that method creates a
+    # row on first call, and a read-only list endpoint must never have that
+    # side effect. An org with no ledger yet just shows the same
+    # DEFAULT_STARTING_BALANCE it would actually get the first time
+    # anything touches its ledger for real.
+    ledger_result = await db.execute(
+        select(AICreditLedger).where(AICreditLedger.org_id.in_([o.id for o in orgs]))
+    )
+    balances = {l.org_id: l.balance for l in ledger_result.scalars().all()}
+
+    return [
+        OrgAdminOut(
+            id=o.id, name=o.name, plan=o.plan, created_at=o.created_at,
+            ai_credit_balance=balances.get(o.id, DEFAULT_STARTING_BALANCE),
+        )
+        for o in orgs
+    ]
+
+
+# ── AI Services credit grants (superadmin) ────────────────────────────────────
+# routers/credits.py's topup_credits is owner-only (manage_credits) — a
+# superadmin with no membership in a given org can't use it. This is the
+# platform-admin lever for the same underlying CreditEngine.credit() call:
+# comping a customer's balance for support, or funding an internal testing
+# org (e.g. one used to exercise paid AI features like Analyze Opportunity,
+# Bulk Opportunity Intelligence, or Funding Strategy Intelligence without
+# hitting the $100 default starting balance).
+
+@router.get("/organizations/{org_id}/credits", response_model=CreditBalanceOut)
+async def admin_get_org_credits(
+    org_id: str,
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Organization).where(Organization.id == org_id))
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Organization not found")
+    ledger = await credit_engine.get_or_create_ledger(db, org_id)
+    return _balance_out(org_id, ledger)
+
+
+@router.post("/organizations/{org_id}/credits/grant", response_model=CreditBalanceOut)
+async def admin_grant_org_credits(
+    org_id: str,
+    body: CreditTopupRequest,
+    current_user: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Adds `body.amount` to the org's AI Services balance — same
+    CreditEngine.credit() call topup_credits uses, just reachable without
+    org membership. `body.reason` defaults to "manual_topup"; pass
+    something identifying (e.g. "admin testing allocation") so the
+    transaction log stays legible."""
+    result = await db.execute(select(Organization).where(Organization.id == org_id))
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    ledger = await credit_engine.credit(db, org_id, body.amount, body.reason, user_id=current_user.id)
+
+    await log_action(
+        db, actor_id=current_user.id, action="admin.organization.credits_granted",
+        org_id=org_id, object_type="ai_credit_ledger", object_id=ledger.id,
+        detail={"amount": body.amount, "reason": body.reason},
+    )
+    return _balance_out(org_id, ledger)
 
 
 @router.patch("/organizations/{org_id}/plan", response_model=OrgAdminOut)
