@@ -38,6 +38,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
+from engines import usage_tracking
+from engines.usage_tracking import usage_from_response
 from models.db_models import (
     BudgetRecord, Deliverable, Milestone, ProjectKnowledge, ProposalSection,
     ScopeOfWork, Task, WorkPackage, new_uuid,
@@ -423,6 +425,8 @@ class ScopeOfWorkEngine:
     async def generate_methodology_narrative(
         self, proposal: Any, project_knowledge: ProjectKnowledge,
         company_profile: Dict[str, Any], additional_context: Optional[str] = None,
+        db: Optional[AsyncSession] = None, org_id: Optional[str] = None, user_id: Optional[str] = None,
+        price_cents_charged: int = 0,
     ) -> str:
         prompt = f"""
 Write a methodology narrative (3-5 paragraphs, plain prose, no markdown or headers)
@@ -454,11 +458,21 @@ partners, or results.
             )
         except Exception as exc:
             raise _ai_error(exc)
-        return response.choices[0].message.content.strip()
+        narrative = response.choices[0].message.content.strip()
+        if db is not None:
+            prompt_tokens, completion_tokens = usage_from_response(response)
+            await usage_tracking.record_usage(
+                db, org_id=org_id, user_id=user_id, operation="scope_of_work:methodology",
+                model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                price_cents_charged=price_cents_charged, reference={"proposal_id": getattr(proposal, "id", None)},
+            )
+        return narrative
 
     async def generate_evaluation_plan(
         self, proposal: Any, project_knowledge: ProjectKnowledge,
         company_profile: Dict[str, Any], additional_context: Optional[str] = None,
+        db: Optional[AsyncSession] = None, org_id: Optional[str] = None, user_id: Optional[str] = None,
+        price_cents_charged: int = 0,
     ) -> str:
         prompt = f"""
 Write an evaluation plan (2-4 paragraphs, plain prose, no markdown or headers)
@@ -488,7 +502,15 @@ targets are not yet defined.
             )
         except Exception as exc:
             raise _ai_error(exc)
-        return response.choices[0].message.content.strip()
+        plan = response.choices[0].message.content.strip()
+        if db is not None:
+            prompt_tokens, completion_tokens = usage_from_response(response)
+            await usage_tracking.record_usage(
+                db, org_id=org_id, user_id=user_id, operation="scope_of_work:evaluation_plan",
+                model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                price_cents_charged=price_cents_charged, reference={"proposal_id": getattr(proposal, "id", None)},
+            )
+        return plan
 
     async def generate_work_breakdown(
         self, proposal: Any, project_knowledge: ProjectKnowledge, scope_of_work: ScopeOfWork,
@@ -540,7 +562,15 @@ empty lists are fine. Month numbers are 1-indexed from project start.
             )
         except Exception as exc:
             raise _ai_error(exc)
-        return _parse_json_response(response.choices[0].message.content or "")
+        result = _parse_json_response(response.choices[0].message.content or "")
+        # Phase 3 §4.7 — Administrator-Only Engineering Economics. Same
+        # "_usage rides along in the return dict" convention as
+        # foa_parser.py::analyze_opportunity — the caller
+        # (routers/scope_of_work.py::generate_work_breakdown) pops it off
+        # and hands it to engines/usage_tracking.record_usage().
+        prompt_tokens, completion_tokens = usage_from_response(response)
+        result["_usage"] = {"model": settings.OPENAI_MODEL, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+        return result
 
     async def apply_generated_work_breakdown(
         self, db: AsyncSession, proposal_id: str, breakdown: Dict[str, Any],
@@ -580,6 +610,7 @@ empty lists are fine. Month numbers are 1-indexed from project start.
 
     async def derive_project_knowledge_from_proposal(
         self, db: AsyncSession, proposal: Any, project_knowledge: ProjectKnowledge,
+        org_id: Optional[str] = None, user_id: Optional[str] = None, price_cents_charged: int = 0,
     ) -> Dict[str, Any]:
         """Reads the proposal's already-generated ProposalSection content and
         extracts a Project Knowledge / Scope of Work draft from it. Returns an
@@ -654,11 +685,19 @@ support. Use null for any field the sections genuinely don't address.
             raise _ai_error(exc)
         parsed = _parse_json_response(response.choices[0].message.content or "")
         parsed["source_sections_used"] = [s.section_id for s in sections]
+        prompt_tokens, completion_tokens = usage_from_response(response)
+        await usage_tracking.record_usage(
+            db, org_id=org_id, user_id=user_id, operation="scope_of_work:derive_from_proposal",
+            model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            price_cents_charged=price_cents_charged, reference={"proposal_id": proposal.id},
+        )
         return parsed
 
     async def suggest_project_knowledge_field(
         self, proposal: Any, project_knowledge: ProjectKnowledge, company_profile: Dict[str, Any],
         field: str, current_value: Optional[str] = None, additional_context: Optional[str] = None,
+        db: Optional[AsyncSession] = None, org_id: Optional[str] = None, user_id: Optional[str] = None,
+        price_cents_charged: int = 0,
     ) -> str:
         """Powers the inline "Suggest" button next to a manually-edited
         Project Knowledge field. Unlike the full-field AI Draft buttons
@@ -705,7 +744,15 @@ surrounding quotation marks.
             )
         except Exception as exc:
             raise _ai_error(exc)
-        return response.choices[0].message.content.strip()
+        suggestion = response.choices[0].message.content.strip()
+        if db is not None:
+            prompt_tokens, completion_tokens = usage_from_response(response)
+            await usage_tracking.record_usage(
+                db, org_id=org_id, user_id=user_id, operation=f"scope_of_work:suggest_field:{field}",
+                model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                price_cents_charged=price_cents_charged, reference={"proposal_id": getattr(proposal, "id", None)},
+            )
+        return suggestion
 
     # ── Budget sync (PRD §10: "Budget structure feeding the existing Budget Builder") ──
 

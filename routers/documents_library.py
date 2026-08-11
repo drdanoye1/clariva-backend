@@ -113,6 +113,8 @@ async def generate_supporting_document(
         proposal, project_knowledge, company_profile, body.doc_type,
         recipient_name=body.recipient_name, recipient_organization=body.recipient_organization,
         additional_context=body.additional_context,
+        db=db, org_id=org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100),
     )
     meta = SUPPORTING_DOCUMENT_TYPES[body.doc_type]
     title = f"{meta['label']} — {proposal.title}"

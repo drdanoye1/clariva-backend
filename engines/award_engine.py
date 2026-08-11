@@ -55,6 +55,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import storage
 from config import settings
+from engines import usage_tracking
+from engines.usage_tracking import usage_from_response
 from models.db_models import (
     ApprovalRequest, Award, AwardAmendment, AwardCloseout, AwardComplianceItem,
     AwardCondition, AwardExpenditure, AwardPerformanceRecord, AwardReport, BudgetRecord,
@@ -545,7 +547,15 @@ sentence.
             )
         except Exception as exc:
             raise _ai_error(exc)
-        return _parse_json_response(response.choices[0].message.content or "")
+        result = _parse_json_response(response.choices[0].message.content or "")
+        # Phase 3 §4.7 — Administrator-Only Engineering Economics. Same
+        # "_usage rides along in the return dict" convention as
+        # foa_parser.py::analyze_opportunity — the caller
+        # (routers/awards.py::extract_award_intelligence) pops it off and
+        # hands it to engines/usage_tracking.record_usage().
+        prompt_tokens, completion_tokens = usage_from_response(response)
+        result["_usage"] = {"model": settings.OPENAI_MODEL, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+        return result
 
     # ── Award Received: sponsor conditions (Phase 7 data model) ────────────
 
@@ -948,7 +958,11 @@ sentence.
             compliance_summary=compliance_summary or None,
         )
 
-    async def generate_report_narrative(self, report: AwardReportOut, proposal: Proposal, additional_context: Optional[str] = None) -> str:
+    async def generate_report_narrative(
+        self, report: AwardReportOut, proposal: Proposal, additional_context: Optional[str] = None,
+        db: Optional[AsyncSession] = None, org_id: Optional[str] = None, user_id: Optional[str] = None,
+        price_cents_charged: int = 0,
+    ) -> str:
         exec_status = report.execution_status
         budget_status = report.budget_status
         prompt = f"""
@@ -991,7 +1005,15 @@ fabricate figures, dates, or results not given above.
             )
         except Exception as exc:
             raise _ai_error(exc)
-        return response.choices[0].message.content.strip()
+        narrative = response.choices[0].message.content.strip()
+        if db is not None:
+            prompt_tokens, completion_tokens = usage_from_response(response)
+            await usage_tracking.record_usage(
+                db, org_id=org_id, user_id=user_id, operation="award:report_narrative",
+                model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                price_cents_charged=price_cents_charged, reference={"award_id": report.award_id},
+            )
+        return narrative
 
     # ── Persisted, human-reviewed reports (see models/db_models.py's
     # AwardReport docstring — the generate_report/generate_report_narrative
@@ -1011,6 +1033,7 @@ fabricate figures, dates, or results not given above.
     async def create_report_draft(
         self, db: AsyncSession, award_id: str, report_type: str, additional_context: Optional[str],
         award_out: Any, requested_by: str,
+        org_id: Optional[str] = None, user_id: Optional[str] = None, price_cents_charged: int = 0,
     ) -> AwardReport:
         """Runs the same generate_report/generate_report_narrative pipeline
         the ephemeral preview endpoints use, but persists the result as a
@@ -1023,7 +1046,10 @@ fabricate figures, dates, or results not given above.
         award = await self.get_award_or_404(db, award_id)
         proposal_result = await db.execute(select(Proposal).where(Proposal.id == award.proposal_id))
         proposal = proposal_result.scalar_one_or_none()
-        narrative = await self.generate_report_narrative(report_view, proposal, additional_context)
+        narrative = await self.generate_report_narrative(
+            report_view, proposal, additional_context,
+            db=db, org_id=org_id, user_id=user_id, price_cents_charged=price_cents_charged,
+        )
 
         report_data = json.loads(report_view.model_dump_json(exclude={"narrative", "award"}))
         report = AwardReport(

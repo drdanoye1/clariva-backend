@@ -20,6 +20,8 @@ from database import get_db
 from models.db_models import BudgetRecord, OrgContextDB, Proposal, User
 from routers.auth import get_current_user
 from engines.company_profile import get_org_context
+from engines import usage_tracking
+from engines.usage_tracking import usage_from_response
 
 router = APIRouter()
 
@@ -400,6 +402,16 @@ CRITICAL FORMATTING RULES — the output will be inserted directly into a federa
     except Exception as exc:
         raise _ai_error(exc)
     justification = response.choices[0].message.content.strip()
+    # Phase 3 §4.7 — Administrator-Only Engineering Economics. This
+    # endpoint is unmetered (free) — see module docstring, no
+    # debit_or_402 call site here — so price_cents_charged stays 0; we
+    # still record COGS for margin math.
+    prompt_tokens, completion_tokens = usage_from_response(response)
+    await usage_tracking.record_usage(
+        db, org_id=None, user_id=current_user.id, operation="budget:justification",
+        model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+        price_cents_charged=0, reference={"proposal_id": proposal_id},
+    )
     # Post-process: strip SBIR language for non-SBIR grants
     from engines.proposal_generator import _sanitize_sbir_content
     grant_type_val = getattr(proposal, "grant_type", None) or "federal_other"
@@ -474,7 +486,7 @@ async def extract_budget_from_file(
     if not text.strip():
         raise HTTPException(status_code=422, detail="File appears to be empty or unreadable.")
 
-    return await _extract_budget_from_text(text)
+    return await _extract_budget_from_text(text, db=db, user_id=current_user.id)
 
 
 # Factored out of extract_budget_from_file() above (Version 3.0 upgrade,
@@ -484,7 +496,9 @@ async def extract_budget_from_file(
 # Intake document (Document Library), without needing the raw file bytes
 # again or duplicating this prompt. Behavior is byte-for-byte identical to
 # what extract_budget_from_file() did inline before this refactor.
-async def _extract_budget_from_text(text: str) -> Dict[str, Any]:
+async def _extract_budget_from_text(
+    text: str, db: Optional[AsyncSession] = None, org_id: Optional[str] = None, user_id: Optional[str] = None,
+) -> Dict[str, Any]:
     extract_prompt = f"""Extract budget line items from this document and return ONLY valid JSON matching this schema exactly:
 
 {{
@@ -549,6 +563,14 @@ DOCUMENT:
         )
     except Exception as exc:
         raise _ai_error(exc)
+
+    if db is not None:
+        prompt_tokens, completion_tokens = usage_from_response(response)
+        await usage_tracking.record_usage(
+            db, org_id=org_id, user_id=user_id, operation="budget:extract",
+            model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            price_cents_charged=0, reference={},
+        )
 
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)

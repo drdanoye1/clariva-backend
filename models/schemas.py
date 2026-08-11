@@ -1989,3 +1989,87 @@ class OrgAdminOut(BaseModel):
 
 class OrgPlanUpdateRequest(BaseModel):
     plan: str  # free | professional | team | organization | enterprise
+
+
+# ── Phase 3 §4.7 — Administrator-Only Engineering Economics ─────────────
+# See engines/engineering_economics_engine.py for the aggregation logic
+# these schemas surface. All GET/PATCH endpoints that use these live on
+# routers/admin.py behind require_superadmin.
+
+class OperationEconomicsOut(BaseModel):
+    operation: str
+    transaction_count: int
+    revenue_cents: int
+    cogs_cents: float
+    gross_margin_cents: float
+    gross_margin_pct: Optional[float] = None
+    avg_prompt_tokens: float
+    avg_completion_tokens: float
+    avg_cogs_cents: float
+    p50_cogs_cents: float
+    p75_cogs_cents: float
+    p95_cogs_cents: float
+
+
+class EconomicsTotalsOut(BaseModel):
+    transaction_count: int
+    revenue_cents: int
+    cogs_cents: float
+    gross_margin_cents: float
+    gross_margin_pct: Optional[float] = None
+
+
+class MarketplaceListingConversionOut(BaseModel):
+    listing_id: str
+    listing_name: str
+    purchase_count: int
+    revenue_cents: int
+
+
+class MarketplaceConversionOut(BaseModel):
+    published_listing_count: int
+    listings_with_at_least_one_sale: int
+    listing_conversion_pct: Optional[float] = None
+    total_purchases: int
+    total_revenue_cents: int
+    top_listings: List[MarketplaceListingConversionOut]
+
+
+class ComplimentaryConversionOut(BaseModel):
+    service_key: str
+    orgs_used_complimentary: int
+    orgs_used_paid: int
+    orgs_converted: int
+    conversion_rate_pct: Optional[float] = None
+
+
+class PlatformCostConfigOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    key: str
+    label: str
+    value_cents: float
+
+
+class PlatformCostConfigUpdate(BaseModel):
+    value_cents: float = Field(ge=0)
+
+
+class ModelPricingConfigOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    model: str
+    input_cost_cents_per_1k: float
+    output_cost_cents_per_1k: float
+
+
+class ModelPricingConfigUpdate(BaseModel):
+    input_cost_cents_per_1k: Optional[float] = Field(default=None, ge=0)
+    output_cost_cents_per_1k: Optional[float] = Field(default=None, ge=0)
+
+
+class EngineeringEconomicsDashboardOut(BaseModel):
+    operations: List[OperationEconomicsOut]
+    totals: EconomicsTotalsOut
+    marketplace: MarketplaceConversionOut
+    complimentary_conversion: List[ComplimentaryConversionOut]
+    platform_costs: List[PlatformCostConfigOut]
+    model_pricing: List[ModelPricingConfigOut]

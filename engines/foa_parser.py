@@ -389,6 +389,16 @@ class FOAParserEngine:
         complexity = report.get("complexity") or {}
         attractiveness = report.get("opportunity_attractiveness") or {}
 
+        # Phase 3 §4.7 — Administrator-Only Engineering Economics. Token
+        # usage riding along in the return dict (rather than a separate
+        # return value) so every existing caller keeps working unchanged;
+        # the one caller that cares (routers/foa.py::_analyze_single_opportunity)
+        # pops "_usage" and hands it to engines/usage_tracking.record_usage().
+        # See that module's usage_from_response() for the tolerant-of-a-
+        # missing-.usage extraction.
+        from engines.usage_tracking import usage_from_response
+        prompt_tokens, completion_tokens = usage_from_response(response)
+
         return {
             "report": report,
             "summary": report.get("executive_brief"),
@@ -397,6 +407,7 @@ class FOAParserEngine:
             "complexity": complexity.get("level"),
             "attractiveness": attractiveness.get("level"),
             "attractiveness_reason": attractiveness.get("reason"),
+            "_usage": {"model": settings.OPENAI_MODEL, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
         }
 
     def _normalize_intelligence_report(self, data: Dict[str, Any]) -> Dict[str, Any]:

@@ -26,6 +26,7 @@ from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Upload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from config import settings
 from database import get_db
 from models.db_models import Award, FOARecord, Proposal, User
 from models.schemas import (
@@ -42,6 +43,7 @@ from engines.service_catalog_engine import ServiceCatalogEngine
 from engines.credit_engine import InsufficientCreditsError
 from engines.company_profile import get_org_context
 from engines.fit_score_engine import FitScoreResult, score_opportunity
+from engines import usage_tracking
 
 router = APIRouter()
 parser  = FOAParserEngine()
@@ -719,13 +721,15 @@ async def _analyze_single_opportunity(db: AsyncSession, record: FOARecord, curre
     # stricter than the plain view/member access _assert_foa_access already
     # granted by the caller, since this specific action spends the org's
     # shared complimentary allowance or paid AI Services balance.
+    price_cents_charged = 0
     if record.org_id:
         await _assert_permission(record.org_id, current_user.id, "purchase_ai_services", db)
         try:
-            await catalog_engine.consume(
+            txn = await catalog_engine.consume(
                 db, record.org_id, current_user.id, "grant_opportunity_analysis",
                 reference={"foa_id": record.id},
             )
+            price_cents_charged = txn.price_cents
         except InsufficientCreditsError as exc:
             raise HTTPException(status_code=402, detail=str(exc))
 
@@ -761,6 +765,15 @@ async def _analyze_single_opportunity(db: AsyncSession, record: FOARecord, curre
         record.complexity = result.get("complexity")
         record.attractiveness = result.get("attractiveness")
         record.attractiveness_reason = result.get("attractiveness_reason")
+
+        # Phase 3 §4.7 — Administrator-Only Engineering Economics.
+        usage = result.get("_usage") or {}
+        await usage_tracking.record_usage(
+            db, operation="grant_opportunity_analysis", model=usage.get("model", settings.OPENAI_MODEL),
+            prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0),
+            org_id=record.org_id, user_id=current_user.id,
+            price_cents_charged=price_cents_charged, reference={"foa_id": record.id},
+        )
 
         await db.flush()
         await db.refresh(record)

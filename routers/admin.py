@@ -10,15 +10,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from database import get_db
-from models.db_models import AICreditLedger, Organization, User, Proposal
-from models.schemas import CreditBalanceOut, CreditTopupRequest, OrgAdminOut, OrgPlanUpdateRequest
+from models.db_models import (
+    AICreditLedger, ModelPricingConfig, Organization, PlatformCostConfig, User, Proposal,
+)
+from models.schemas import (
+    CreditBalanceOut, CreditTopupRequest, EngineeringEconomicsDashboardOut,
+    ModelPricingConfigOut, ModelPricingConfigUpdate, OrgAdminOut, OrgPlanUpdateRequest,
+    PlatformCostConfigOut, PlatformCostConfigUpdate,
+)
 from routers.auth import get_current_user
 from routers.credits import _balance_out
 from engines.credit_engine import CreditEngine, DEFAULT_STARTING_BALANCE
+from engines.engineering_economics_engine import EngineeringEconomicsEngine
 from audit import log_action
 
 router = APIRouter()
 credit_engine = CreditEngine()
+economics_engine = EngineeringEconomicsEngine()
 
 
 # ── Superadmin dependency ─────────────────────────────────────────────────────
@@ -235,3 +243,90 @@ async def admin_update_org_plan(
         detail={"old_plan": old_plan, "new_plan": body.plan},
     )
     return org
+
+
+# ── Engineering Economics (Phase 3 §4.7) ─────────────────────────────────────
+# Read-only dashboard over engines/engineering_economics_engine.py, plus
+# admin-editable per-model token pricing and platform cost-config — the
+# same "configurable, not hardcoded" discipline as Phase 3.1's service
+# catalog pricing controls above.
+
+@router.get("/economics", response_model=EngineeringEconomicsDashboardOut)
+async def admin_get_economics(
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await economics_engine.get_dashboard(db)
+
+
+@router.get("/model-pricing", response_model=List[ModelPricingConfigOut])
+async def admin_list_model_pricing(
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await economics_engine.get_model_pricing(db)
+
+
+@router.patch("/model-pricing/{model}", response_model=ModelPricingConfigOut)
+async def admin_update_model_pricing(
+    model: str,
+    body: ModelPricingConfigUpdate,
+    current_user: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(ModelPricingConfig).where(ModelPricingConfig.model == model))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No pricing configured for model '{model}'.")
+
+    changes: dict = {}
+    if body.input_cost_cents_per_1k is not None:
+        changes["input_cost_cents_per_1k"] = (row.input_cost_cents_per_1k, body.input_cost_cents_per_1k)
+        row.input_cost_cents_per_1k = body.input_cost_cents_per_1k
+    if body.output_cost_cents_per_1k is not None:
+        changes["output_cost_cents_per_1k"] = (row.output_cost_cents_per_1k, body.output_cost_cents_per_1k)
+        row.output_cost_cents_per_1k = body.output_cost_cents_per_1k
+
+    await db.flush()
+    await db.refresh(row)
+
+    if changes:
+        await log_action(
+            db, actor_id=current_user.id, action="admin.model_pricing.updated",
+            object_type="model_pricing_config", object_id=row.id,
+            detail={k: {"old": v[0], "new": v[1]} for k, v in changes.items()},
+        )
+    return row
+
+
+@router.get("/cost-config", response_model=List[PlatformCostConfigOut])
+async def admin_list_cost_config(
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await economics_engine.get_platform_cost_config(db)
+
+
+@router.patch("/cost-config/{key}", response_model=PlatformCostConfigOut)
+async def admin_update_cost_config(
+    key: str,
+    body: PlatformCostConfigUpdate,
+    current_user: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(PlatformCostConfig).where(PlatformCostConfig.key == key))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No cost config entry '{key}'.")
+
+    old_value = row.value_cents
+    row.value_cents = body.value_cents
+    await db.flush()
+    await db.refresh(row)
+
+    await log_action(
+        db, actor_id=current_user.id, action="admin.cost_config.updated",
+        object_type="platform_cost_config", object_id=row.key,
+        detail={"old_value_cents": old_value, "new_value_cents": body.value_cents},
+    )
+    return row

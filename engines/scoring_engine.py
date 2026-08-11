@@ -9,11 +9,14 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import openai
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
+from engines import usage_tracking
+from engines.usage_tracking import usage_from_response
 from models.schemas import RiskPenalty, SectionScore, ScoringResult
 
 
@@ -58,7 +61,10 @@ class ScoringEngine:
     def __init__(self):
         self.client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
-    async def score(self, proposal: Any, sections: List[Any]) -> ScoringResult:
+    async def score(
+        self, proposal: Any, sections: List[Any],
+        db: Optional[AsyncSession] = None, user_id: Optional[str] = None,
+    ) -> ScoringResult:
         """Score a proposal across all dimensions."""
 
         # Build section summaries for the LLM
@@ -90,6 +96,17 @@ Score each section and provide overall dimension scores.
             response_format={"type": "json_object"},
             temperature=0.2,
         )
+
+        # Phase 3 §4.7 — Administrator-Only Engineering Economics. This
+        # endpoint is unmetered (free) — no credit debit here — so
+        # price_cents_charged stays 0; we still record COGS for margin math.
+        if db is not None:
+            prompt_tokens, completion_tokens = usage_from_response(response)
+            await usage_tracking.record_usage(
+                db, org_id=None, user_id=user_id, operation="scoring:score",
+                model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                price_cents_charged=0, reference={"proposal_id": proposal.id},
+            )
 
         raw = json.loads(response.choices[0].message.content)
         return self._build_result(proposal.id, raw, sections)

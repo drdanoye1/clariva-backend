@@ -40,8 +40,11 @@ from typing import Any, Dict, Optional
 
 import openai
 from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
+from engines import usage_tracking
+from engines.usage_tracking import usage_from_response
 
 _log = logging.getLogger(__name__)
 
@@ -255,6 +258,8 @@ class SupportingDocumentsEngine:
         self, proposal: Any, project_knowledge: Optional[Any], company_profile: Dict[str, Any],
         doc_type: str, recipient_name: Optional[str] = None, recipient_organization: Optional[str] = None,
         additional_context: Optional[str] = None,
+        db: Optional[AsyncSession] = None, org_id: Optional[str] = None, user_id: Optional[str] = None,
+        price_cents_charged: int = 0,
     ) -> str:
         if doc_type not in SUPPORTING_DOCUMENT_TYPES:
             raise HTTPException(status_code=400, detail=f"Unknown supporting document type '{doc_type}'.")
@@ -295,4 +300,12 @@ signature block or letterhead; end with the closing paragraph.
             )
         except Exception as exc:
             raise _ai_error(exc)
-        return response.choices[0].message.content.strip()
+        content = response.choices[0].message.content.strip()
+        if db is not None:
+            prompt_tokens, completion_tokens = usage_from_response(response)
+            await usage_tracking.record_usage(
+                db, org_id=org_id, user_id=user_id, operation=f"supporting_document:{doc_type}",
+                model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                price_cents_charged=price_cents_charged, reference={"doc_type": doc_type},
+            )
+        return content

@@ -1804,3 +1804,110 @@ class FundingStrategyPlan(Base):
     generated_by  = Column(String(36), ForeignKey("users.id"), nullable=True)
     generated_at  = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ModelPricingConfig(Base):
+    """
+    Engine 27 — Administrator-Only Engineering Economics (Phase 3 §4.7).
+    Admin-editable $/1K-token input/output rate per LLM model, the basis
+    every AIUsageRecord.cogs_cents is computed from (see
+    engines/usage_tracking.py::estimate_cost_cents). One row per model
+    string (whatever `model=` a call site actually passes to
+    `client.chat.completions.create` — most call sites use
+    `settings.OPENAI_MODEL`, but `routers/extract.py`'s vision call and
+    `routers/suggest.py`'s field-alternatives call hardcode their own
+    model strings, so this is keyed by the literal model name, not a
+    single global rate).
+
+    Seeded with OpenAI's published rates at the time this shipped (Aug
+    2026): gpt-4o $2.50/$10.00 per 1M input/output tokens, gpt-4o-mini
+    $0.15/$0.60 per 1M. These are *administrator-editable* — OpenAI
+    revises pricing periodically and this table is the one place to
+    reflect a change without a code deploy, same "configurable, not
+    hardcoded" discipline as SERVICE_CATALOG_SEED's admin-editable prices
+    (engines/service_catalog_engine.py).
+    """
+    __tablename__ = "model_pricing_configs"
+
+    id                          = Column(String(36), primary_key=True, default=new_uuid)
+    model                       = Column(String(80), unique=True, nullable=False, index=True)
+    input_cost_cents_per_1k     = Column(Float, nullable=False)
+    output_cost_cents_per_1k    = Column(Float, nullable=False)
+    updated_at                  = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at                  = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AIUsageRecord(Base):
+    """
+    Engine 27 — Administrator-Only Engineering Economics (Phase 3 §4.7).
+    One row per LLM call across the whole platform — the COGS ledger,
+    parallel to (but independent of) AIServiceTransaction's revenue
+    ledger and CreditTransaction's flat-credit ledger. Written by
+    engines/usage_tracking.py::record_usage(), called from every live
+    `client.chat.completions.create()` call site after the response comes
+    back (never before — there's nothing to record until the call
+    actually completes and reports token usage).
+
+    Deliberately self-sufficient for margin math: `price_cents_charged`
+    is captured at write time from whatever the caller already knows was
+    charged for this specific call (the real service-catalog price for
+    the two `ServiceCatalogEngine.consume()`-gated operations; the flat
+    `GENERATION_COST` dollar-equivalent, in cents, for the older
+    `debit_or_402`-metered operations, or 0 for the free-tier/unmetered
+    ones) — rather than requiring the Engineering Economics dashboard to
+    join back against AIServiceTransaction or CreditTransaction (whose
+    `reason`/`reference` shapes differ per call site and would make that
+    join fragile). Revenue, cost, and margin are all readable from this
+    one table, grouped by `operation`.
+
+    `operation` is a stable label identifying *what* the call was for —
+    the real `service_key` for catalog-priced calls (e.g.
+    "grant_opportunity_analysis"), or a normalized "family:action" string
+    for everything else (e.g. "scope_of_work:methodology",
+    "award:extract_intelligence", "supporting_document:cover_letter"),
+    matching (but not required to equal) the `reason` strings
+    CreditTransaction already uses for the legacy metering path. This is
+    the dashboard's grouping key — see
+    engines/engineering_economics_engine.py.
+
+    `cogs_cents` is a float (not Integer, unlike every price_cents column
+    elsewhere in this codebase) because a single call can cost a small
+    fraction of a cent (e.g. 500 prompt tokens on gpt-4o-mini @ $0.15/1M
+    is $0.000075) — rounding per-row would understate COGS at scale even
+    though the aggregate dashboard rounds for display.
+    """
+    __tablename__ = "ai_usage_records"
+
+    id                    = Column(String(36), primary_key=True, default=new_uuid)
+    org_id                = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    user_id               = Column(String(36), ForeignKey("users.id"), nullable=True)
+    operation              = Column(String(120), nullable=False, index=True)
+    model                  = Column(String(80), nullable=False)
+    prompt_tokens           = Column(Integer, nullable=False, default=0)
+    completion_tokens       = Column(Integer, nullable=False, default=0)
+    cogs_cents              = Column(Float, nullable=False, default=0.0)
+    price_cents_charged     = Column(Integer, nullable=False, default=0)
+    reference               = Column(JSON, default=dict, nullable=True)
+    created_at               = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PlatformCostConfig(Base):
+    """
+    Engine 27 — Administrator-Only Engineering Economics (Phase 3 §4.7).
+    Small admin-editable key/value table for platform-wide cost line
+    items that aren't per-model token pricing and aren't yet metered
+    per-call — currently just the "Search API and external retrieval
+    cost" line the spec asks for. Grants.gov/SAM.gov (the only external
+    search/retrieval APIs this app calls) are free government APIs, so
+    there is no real metered cost to compute today; both keys seed to 0
+    and exist as an admin-editable placeholder in case a paid
+    search/retrieval API is added later (per explicit product decision —
+    show $0 rather than omitting the line, so the dashboard's shape
+    doesn't need to change when that day comes).
+    """
+    __tablename__ = "platform_cost_configs"
+
+    key         = Column(String(80), primary_key=True)
+    label       = Column(String(200), nullable=False)
+    value_cents = Column(Float, nullable=False, default=0.0)
+    updated_at  = Column(DateTime(timezone=True), onupdate=func.now())

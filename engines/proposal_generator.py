@@ -15,6 +15,7 @@ from fastapi import HTTPException
 
 from config import settings
 from engines.grant_templates import get_grant_type, get_generation_context
+from engines.usage_tracking import usage_from_response
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -824,11 +825,19 @@ IMPORTANT:
         # Extract [MISSING: ...] tags as compliance flags
         missing_flags = re.findall(r"\[MISSING:[^\]]+\]", content)
 
+        # Phase 3 §4.7 — Administrator-Only Engineering Economics. Same
+        # "_usage rides along in the return dict" convention as
+        # foa_parser.py::analyze_opportunity — the caller
+        # (routers/proposals.py::generate_section/generate_all_sections)
+        # pops it off and hands it to engines/usage_tracking.record_usage().
+        prompt_tokens, completion_tokens = usage_from_response(response)
+
         return {
             "content":       content,
             "word_count":    word_count,
             "page_estimate": round(page_estimate, 2),
             "missing_flags": missing_flags,
+            "_usage": {"model": settings.OPENAI_MODEL, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
         }
 
     async def regenerate_section(

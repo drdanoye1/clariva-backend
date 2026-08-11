@@ -13,10 +13,14 @@ from typing import List, Optional
 import openai
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from routers.auth import get_current_user
 from config import settings
+from database import get_db
 from models.db_models import User
+from engines import usage_tracking
+from engines.usage_tracking import usage_from_response
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
@@ -50,6 +54,7 @@ class SuggestResponse(BaseModel):
 @router.post("", response_model=SuggestResponse)
 async def suggest_field_alternatives(
     body: SuggestRequest,
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Return 3 AI-generated alternative framings for a proposal form field."""
@@ -101,6 +106,16 @@ Example output: ["option 1", "option 2", "option 3"]"""
             temperature=0.85,
             max_tokens=600,
         )
+        # Phase 3 §4.7 — Administrator-Only Engineering Economics. This
+        # endpoint is unmetered (free) — no credit debit here — so
+        # price_cents_charged stays 0; we still record COGS for margin math.
+        prompt_tokens, completion_tokens = usage_from_response(response)
+        await usage_tracking.record_usage(
+            db, org_id=None, user_id=current_user.id, operation="suggest:field_alternatives",
+            model="gpt-4o-mini", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            price_cents_charged=0, reference={"field": body.field},
+        )
+
         raw = response.choices[0].message.content.strip()
 
         # Strip markdown code fences if the model wrapped its output

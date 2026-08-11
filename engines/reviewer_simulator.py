@@ -11,8 +11,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import openai
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
+from engines import usage_tracking
+from engines.usage_tracking import usage_from_response
 from models.schemas import ReviewerSimulation, ReviewerType
 
 
@@ -258,6 +261,7 @@ class ReviewerSimulatorEngine:
         sections: List[Any],
         reviewer_type: ReviewerType = ReviewerType.GENERIC,
         company_profile: Optional[Dict] = None,
+        db: Optional[AsyncSession] = None, user_id: Optional[str] = None,
     ) -> ReviewerSimulation:
         """Simulate a reviewer evaluating the proposal with profile gap awareness."""
 
@@ -303,6 +307,17 @@ class ReviewerSimulatorEngine:
 
         content_str = response.choices[0].message.content or ""
         raw = self._parse_json(content_str)
+
+        # Phase 3 §4.7 — Administrator-Only Engineering Economics. This
+        # endpoint is unmetered (free) — no credit debit here — so
+        # price_cents_charged stays 0; we still record COGS for margin math.
+        if db is not None:
+            prompt_tokens, completion_tokens = usage_from_response(response)
+            await usage_tracking.record_usage(
+                db, org_id=None, user_id=user_id, operation="reviewer:simulate",
+                model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                price_cents_charged=0, reference={"proposal_id": proposal.id, "reviewer_type": reviewer_type.value},
+            )
 
         return ReviewerSimulation(
             proposal_id=proposal.id,

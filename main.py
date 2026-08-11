@@ -76,6 +76,18 @@ async def _seed_service_catalog() -> None:
         logger.info("Service catalog verified/seeded.")
 
 
+async def _seed_usage_tracking() -> None:
+    """Idempotently seed model pricing + platform cost-config defaults for
+    Administrator-Only Engineering Economics (Phase 3 §4.7). Same
+    idempotent-on-every-boot pattern as _seed_service_catalog() above."""
+    from database import AsyncSessionLocal
+    from engines import usage_tracking
+    async with AsyncSessionLocal() as db:
+        await usage_tracking.ensure_seeded(db)
+        await db.commit()
+        logger.info("Model pricing / cost config verified/seeded.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Clariva Intelligent Grant Writing Platform...")
@@ -83,6 +95,7 @@ async def lifespan(app: FastAPI):
     logger.info("Database tables verified.")
     await _seed_superadmin()
     await _seed_service_catalog()
+    await _seed_usage_tracking()
     yield
     logger.info("Shutting down.")
 

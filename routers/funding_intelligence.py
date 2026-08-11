@@ -267,11 +267,11 @@ async def generate_funding_strategy(
     why this is "current state," not a versioned history."""
     await _assert_permission(org_id, current_user.id, "purchase_ai_services", db)
     try:
-        await catalog_engine.consume(
+        txn = await catalog_engine.consume(
             db, org_id, current_user.id, "funding_strategy_intelligence",
             reference={"org_id": org_id},
         )
     except InsufficientCreditsError as exc:
         raise HTTPException(status_code=402, detail=str(exc))
-    plan = await strategy_engine.generate_plan(db, org_id, current_user.id)
+    plan = await strategy_engine.generate_plan(db, org_id, current_user.id, price_cents_charged=txn.price_cents)
     return FundingStrategyPlanOut(**plan)

@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from config import settings
 from database import get_db
 from models.db_models import Proposal, ProposalSection, ProposalStatusEvent, FOARecord, OrgContextDB, User, new_uuid
 from engines.company_profile import get_org_context
@@ -21,6 +22,7 @@ from routers.auth import get_current_user
 from engines.proposal_generator import ProposalGeneratorEngine
 from engines.workflow_engine import WorkflowEngine
 from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
+from engines import usage_tracking
 from routers.organizations import _assert_member
 from audit import log_action
 
@@ -323,6 +325,16 @@ async def generate_section(
     section.word_count       = generated["word_count"]
     section.page_estimate    = generated["page_estimate"]
     section.compliance_flags = generated.get("missing_flags", [])
+
+    # Phase 3 §4.7 — Administrator-Only Engineering Economics.
+    usage = generated.get("_usage") or {}
+    await usage_tracking.record_usage(
+        db, operation="proposal:generate_section", model=usage.get("model", settings.OPENAI_MODEL),
+        prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0),
+        org_id=org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100) if org_id else 0,
+        reference={"proposal_id": proposal_id, "section_id": body.section_id},
+    )
     await db.flush()
 
     return SectionContent(
@@ -390,6 +402,16 @@ async def generate_all_sections(
             section.word_count       = result["word_count"]
             section.page_estimate    = result["page_estimate"]
             section.compliance_flags = result.get("missing_flags", [])
+
+            # Phase 3 §4.7 — Administrator-Only Engineering Economics.
+            usage = result.get("_usage") or {}
+            await usage_tracking.record_usage(
+                db, operation="proposal:generate_section", model=usage.get("model", settings.OPENAI_MODEL),
+                prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0),
+                org_id=org_id, user_id=current_user.id,
+                price_cents_charged=int(GENERATION_COST * 100) if org_id else 0,
+                reference={"proposal_id": proposal_id, "section_id": section.section_id},
+            )
 
     proposal.status = "in_review"
     await db.flush()

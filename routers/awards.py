@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import storage
+from config import settings
 from database import get_db
 from models.db_models import Award, Document, OrgMembership, StoredFile, User, new_uuid
 from models.schemas import (
@@ -50,6 +51,7 @@ from engines.award_engine import AwardEngine, _naive
 from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
 from engines.document_library_engine import DocumentLibraryEngine
 from engines.scope_of_work_engine import ScopeOfWorkEngine
+from engines import usage_tracking
 
 router = APIRouter()
 engine = AwardEngine()
@@ -279,12 +281,23 @@ async def extract_award_intelligence(
     await _meter(award.org_id, current_user.id, db, reason=f"award:extract_intelligence:{award_id}")
 
     scope_result = await engine.extract_scope_and_award_fields(access.proposal, document_text)
+    # Phase 3 §4.7 — Administrator-Only Engineering Economics. Same
+    # "_usage rides along in the return dict" convention as
+    # foa_parser.py::analyze_opportunity.
+    usage = scope_result.pop("_usage", None) or {}
+    await usage_tracking.record_usage(
+        db, operation="award:extract_intelligence", model=usage.get("model", settings.OPENAI_MODEL),
+        prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0),
+        org_id=award.org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100) if award.org_id else 0,
+        reference={"award_id": award_id},
+    )
     # Budget extraction is best-effort and separate from scope/award fields
     # above — a short award notice letter often has nothing budget-shaped in
     # it at all, and that shouldn't block the (usually more reliable)
     # award value/dates/work-plan extraction from returning.
     try:
-        budget_result = await _extract_budget_from_text(document_text)
+        budget_result = await _extract_budget_from_text(document_text, db=db, org_id=award.org_id, user_id=current_user.id)
     except HTTPException:
         budget_result = None
 
@@ -688,7 +701,11 @@ async def generate_report_narrative(
     award, access = await _get_award_and_access(award_id, current_user, db, require_edit=False)
     await _meter(access.org_id, current_user.id, db, reason="award_report_narrative")
     report = await engine.generate_report(db, award_id, report_type, _to_award_out(award, proposal_title=access.proposal.title))
-    narrative = await engine.generate_report_narrative(report, access.proposal, payload.additional_context)
+    narrative = await engine.generate_report_narrative(
+        report, access.proposal, payload.additional_context,
+        db=db, org_id=access.org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100) if access.org_id else 0,
+    )
     await db.commit()
     return {"narrative": narrative}
 
@@ -712,6 +729,8 @@ async def create_report_draft(
     report = await engine.create_report_draft(
         db, award_id, payload.report_type, payload.additional_context,
         _to_award_out(award, proposal_title=access.proposal.title), requested_by=current_user.id,
+        org_id=access.org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100) if access.org_id else 0,
     )
     await db.commit()
     await db.refresh(report)

@@ -20,6 +20,8 @@ from config import settings
 from database import get_db
 from models.db_models import User
 from routers.auth import get_current_user
+from engines import usage_tracking
+from engines.usage_tracking import usage_from_response
 
 router = APIRouter()
 
@@ -215,7 +217,10 @@ def _ai_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail="An unexpected error occurred. Please try again or contact support.")
 
 
-async def _call_gpt_text(text: str, source_hint: str, doc_type: Optional[str] = None) -> dict:
+async def _call_gpt_text(
+    text: str, source_hint: str, doc_type: Optional[str] = None,
+    db: Optional[AsyncSession] = None, user_id: Optional[str] = None,
+) -> dict:
     """Send extracted text to GPT-4o for structured extraction."""
     client = _get_client()
     # Truncate to ~15k chars to stay within token limits
@@ -234,6 +239,16 @@ async def _call_gpt_text(text: str, source_hint: str, doc_type: Optional[str] = 
         )
     except Exception as exc:
         raise _ai_error(exc)
+    # Phase 3 §4.7 — Administrator-Only Engineering Economics. This
+    # extraction flow is unmetered (free) — see module docstring — so
+    # price_cents_charged stays 0; we still record COGS for margin math.
+    if db is not None:
+        prompt_tokens, completion_tokens = usage_from_response(response)
+        await usage_tracking.record_usage(
+            db, org_id=None, user_id=user_id, operation="extract:profile_text",
+            model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            price_cents_charged=0, reference={"source": source_hint},
+        )
     raw = response.choices[0].message.content.strip()
     # Strip markdown fences if present
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -244,7 +259,10 @@ async def _call_gpt_text(text: str, source_hint: str, doc_type: Optional[str] = 
         raise HTTPException(status_code=500, detail="The AI returned an unexpected response. Please try again.")
 
 
-async def _call_gpt_vision(image_bytes: bytes, content_type: str, source_hint: str, doc_type: Optional[str] = None) -> dict:
+async def _call_gpt_vision(
+    image_bytes: bytes, content_type: str, source_hint: str, doc_type: Optional[str] = None,
+    db: Optional[AsyncSession] = None, user_id: Optional[str] = None,
+) -> dict:
     """Send image to GPT-4o vision for structured extraction."""
     client = _get_client()
     b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -269,6 +287,13 @@ async def _call_gpt_vision(image_bytes: bytes, content_type: str, source_hint: s
         )
     except Exception as exc:
         raise _ai_error(exc)
+    if db is not None:
+        prompt_tokens, completion_tokens = usage_from_response(response)
+        await usage_tracking.record_usage(
+            db, org_id=None, user_id=user_id, operation="extract:profile_vision",
+            model="gpt-4o", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            price_cents_charged=0, reference={"source": source_hint},
+        )
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
@@ -306,34 +331,34 @@ async def extract_profile(
         fname_lower = filename.lower()
 
         if _is_image(content_type, filename):
-            extracted = await _call_gpt_vision(content, content_type, filename, doc_type)
+            extracted = await _call_gpt_vision(content, content_type, filename, doc_type, db=db, user_id=current_user.id)
 
         elif fname_lower.endswith(".pdf") or content_type == "application/pdf":
             text = _extract_text_from_pdf(content)
             if not text.strip():
                 raise HTTPException(status_code=422, detail="PDF appears to be scanned/image-only. Try uploading as image instead.")
-            extracted = await _call_gpt_text(text, filename, doc_type)
+            extracted = await _call_gpt_text(text, filename, doc_type, db=db, user_id=current_user.id)
 
         elif fname_lower.endswith((".docx", ".doc")) or "word" in content_type:
             text = _extract_text_from_docx(content)
-            extracted = await _call_gpt_text(text, filename, doc_type)
+            extracted = await _call_gpt_text(text, filename, doc_type, db=db, user_id=current_user.id)
 
         elif fname_lower.endswith(".txt") or content_type.startswith("text/"):
             text = content.decode("utf-8", errors="replace")
-            extracted = await _call_gpt_text(text, filename, doc_type)
+            extracted = await _call_gpt_text(text, filename, doc_type, db=db, user_id=current_user.id)
 
         else:
             # Try as text, fall back gracefully
             try:
                 text = content.decode("utf-8", errors="replace")
-                extracted = await _call_gpt_text(text, filename, doc_type)
+                extracted = await _call_gpt_text(text, filename, doc_type, db=db, user_id=current_user.id)
             except Exception:
                 raise HTTPException(
                     status_code=415,
                     detail=f"Unsupported file type: {content_type or fname_lower}. Use PDF, DOCX, image, or TXT."
                 )
     else:
-        extracted = await _call_gpt_text(pasted_text, "pasted text", doc_type)
+        extracted = await _call_gpt_text(pasted_text, "pasted text", doc_type, db=db, user_id=current_user.id)
 
     # Clean up: remove null values but keep empty arrays
     cleaned = {k: v for k, v in extracted.items() if v is not None or isinstance(v, list)}

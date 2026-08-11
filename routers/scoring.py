@@ -43,7 +43,7 @@ async def score_proposal(
         raise HTTPException(status_code=400, detail="Generate proposal content before scoring")
 
     try:
-        scoring = await scorer.score(proposal, sections)
+        scoring = await scorer.score(proposal, sections, db=db, user_id=current_user.id)
     except Exception as exc:
         print(f"[scoring] Engine error: {exc}")
         raise HTTPException(status_code=500, detail=f"Scoring engine error: {str(exc)}")

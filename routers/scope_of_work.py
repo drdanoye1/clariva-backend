@@ -30,11 +30,13 @@ from models.schemas import (
     TaskCreate, TaskOut, TaskUpdate, WorkBreakdownGenerateOut,
     WorkBreakdownGenerateRequest, WorkPackageCreate, WorkPackageOut, WorkPackageUpdate,
 )
+from config import settings
 from routers.auth import get_current_user
 from routers.proposals import _get_proposal_or_404, _load_company_profile
 from routers.organizations import _assert_member
 from engines.scope_of_work_engine import ScopeOfWorkEngine
 from engines.credit_engine import CreditEngine, GENERATION_COST, debit_or_402
+from engines import usage_tracking
 
 router = APIRouter()
 engine = ScopeOfWorkEngine()
@@ -242,6 +244,8 @@ async def generate_methodology(
     company_profile = await _load_company_profile(current_user.id, db)
     narrative = await engine.generate_methodology_narrative(
         proposal, pk, company_profile, additional_context=body.additional_context,
+        db=db, org_id=org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100) if org_id else 0,
     )
     sow = await engine.update_scope_of_work(db, proposal_id, {"methodology_narrative": narrative})
     return MethodologyGenerateOut(methodology_narrative=sow.methodology_narrative)
@@ -258,6 +262,8 @@ async def generate_evaluation_plan(
     company_profile = await _load_company_profile(current_user.id, db)
     plan = await engine.generate_evaluation_plan(
         proposal, pk, company_profile, additional_context=body.additional_context,
+        db=db, org_id=org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100) if org_id else 0,
     )
     pk = await engine.update_project_knowledge(db, proposal_id, {"evaluation_plan": plan})
     return EvaluationPlanGenerateOut(evaluation_plan=pk.evaluation_plan)
@@ -280,6 +286,15 @@ async def generate_work_breakdown(
     company_profile = await _load_company_profile(current_user.id, db)
     breakdown = await engine.generate_work_breakdown(
         proposal, pk, sow, company_profile, additional_context=body.additional_context,
+    )
+    # Phase 3 §4.7 — Administrator-Only Engineering Economics.
+    usage = breakdown.pop("_usage", None) or {}
+    await usage_tracking.record_usage(
+        db, operation="scope_of_work:work_breakdown", model=usage.get("model", settings.OPENAI_MODEL),
+        prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0),
+        org_id=org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100) if org_id else 0,
+        reference={"proposal_id": proposal_id},
     )
     created = await engine.apply_generated_work_breakdown(db, proposal_id, breakdown)
     return WorkBreakdownGenerateOut(
@@ -306,7 +321,10 @@ async def derive_from_proposal(
     proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
     await _meter(org_id, current_user.id, db, reason=f"scope_of_work:derive_from_proposal:{proposal_id}")
     pk = await engine.get_or_create_project_knowledge(db, proposal_id)
-    draft = await engine.derive_project_knowledge_from_proposal(db, proposal, pk)
+    draft = await engine.derive_project_knowledge_from_proposal(
+        db, proposal, pk, org_id=org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100) if org_id else 0,
+    )
     return DeriveFromProposalOut(**draft)
 
 
@@ -325,6 +343,8 @@ async def suggest_field(
     suggestion = await engine.suggest_project_knowledge_field(
         proposal, pk, company_profile, body.field,
         current_value=body.current_value, additional_context=body.additional_context,
+        db=db, org_id=org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100) if org_id else 0,
     )
     return FieldSuggestOut(field=body.field, suggestion=suggestion)
 

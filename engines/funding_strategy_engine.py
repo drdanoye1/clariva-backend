@@ -56,6 +56,8 @@ from config import settings
 from engines.company_profile import get_org_context
 from engines.historical_performance_engine import HistoricalFundingPerformanceEngine
 from engines.portfolio_recommendation_engine import PortfolioRecommendationEngine
+from engines import usage_tracking
+from engines.usage_tracking import usage_from_response
 from models.db_models import FundingStrategyPlan
 
 _log = logging.getLogger(__name__)
@@ -232,13 +234,22 @@ class FundingStrategyEngine:
 
     # ── Public API ───────────────────────────────────────────────────────
 
-    async def generate_plan(self, db: AsyncSession, org_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    async def generate_plan(
+        self, db: AsyncSession, org_id: str, user_id: Optional[str] = None,
+        price_cents_charged: int = 0,
+    ) -> Dict[str, Any]:
         """Synthesizes a fresh strategic plan from the org's current
         pipeline, historical performance, and profile, then upserts it as
         this org's FundingStrategyPlan row. Raises the shared _ai_error()
         HTTPException on any OpenAI failure, same pattern as
         scope_of_work_engine.py / supporting_documents_engine.py — the
-        caller (router) doesn't need its own try/except for that."""
+        caller (router) doesn't need its own try/except for that.
+
+        `price_cents_charged` — Phase 3 §4.7 — is whatever the router
+        already charged via ServiceCatalogEngine.consume() before calling
+        this, passed through purely so the AIUsageRecord written below
+        carries real revenue alongside real COGS without this engine
+        needing to know anything about pricing itself."""
         performance = await self.performance_engine.get_performance(db, org_id=org_id)
         recommendations = await self.portfolio_engine.get_recommendations(db, org_id=org_id, limit=15)
         profile = await get_org_context(db, org_id=org_id)
@@ -272,6 +283,14 @@ class FundingStrategyEngine:
         raw_json = response.choices[0].message.content or ""
         parsed = self._parse_json(raw_json)
         plan = self._normalize_plan(parsed)
+
+        # Phase 3 §4.7 — Administrator-Only Engineering Economics.
+        prompt_tokens, completion_tokens = usage_from_response(response)
+        await usage_tracking.record_usage(
+            db, operation="funding_strategy_intelligence", model=settings.OPENAI_MODEL,
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            org_id=org_id, user_id=user_id, price_cents_charged=price_cents_charged,
+        )
 
         row = await self._upsert_plan(db, org_id, user_id, plan)
         return self._to_out(row)

@@ -68,7 +68,8 @@ async def simulate_review(
         company_profile = await _load_company_profile(current_user.id, db)
 
         simulation = await simulator.simulate(
-            proposal, sections, reviewer_type, company_profile=company_profile
+            proposal, sections, reviewer_type, company_profile=company_profile,
+            db=db, user_id=current_user.id,
         )
 
         try:
