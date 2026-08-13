@@ -30,7 +30,8 @@ from sqlalchemy import select
 import routers.payments as payments_router
 from database import AsyncSessionLocal
 from engines.credit_engine import CreditEngine
-from models.db_models import Organization
+from engines.partner_engine import PartnerEngine
+from models.db_models import CommissionEntry, Organization
 from scripts import downgrade_expired_plans
 
 
@@ -515,3 +516,127 @@ def test_downgrade_expired_plans_resets_purchased_seats(client, registered_user)
     org = _get_org(org_id)
     assert org.plan == "free"
     assert org.purchased_seats == 0
+
+
+# ── Partner Center (Engine 28) — webhook → commission integration ──────────
+#
+# Confirms the hook added to routers/payments.py's `plan_subscription`
+# branch (see PartnerEngine.record_commission's docstring) actually fires
+# end-to-end through the real HTTP webhook: an org attributed to an
+# approved partner gets a CommissionEntry on a plan_subscription webhook;
+# an unattributed org (the common case) gets none, and the webhook's own
+# response/plan-activation behavior is unaffected either way.
+
+def _commission_entries_for_org(org_id: str) -> list[CommissionEntry]:
+    async def _body():
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(CommissionEntry).where(CommissionEntry.organization_id == org_id))
+            return list(result.scalars().all())
+    return _run(_body())
+
+
+def _active_month_1_12_commission_rate() -> float:
+    # The commission rule is a single shared, mutable, versioned row (see
+    # PartnerEngine.get_active_commission_rule) — other test modules
+    # (test_partners_api.py's commission-rule update test, in particular)
+    # legitimately change it within the same shared test-session database
+    # (see conftest.py: one SQLite file for the whole pytest run, not a
+    # fresh DB per test). Asserting against a hardcoded 0.20 here would
+    # make this test's pass/fail depend on file collection order across
+    # the whole suite — same class of bug as the AIServiceTransaction
+    # count fix elsewhere in this file's history. Read whatever rate is
+    # actually active instead.
+    async def _body():
+        async with AsyncSessionLocal() as db:
+            rule = await PartnerEngine().get_active_commission_rule(db)
+            return rule.months_1_12_rate
+    return _run(_body())
+
+
+def _approved_partner_referral_code(label: str) -> str:
+    async def _body():
+        async with AsyncSessionLocal() as db:
+            engine = PartnerEngine()
+            partner = await engine.apply(
+                db, name=f"Integration Partner {label}", contact_name="Pat Partner",
+                contact_email=f"partner-{uuid.uuid4().hex[:8]}@example.com",
+            )
+            await db.commit()
+            partner = await engine.approve_partner(db, partner.id, actor_id="test-actor")
+            await db.commit()
+            return partner.referral_code
+    return _run(_body())
+
+
+def test_webhook_plan_subscription_creates_commission_entry_for_attributed_org(client, registered_user, monkeypatch):
+    referral_code = _approved_partner_referral_code("A")
+    org_resp = client.post(
+        "/api/v1/organizations/",
+        json={"name": f"Attributed Org {uuid.uuid4().hex[:8]}", "referral_code": referral_code},
+        headers=registered_user["headers"],
+    )
+    assert org_resp.status_code == 201, org_resp.text
+    org_id = org_resp.json()["id"]
+
+    async def fake_fetch(base_url, access_token, order_id):
+        return {"kind": "plan_subscription", "org_id": org_id, "plan_id": "team", "initiated_by_user_id": registered_user["user_id"]}
+    monkeypatch.setattr(payments_router, "_fetch_order_metadata", fake_fetch)
+    monkeypatch.setattr(payments_router, "_square_config", lambda: ("https://fake", "fake-token"))
+
+    resp = _post_webhook(client, _payment_updated_event(order_id="order-partner-commission"))
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "applied"
+    assert _get_org(org_id).plan == "team"  # plan activation is unaffected by the commission hook
+
+    entries = _commission_entries_for_org(org_id)
+    assert len(entries) == 1
+    entry = entries[0]
+    expected_rate = _active_month_1_12_commission_rate()  # month 1 of the 1-12 cohort bucket
+    assert entry.qualifying_revenue_cents == payments_router.PLANS["team"]["amount"]
+    assert entry.commission_rate == expected_rate
+    assert entry.commission_amount_cents == round(payments_router.PLANS["team"]["amount"] * expected_rate)
+    assert entry.status == "pending"
+
+
+def test_webhook_plan_subscription_creates_no_commission_entry_for_unattributed_org(client, registered_user, monkeypatch):
+    org_id = _create_org(client, registered_user["headers"])  # no referral_code — the common case
+
+    async def fake_fetch(base_url, access_token, order_id):
+        return {"kind": "plan_subscription", "org_id": org_id, "plan_id": "team", "initiated_by_user_id": registered_user["user_id"]}
+    monkeypatch.setattr(payments_router, "_fetch_order_metadata", fake_fetch)
+    monkeypatch.setattr(payments_router, "_square_config", lambda: ("https://fake", "fake-token"))
+
+    resp = _post_webhook(client, _payment_updated_event(order_id="order-no-attribution"))
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "applied"
+    assert _get_org(org_id).plan == "team"
+
+    assert _commission_entries_for_org(org_id) == []
+
+
+def test_webhook_plan_subscription_survives_partner_engine_failure(client, registered_user, monkeypatch):
+    # The webhook's plan_subscription branch wraps the commission call in a
+    # bare try/except specifically so a partner-engine bug can never block
+    # a paying customer's plan activation (see routers/payments.py's inline
+    # comment at the hook site). Simulate that failure directly.
+    referral_code = _approved_partner_referral_code("B")
+    org_resp = client.post(
+        "/api/v1/organizations/",
+        json={"name": f"Attributed Org {uuid.uuid4().hex[:8]}", "referral_code": referral_code},
+        headers=registered_user["headers"],
+    )
+    org_id = org_resp.json()["id"]
+
+    async def fake_fetch(base_url, access_token, order_id):
+        return {"kind": "plan_subscription", "org_id": org_id, "plan_id": "team", "initiated_by_user_id": registered_user["user_id"]}
+    monkeypatch.setattr(payments_router, "_fetch_order_metadata", fake_fetch)
+    monkeypatch.setattr(payments_router, "_square_config", lambda: ("https://fake", "fake-token"))
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("simulated partner engine failure")
+    monkeypatch.setattr(payments_router.partner_engine, "record_commission", _boom)
+
+    resp = _post_webhook(client, _payment_updated_event(order_id="order-partner-engine-boom"))
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "applied"
+    assert _get_org(org_id).plan == "team"  # plan activation still applied despite the exception

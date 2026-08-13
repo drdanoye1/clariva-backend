@@ -22,6 +22,7 @@ from routers import suggest, credits, scope_of_work, collaboration, documents_li
 from routers import connectors, api_keys, public_api, marketplace, invitations
 from routers import portfolio
 from routers import service_catalog
+from routers import partners
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -145,6 +146,7 @@ app.include_router(marketplace.router,   prefix="/api/v1/marketplace",   tags=["
 app.include_router(invitations.router,   prefix="/api/v1/invitations",   tags=["Invitations"])
 app.include_router(portfolio.router,     prefix="/api/v1/portfolio",     tags=["Portfolio Dashboard"])
 app.include_router(service_catalog.router, prefix="/api/v1/service-catalog", tags=["AI Services Marketplace"])
+app.include_router(partners.router,      prefix="/api/v1/partners",      tags=["Partner Center"])
 
 
 @app.get("/health", tags=["Health"])

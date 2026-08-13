@@ -50,6 +50,7 @@ from audit import log_action
 from config import settings
 from database import get_db
 from engines.credit_engine import CreditEngine
+from engines.partner_engine import PartnerEngine
 from models.db_models import Organization, SquareWebhookEvent, User, new_uuid
 from routers.auth import get_current_user
 from routers.organizations import _assert_permission
@@ -58,6 +59,7 @@ _log = logging.getLogger(__name__)
 
 router = APIRouter()
 credit_engine = CreditEngine()
+partner_engine = PartnerEngine()
 
 # ── Plan catalogue ────────────────────────────────────────────────────────────
 # Amount in cents (USD). Free tier has no checkout needed (5 grant-opportunity
@@ -620,6 +622,23 @@ async def square_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         org.plan = tier
         org.plan_expires_at = datetime.now(timezone.utc) + timedelta(days=interval_days)
         await db.flush()
+
+        # Partner Center (Engine 28) commission calc — hooked in right here
+        # deliberately: this `plan_subscription` kind is the ONLY webhook
+        # kind that represents "qualifying net base subscription revenue"
+        # under the Partner Center's Version 2 commission rules (fund_topup
+        # = AI Credits, seat_purchase = seats — both explicitly excluded
+        # from commission). Returns None (no-op) for the vast majority of
+        # orgs that have no partner attribution; never raises, so a partner-
+        # engine bug can't block a customer's plan activation. Commits
+        # atomically with the plan activation below (same transaction).
+        try:
+            await partner_engine.record_commission(
+                db, organization_id=org_id, plan_id=plan_id,
+                qualifying_revenue_cents=PLANS[plan_id]["amount"], payment_reference=order_id,
+            )
+        except Exception:
+            _log.exception("Partner commission calc failed for org %s / order %s — plan activation still applies.", org_id, order_id)
 
         if actor_id:
             await log_action(

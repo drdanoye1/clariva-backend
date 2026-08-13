@@ -1996,3 +1996,260 @@ class SquareWebhookEvent(Base):
     square_event_id  = Column(String(120), unique=True, nullable=False, index=True)
     event_type       = Column(String(60), nullable=True)   # informational only, e.g. "payment.updated"
     processed_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Partner Center (Engine 28) — Channel Partner Program backend, Phase 1 MVP.
+#
+# Scoped down from "Clariva Partner Center — Product Definition, UX/UI &
+# Engineering Specification, Version 2.0" (Aug 2026) §6's full 16-entity
+# data model, per explicit user decision to build "Backend + Admin Console
+# first" and defer the authenticated Partner Portal frontend. Simplifications
+# vs. the full spec (see docs/ARCHITECTURE.md's Partner Center MVP addendum
+# for the complete list):
+#   - No PartnerUser/RBAC-role entity — admin-side endpoints reuse the
+#     existing platform-wide User.is_superadmin flag (require_superadmin),
+#     matching every other admin-only endpoint in this codebase. Version 2's
+#     six-role admin/partner RBAC matrix is not implemented.
+#   - No separate Referral entity for click/funnel analytics — the referral
+#     code lives directly on Partner (Partner.referral_code); tracking
+#     clicks/signups/conversions is a Partner Portal feature and is deferred
+#     with the rest of that frontend.
+#   - No Resource/Notification entities — those are Partner Portal features.
+#   - AuditEvent is NOT a new table — every mutation below logs through the
+#     existing shared audit.py::log_action() helper, same as the rest of
+#     the app.
+#   - CommissionAdjustment is not a separate table — a reversal is just
+#     another CommissionEntry row with is_adjustment=True and
+#     adjusts_entry_id pointing at the entry being reversed, keeping the
+#     ledger append-only without a second table to keep in sync.
+# ---------------------------------------------------------------------------
+
+class Partner(Base):
+    """
+    A Channel Partner applicant/account. Created unauthenticated via the
+    public "Apply to Become a Partner" form on frontend/src/pages/partners.tsx
+    (POST /partners/apply) — applicants do not need an existing Clariva
+    User account to apply. A superadmin (require_superadmin; see rbac.py's
+    "no internal-staff role" note in ARCHITECTURE.md) reviews the
+    application and approves or rejects it; approval is the only thing that
+    generates `referral_code`, so an unapproved partner has no live referral
+    link and can attribute no customers.
+    """
+    __tablename__ = "partners"
+
+    id                  = Column(String(36), primary_key=True, default=new_uuid)
+    name                = Column(String(255), nullable=False)          # organization/firm name
+    contact_name        = Column(String(255), nullable=False)
+    contact_email       = Column(String(255), nullable=False, index=True)
+    # Free-form self-identification from the apply form's "How do you plan
+    # to work with Clariva?" dropdown (referral / reselling / service_
+    # delivery / institutional / not_sure) — informational only; Version 2's
+    # commission schedule is uniform regardless of this value (see
+    # engines/partner_engine.py's COMMISSION rate lookup, which never
+    # branches on partner_type).
+    partner_type        = Column(String(40), nullable=True)
+    notes               = Column(Text, nullable=True)                  # applicant's free-text message
+
+    status              = Column(String(20), nullable=False, default="pending")   # pending | approved | rejected | suspended
+    referral_code       = Column(String(40), unique=True, nullable=True, index=True)  # set on approval only
+
+    # Version 2 §3.7's Registered/Silver/Gold/Platinum status levels affect
+    # benefits/enablement only, never the standard commission schedule (see
+    # partners.tsx's own FAQ copy) — stored here so the Admin Console can
+    # display/set it, but nothing in partner_engine.py reads this to alter
+    # a commission calculation.
+    program_status      = Column(String(20), nullable=False, default="registered")  # registered | silver | gold | platinum
+
+    reviewed_by_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    reviewed_at         = Column(DateTime(timezone=True), nullable=True)
+    rejection_reason    = Column(Text, nullable=True)
+
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at          = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class DealRegistration(Base):
+    """
+    Version 2 §3.3 "Opportunities & Deal Registration" — a partner (today:
+    Clariva staff on a partner's behalf, since the Partner Portal isn't
+    built yet — see Admin Console's deal-registration-creation endpoint)
+    registers a prospective customer before it closes, so attribution is
+    protected once approved. `proposed_plan == "enterprise"` always routes
+    to admin review per spec ("Large and Enterprise opportunities should
+    route to administrator review") — in this codebase every registration
+    already requires admin approval (status starts "pending_review"
+    regardless of plan), so Enterprise gets no special-cased gate; what IS
+    Enterprise-specific is `approved_commissionable_value_cents`, which a
+    superadmin sets on approval since Enterprise has no fixed self-serve
+    price in payments.py::PLANS (contact-sales only — see the Commercial
+    Architecture Phase 1 addendum).
+    """
+    __tablename__ = "partner_deal_registrations"
+
+    id                                    = Column(String(36), primary_key=True, default=new_uuid)
+    partner_id                            = Column(String(36), ForeignKey("partners.id"), nullable=False, index=True)
+
+    organization_name                     = Column(String(255), nullable=False)
+    contact_name                          = Column(String(255), nullable=True)
+    contact_email                         = Column(String(255), nullable=True)
+    domain                                = Column(String(255), nullable=True, index=True)  # for duplicate-claim detection
+
+    proposed_plan                         = Column(String(40), nullable=True)   # matches TIER_DISPLAY_NAMES keys, or "enterprise"
+    estimated_value_cents                 = Column(Integer, nullable=True)
+    # Only meaningful for proposed_plan == "enterprise" — the qualifying
+    # subscription value a superadmin approves for commission-calculation
+    # purposes, since Enterprise pricing is a custom quote, not a PLANS
+    # dict lookup. Ignored for every other plan tier.
+    approved_commissionable_value_cents   = Column(Integer, nullable=True)
+
+    stage                                 = Column(String(20), nullable=False, default="lead")  # lead|qualified|demo|proposal|won|lost
+    status                                = Column(String(20), nullable=False, default="pending_review")  # pending_review|approved|rejected|expired
+
+    # Set on approval: now() + DEAL_PROTECTION_DAYS (engines/partner_engine.py).
+    # Version 2 doesn't specify an exact day count (unlike the superseded v1
+    # doc's 90-180 days) — DEAL_PROTECTION_DAYS is a single named constant so
+    # it's a one-line change, not a migration, if Program Settings needs to
+    # make this admin-configurable later.
+    protection_expires_at                 = Column(DateTime(timezone=True), nullable=True)
+
+    notes                                  = Column(Text, nullable=True)
+    reviewed_by_user_id                    = Column(String(36), ForeignKey("users.id"), nullable=True)
+    reviewed_at                            = Column(DateTime(timezone=True), nullable=True)
+    rejection_reason                       = Column(Text, nullable=True)
+
+    created_at                             = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at                             = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class CustomerAttribution(Base):
+    """
+    The "Customer -> Attribution" link in Version 2 §6's canonical chain
+    (Customer -> Attribution -> Subscription -> Payment -> Commission ->
+    Payout). One row per Organization, at most — first attribution wins
+    (enforced by the unique index on organization_id), matching Version 2
+    §15's "Partner-Sourced / Partner-Influenced / Clariva-Sourced / Partner-
+    Serviced" distinction: whichever referral code (if any) was present
+    when the org was created determines this permanently, since re-
+    attributing an org after the fact would let two partners dispute the
+    same account. `attributed_at` is the clock start for the 20%/15%/10%/0%
+    monthly cohort schedule in engines/partner_engine.py — set once, never
+    reset by a plan upgrade (Version 2's explicit "upgrade treatment" rule).
+    """
+    __tablename__ = "partner_customer_attributions"
+    __table_args__ = (UniqueConstraint("organization_id", name="uq_attribution_per_org"),)
+
+    id                    = Column(String(36), primary_key=True, default=new_uuid)
+    organization_id       = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    partner_id            = Column(String(36), ForeignKey("partners.id"), nullable=False, index=True)
+    deal_registration_id  = Column(String(36), ForeignKey("partner_deal_registrations.id"), nullable=True)
+
+    # partner_sourced | partner_influenced | clariva_sourced | partner_serviced
+    # (Version 2 §15). Rows in this table only ever get created via a
+    # referral-code capture at org-creation time (routers/organizations.py),
+    # so every row this app writes today is "partner_sourced" — the other
+    # three values exist in the schema for a superadmin to hand-correct via
+    # a future Attribution-conflict-resolution tool (Version 2 §4 "Attribution"
+    # admin module), which is not built in this MVP.
+    attribution_type     = Column(String(24), nullable=False, default="partner_sourced")
+
+    attributed_at         = Column(DateTime(timezone=True), server_default=func.now())
+    created_at             = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CommissionRule(Base):
+    """
+    Version 2 §2's standard recurring-commission schedule and §4's
+    "Commission Engine ... Configure standard schedule ... without hard-
+    coding" requirement. Only one row should have is_active=True at a time;
+    changing the schedule deactivates the old row and inserts a new one
+    (append-only, matching this app's "corrections via adjustment, not
+    destructive edits" convention — see CommissionEntry below) rather than
+    UPDATE-ing rates in place, so historical commission entries always
+    remain traceable to the rule version that produced them even after the
+    schedule changes.
+    """
+    __tablename__ = "partner_commission_rules"
+
+    id                   = Column(String(36), primary_key=True, default=new_uuid)
+    months_1_12_rate     = Column(Float, nullable=False, default=0.20)
+    months_13_24_rate    = Column(Float, nullable=False, default=0.15)
+    months_25_36_rate    = Column(Float, nullable=False, default=0.10)
+    month_37_plus_rate   = Column(Float, nullable=False, default=0.0)
+    is_active            = Column(Boolean, nullable=False, default=True)
+
+    created_by_user_id   = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CommissionEntry(Base):
+    """
+    The commission ledger — Version 2 §3.4 "Commissions ... a transparent
+    financial ledger with Pending -> Approved -> Available -> Paid, plus
+    Reversed when required. Every line must include a View Calculation
+    action showing qualifying subscription payment, exclusions/adjustments,
+    cohort, rate and resulting commission."
+
+    One row is created per qualifying Square `plan_subscription` webhook
+    event for an org that has a CustomerAttribution (see routers/payments.py's
+    webhook handler, and engines/partner_engine.py::record_commission()) —
+    AI usage/credit top-ups (`fund_topup`) and seat purchases (`seat_purchase`)
+    never reach this path, since only the `plan_subscription` webhook kind
+    represents "qualifying net base subscription revenue" under Version 2 §2;
+    this lines up naturally with this app's pre-existing three-way webhook
+    `kind` dispatch rather than requiring new exclusion logic. `commission_
+    rate`, `months_since_attribution`, and `qualifying_revenue_cents` are all
+    snapshotted at creation time (not recomputed later) so a later
+    CommissionRule change never silently rewrites a historical entry's math.
+    """
+    __tablename__ = "partner_commission_entries"
+
+    id                          = Column(String(36), primary_key=True, default=new_uuid)
+    partner_id                  = Column(String(36), ForeignKey("partners.id"), nullable=False, index=True)
+    organization_id             = Column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    attribution_id              = Column(String(36), ForeignKey("partner_customer_attributions.id"), nullable=False)
+
+    # Traceable back to the exact Square webhook event this entry came from
+    # (Square payment/order id) — "every line must include a View
+    # Calculation action" per spec.
+    payment_reference           = Column(String(120), nullable=True)
+    plan_id                     = Column(String(40), nullable=True)          # e.g. "professional_annual"
+
+    qualifying_revenue_cents    = Column(Integer, nullable=False)
+    months_since_attribution    = Column(Integer, nullable=False)            # snapshot — which cohort bucket this fell into
+    commission_rate             = Column(Float, nullable=False)              # snapshot of CommissionRule at calc time
+    commission_amount_cents     = Column(Integer, nullable=False)
+
+    status                      = Column(String(20), nullable=False, default="pending")  # pending|approved|available|paid|reversed
+
+    # Reversal support without a second CommissionAdjustment table — see the
+    # module-level note above this section.
+    is_adjustment                = Column(Boolean, nullable=False, default=False)
+    adjusts_entry_id              = Column(String(36), ForeignKey("partner_commission_entries.id"), nullable=True)
+
+    created_at                    = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at                    = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class PartnerPayout(Base):
+    """
+    Version 2 §3.5/§4 "Payouts" — an administrative record that a batch of
+    `available` CommissionEntry rows was paid out to a partner. This is a
+    bookkeeping ledger only: creating a row here does NOT move money or
+    call any payment processor. Clariva staff pay the partner through
+    whatever external process the business uses (wire, check, ACH run,
+    etc.) and then record it here for reconciliation, matching this app's
+    hard rule of never executing a financial transfer on anyone's behalf.
+    """
+    __tablename__ = "partner_payouts"
+
+    id                    = Column(String(36), primary_key=True, default=new_uuid)
+    partner_id             = Column(String(36), ForeignKey("partners.id"), nullable=False, index=True)
+    amount_cents            = Column(Integer, nullable=False)
+    # Which CommissionEntry ids this payout covers — JSON list of strings.
+    commission_entry_ids     = Column(JSON, default=list)
+    status                    = Column(String(20), nullable=False, default="paid")  # scheduled|paid|held|reversed
+    notes                      = Column(Text, nullable=True)
+
+    created_by_user_id          = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at                    = Column(DateTime(timezone=True), server_default=func.now())

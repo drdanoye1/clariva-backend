@@ -22,8 +22,10 @@ from models.schemas import OrganizationBrandingOut, OrganizationBrandingUpdate
 from routers.auth import get_current_user
 from audit import log_action
 from rbac import ROLES, is_valid_role, roles_with_permission
+from engines.partner_engine import PartnerEngine
 
 router = APIRouter()
+partner_engine = PartnerEngine()
 
 INVITATION_EXPIRY_DAYS = 7
 
@@ -32,6 +34,15 @@ INVITATION_EXPIRY_DAYS = 7
 
 class OrgCreate(BaseModel):
     name: str
+    # Partner Center (Engine 28) attribution — a Clariva Channel Partner's
+    # referral code, e.g. captured from a "?ref=CODE" query param on the
+    # frontend registration/org-creation flow. Optional; a missing or
+    # invalid code is silently ignored (see partner_engine.capture_attribution)
+    # rather than blocking org creation. Org creation, not user registration,
+    # is the attribution hook point — see docs/ARCHITECTURE.md's Partner
+    # Center MVP addendum for why (an Organization doesn't exist yet at
+    # registration time in this codebase).
+    referral_code: Optional[str] = None
 
 class OrgOut(BaseModel):
     id: str
@@ -115,6 +126,17 @@ async def create_organization(
     await log_action(db, actor_id=current_user.id, action="org.created",
                       org_id=org.id, object_type="organization", object_id=org.id,
                       detail={"name": org.name})
+
+    if body.referral_code:
+        attribution = await partner_engine.capture_attribution(
+            db, organization_id=org.id, referral_code=body.referral_code,
+        )
+        if attribution:
+            await log_action(
+                db, actor_id=current_user.id, action="partner.attribution.captured",
+                org_id=org.id, object_type="customer_attribution", object_id=attribution.id,
+                detail={"partner_id": attribution.partner_id, "referral_code": body.referral_code},
+            )
 
     return {"id": org.id, "name": org.name, "role": "owner"}
 
