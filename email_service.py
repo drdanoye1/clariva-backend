@@ -75,3 +75,28 @@ def render_invitation_email(
       </p>
     </div>
     """
+
+
+def render_partner_portal_invite_email(partner_name: str, claim_url: str) -> str:
+    """Partner Center (Engine 28) — Partner Portal account-linking email.
+    Same f-string-HTML shape as render_invitation_email() above, no
+    templating engine, just a different subject/body/expiry line (14 days —
+    see engines/partner_engine.py's PORTAL_INVITE_EXPIRY_DAYS)."""
+    return f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">
+      <h2 style="color:#0f172a; margin-bottom: 4px;">Set up your Clariva Partner Portal login</h2>
+      <p style="color:#334155; line-height: 1.6;">
+        <strong>{partner_name}</strong> has been approved as a Clariva Enterprise&trade; channel partner.
+        Set a password below to access your Partner Portal — your customer list, commission ledger,
+        and payout history, all in one place.
+      </p>
+      <p style="margin: 28px 0;">
+        <a href="{claim_url}" style="background:#1d4ed8; color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:600; display:inline-block;">
+          Set Up Portal Access
+        </a>
+      </p>
+      <p style="color:#94a3b8; font-size:13px;">
+        This link expires in 14 days. If you weren't expecting this, you can safely ignore this email.
+      </p>
+    </div>
+    """

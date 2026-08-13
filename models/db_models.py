@@ -2065,8 +2065,44 @@ class Partner(Base):
     reviewed_at         = Column(DateTime(timezone=True), nullable=True)
     rejection_reason    = Column(Text, nullable=True)
 
+    # Partner Portal (Phase 1 of the roadmap's "Channel Operations" plan —
+    # the read-only partner-facing dashboard). Nullable/unique: a Partner
+    # has no portal access until this is set via PartnerPortalInvite's
+    # accept flow (mirrors Invitation's account-creation pattern below),
+    # and at most one Clariva User account may be linked to a given
+    # Partner (and vice versa — a User can't be linked to two Partners).
+    # Added via migrations.py since `partners` already exists in production.
+    user_id             = Column(String(36), ForeignKey("users.id"), nullable=True, unique=True, index=True)
+
     created_at          = Column(DateTime(timezone=True), server_default=func.now())
     updated_at          = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class PartnerPortalInvite(Base):
+    """
+    Links a Partner to a Clariva User account so they can log into the
+    (read-only, Phase 1) Partner Portal — mirrors Invitation's token +
+    Resend-email + inline-registration pattern almost exactly (see
+    routers/invitations.py), rather than building a separate PartnerUser
+    auth system. Created by a superadmin from the Admin Console
+    (POST /partners/admin/applications/{id}/portal-invite); if a User
+    already exists with the partner's contact_email, PartnerEngine skips
+    this table entirely and links Partner.user_id directly (same shortcut
+    Invitation's creation endpoint takes in routers/organizations.py) — a
+    row here only exists when the recipient needs to register a brand-new
+    account, and the emailed token is what proves they control that inbox.
+    """
+    __tablename__ = "partner_portal_invites"
+
+    id           = Column(String(36), primary_key=True, default=new_uuid)
+    partner_id   = Column(String(36), ForeignKey("partners.id"), nullable=False, index=True)
+    email        = Column(String(255), nullable=False, index=True)  # snapshot of Partner.contact_email at invite time
+    token        = Column(String(64), unique=True, nullable=False, index=True)
+    invited_by   = Column(String(36), ForeignKey("users.id"), nullable=False)
+    status       = Column(String(20), nullable=False, default="pending")  # pending | accepted | revoked
+    expires_at   = Column(DateTime(timezone=True), nullable=False)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    accepted_at  = Column(DateTime(timezone=True), nullable=True)
 
 
 class DealRegistration(Base):

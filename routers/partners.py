@@ -1,19 +1,27 @@
 """
-Partner Center router — Channel Partner Program, Phase 1 MVP.
+Partner Center router — Channel Partner Program, Phase 1 MVP + Partner
+Portal (read-only partner-facing dashboard).
 Access: /api/v1/partners/*
 
-Two audiences, sharply split:
-  - POST /partners/apply is the ONLY unauthenticated endpoint here — it's
+Three audiences now, sharply split:
+  - POST /partners/apply is the only fully-unauthenticated endpoint — it's
     the real backend for frontend/src/pages/partners.tsx's "Apply to
-    Become a Partner" form, which previously only simulated a submission
-    (see that file's `handleSubmit` — now wired to this endpoint).
-  - Every other endpoint is `/partners/admin/*`, gated behind
-    `require_superadmin` (imported from routers.admin, same dependency
-    every other admin-only endpoint in this codebase uses) — this is the
-    Admin Console half of Version 2's spec. There is no authenticated
-    Partner-facing endpoint in this file; the Partner Portal frontend
-    (partners self-serving their own dashboard) is explicitly deferred —
-    see docs/ARCHITECTURE.md's Partner Center MVP addendum.
+    Become a Partner" form.
+  - `/partners/admin/*` is gated behind `require_superadmin` (imported from
+    routers.admin, same dependency every other admin-only endpoint in this
+    codebase uses) — the Admin Console half of Version 2's spec.
+  - `/partners/portal/*` is the new Partner Portal: two public endpoints
+    (`GET /portal/invite/{token}`, `POST /portal/invite/{token}/accept`) for
+    the invite-claim flow — a prospective portal user has no Clariva
+    account yet, same reasoning as routers/invitations.py being
+    unauthenticated — plus authenticated `GET /portal/me`,
+    `/portal/overview`, `/portal/customers`, `/portal/commission-entries`,
+    `/portal/payouts`, all gated behind the new `require_partner_portal_
+    access` dependency below (reuses the existing Clariva User/JWT system
+    via `get_current_user` + `Partner.user_id`, rather than a separate
+    partner-auth system). Every portal query is scoped server-side to the
+    calling partner's own `partner_id` — a partner can never pass another
+    partner's id and see their data.
 
 See engines/partner_engine.py for all business logic; this file is routing
 + schemas + permission gates only, matching this codebase's engine/router
@@ -27,17 +35,37 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config import settings
 from database import get_db
-from models.db_models import User
+from models.db_models import Partner, User
+from models.schemas import LoginResponse
 from routers.admin import require_superadmin
+from routers.auth import _issue_tokens, get_current_user, hash_password
+from email_service import render_partner_portal_invite_email, send_email
 from engines.partner_engine import (
     AttributionNotFoundError, CommissionEntryNotFoundError, DealRegistrationNotFoundError,
-    DuplicateClaimError, PartnerEngine, PartnerNotFoundError,
+    DuplicateClaimError, PartnerAccountExistsError, PartnerEngine, PartnerNotFoundError,
+    PortalInviteNotFoundError,
 )
 from audit import log_action
 
 router = APIRouter()
 partner_engine = PartnerEngine()
+
+
+async def require_partner_portal_access(
+    current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> Partner:
+    """Portal-equivalent of require_superadmin — resolves the calling
+    User to their linked Partner row (via Partner.user_id) and 403s if
+    there isn't one, rather than gating on a role flag. A partner whose
+    account was later suspended still resolves here (they can see their
+    own history) but the frontend surfaces the suspended status; nothing
+    in this MVP hides ledger data from a suspended partner."""
+    partner = await partner_engine.get_partner_by_user_id(db, current_user.id)
+    if partner is None:
+        raise HTTPException(status_code=403, detail="This account has no linked Partner Portal access.")
+    return partner
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────
@@ -61,6 +89,7 @@ class PartnerOut(BaseModel):
     program_status: str
     reviewed_at: Optional[str] = None
     created_at: Optional[str] = None
+    user_id: Optional[str] = None  # set once linked to a Partner Portal login — see Partner.user_id's docstring
 
 class PartnerRejectRequest(BaseModel):
     reason: Optional[str] = None
@@ -160,6 +189,46 @@ class ChannelOverviewOut(BaseModel):
     total_commission_paid_cents: int
 
 
+# ── Partner Portal schemas ───────────────────────────────────────────────────
+
+class PortalInviteCreateOut(BaseModel):
+    linked_existing_user: bool
+    email_sent: bool
+    message: str
+
+class PortalInvitePreviewOut(BaseModel):
+    partner_name: str
+    email: str
+    valid: bool
+    reason: Optional[str] = None  # "expired" | "revoked" | "accepted" when valid=False
+
+class PortalInviteAcceptRequest(BaseModel):
+    full_name: str
+    password: str
+
+class PartnerPortalMeOut(BaseModel):
+    id: str
+    name: str
+    contact_name: str
+    contact_email: str
+    status: str
+    referral_code: Optional[str] = None
+    program_status: str
+
+class PartnerPortalOverviewOut(BaseModel):
+    active_customers: int
+    attributed_subscription_revenue_cents: int
+    commission_this_month_cents: int
+    available_for_payout_cents: int
+    lifetime_earnings_cents: int
+
+class PartnerPortalCustomerOut(BaseModel):
+    organization_id: str
+    organization_name: str
+    attribution_type: str
+    attributed_at: Optional[str] = None
+
+
 def _partner_out(p) -> PartnerOut:
     return PartnerOut(
         id=p.id, name=p.name, contact_name=p.contact_name, contact_email=p.contact_email,
@@ -167,6 +236,7 @@ def _partner_out(p) -> PartnerOut:
         program_status=p.program_status,
         reviewed_at=p.reviewed_at.isoformat() if p.reviewed_at else None,
         created_at=p.created_at.isoformat() if p.created_at else None,
+        user_id=p.user_id,
     )
 
 def _deal_out(d) -> DealRegistrationOut:
@@ -508,3 +578,137 @@ async def admin_list_payouts(
 async def admin_channel_overview(_: User = Depends(require_superadmin), db: AsyncSession = Depends(get_db)):
     overview = await partner_engine.get_channel_overview(db)
     return ChannelOverviewOut(**overview)
+
+
+# ── Admin: Partner Portal invites ───────────────────────────────────────────
+
+@router.post("/admin/applications/{partner_id}/portal-invite", response_model=PortalInviteCreateOut)
+async def admin_send_portal_invite(
+    partner_id: str,
+    current_user: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Superadmin action from the Admin Console's Applications section —
+    grants an approved partner login access to the (read-only) Partner
+    Portal. See engines/partner_engine.py::create_portal_invite for the
+    "link an existing User directly" shortcut when one already exists with
+    the partner's contact_email."""
+    try:
+        result = await partner_engine.create_portal_invite(db, partner_id=partner_id, invited_by_user_id=current_user.id)
+    except PartnerNotFoundError:
+        raise HTTPException(status_code=404, detail="Partner not found.")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except PartnerAccountExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    email_sent = False
+    if result["linked_existing_user"]:
+        message = "An existing Clariva account with this partner's contact email was linked directly — no email sent."
+    else:
+        invite = result["invite"]
+        claim_url = f"{settings.FRONTEND_URL.rstrip('/')}/partner-portal-invite?token={invite.token}"
+        email_sent = await send_email(
+            to=invite.email, subject="Set up your Clariva Partner Portal login",
+            html=render_partner_portal_invite_email(partner_name=result["partner"].name, claim_url=claim_url),
+        )
+        message = "Portal invite email sent." if email_sent else "Portal invite created, but the email failed to send — share the link manually."
+
+    await log_action(
+        db, actor_id=current_user.id, action="partner.portal_invite.sent",
+        object_type="partner", object_id=partner_id,
+        detail={"linked_existing_user": result["linked_existing_user"], "email_sent": email_sent},
+    )
+    return PortalInviteCreateOut(linked_existing_user=result["linked_existing_user"], email_sent=email_sent, message=message)
+
+
+# ── Portal: public invite-claim flow ────────────────────────────────────────
+
+@router.get("/portal/invite/{token}", response_model=PortalInvitePreviewOut)
+async def portal_invite_preview(token: str, db: AsyncSession = Depends(get_db)):
+    """Lets the claim page show who's inviting the person before they
+    commit to setting a password — mirrors GET /invitations/by-token/{token}."""
+    try:
+        invite = await partner_engine.get_portal_invite_by_token(db, token)
+    except PortalInviteNotFoundError:
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    partner = await partner_engine.get_partner(db, invite.partner_id)
+    reason = partner_engine.portal_invite_validity(invite)
+    return PortalInvitePreviewOut(
+        partner_name=partner.name, email=invite.email, valid=reason is None, reason=reason,
+    )
+
+
+@router.post("/portal/invite/{token}/accept", response_model=LoginResponse)
+async def portal_invite_accept(token: str, body: PortalInviteAcceptRequest, db: AsyncSession = Depends(get_db)):
+    """Creates the partner contact's Clariva account, links Partner.user_id,
+    and logs them in — one submit, mirrors POST /invitations/by-token/{token}/accept."""
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+    try:
+        user = await partner_engine.accept_portal_invite(
+            db, token=token, full_name=body.full_name, hashed_password=hash_password(body.password),
+        )
+    except PortalInviteNotFoundError:
+        raise HTTPException(status_code=404, detail="Invitation not found.")
+    except PartnerAccountExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    await log_action(db, actor_id=user.id, action="partner.portal_invite_accepted",
+                      object_type="user", object_id=user.id)
+    return _issue_tokens(user)
+
+
+# ── Portal: authenticated partner-facing dashboard ──────────────────────────
+
+@router.get("/portal/me", response_model=PartnerPortalMeOut)
+async def portal_me(partner: Partner = Depends(require_partner_portal_access)):
+    return PartnerPortalMeOut(
+        id=partner.id, name=partner.name, contact_name=partner.contact_name, contact_email=partner.contact_email,
+        status=partner.status, referral_code=partner.referral_code, program_status=partner.program_status,
+    )
+
+
+@router.get("/portal/overview", response_model=PartnerPortalOverviewOut)
+async def portal_overview(
+    partner: Partner = Depends(require_partner_portal_access), db: AsyncSession = Depends(get_db),
+):
+    overview = await partner_engine.get_partner_overview(db, partner.id)
+    return PartnerPortalOverviewOut(**overview)
+
+
+@router.get("/portal/customers", response_model=List[PartnerPortalCustomerOut])
+async def portal_customers(
+    partner: Partner = Depends(require_partner_portal_access), db: AsyncSession = Depends(get_db),
+):
+    customers = await partner_engine.list_attributed_customers(db, partner.id)
+    return [
+        PartnerPortalCustomerOut(
+            organization_id=c["organization_id"], organization_name=c["organization_name"],
+            attribution_type=c["attribution_type"],
+            attributed_at=c["attributed_at"].isoformat() if c["attributed_at"] else None,
+        )
+        for c in customers
+    ]
+
+
+@router.get("/portal/commission-entries", response_model=List[CommissionEntryOut])
+async def portal_commission_entries(
+    status: Optional[str] = None,
+    partner: Partner = Depends(require_partner_portal_access), db: AsyncSession = Depends(get_db),
+):
+    """Scoped to the calling partner only — partner_id comes from the
+    resolved Partner, never from a request parameter, so there's no way
+    for a partner to pass another partner's id and see their ledger."""
+    entries = await partner_engine.list_commission_entries(db, partner_id=partner.id, status=status)
+    return [_entry_out(e) for e in entries]
+
+
+@router.get("/portal/payouts", response_model=List[PayoutOut])
+async def portal_payouts(
+    partner: Partner = Depends(require_partner_portal_access), db: AsyncSession = Depends(get_db),
+):
+    payouts = await partner_engine.list_payouts(db, partner_id=partner.id)
+    return [_payout_out(p) for p in payouts]

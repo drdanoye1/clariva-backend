@@ -284,7 +284,22 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     # purchased," which is correct — nothing before this column existed
     # could have bought any.
     ("organizations", "purchased_seats", "INTEGER DEFAULT 0", "INTEGER NOT NULL DEFAULT 0"),
+
+    # --- partners (Partner Portal — Phase 1 of the roadmap's "Channel
+    # Operations" plan) ---------------------------------------------------
+    # `partners` already exists in production (Partner Center Phase 1 MVP
+    # backend), so this new column needs a real migration entry rather than
+    # relying on create_all(). Nullable, no backfill: every existing
+    # partner has no linked Clariva account until they go through the new
+    # PartnerPortalInvite accept flow. See Partner.user_id's docstring in
+    # models/db_models.py.
+    ("partners", "user_id", "VARCHAR(36)", "VARCHAR(36)"),
 ]
+
+# partner_portal_invites (Partner Portal addendum) is a new table — no
+# entry needed here, same create_all()-handles-new-tables rule as every
+# other new table introduced in this project's history (see the notes
+# above COLUMN_MIGRATIONS).
 
 # New tables introduced by Phase 2 (service_catalog_items,
 # complimentary_allowances, org_service_entitlements,

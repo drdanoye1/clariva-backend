@@ -57,7 +57,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.db_models import (
-    CommissionEntry, CommissionRule, CustomerAttribution, DealRegistration, Partner, PartnerPayout,
+    CommissionEntry, CommissionRule, CustomerAttribution, DealRegistration, Organization, Partner,
+    PartnerPayout, PartnerPortalInvite, User,
 )
 
 # Version 2 doesn't specify an exact deal-registration protection window
@@ -68,6 +69,12 @@ DEAL_PROTECTION_DAYS = 180
 
 VALID_COMMISSION_STATUSES = ("pending", "approved", "available", "paid", "reversed")
 VALID_PROGRAM_STATUSES = ("registered", "silver", "gold", "platinum")
+
+# Longer than routers/organizations.py's INVITATION_EXPIRY_DAYS (7) —
+# a partner-side decision maker's approval cycle for "should I set up our
+# portal login" runs slower than an internal teammate accepting a team
+# invite, and re-issuing is an extra admin click that's easy to avoid.
+PORTAL_INVITE_EXPIRY_DAYS = 14
 
 
 def _naive(dt: Optional[datetime]) -> Optional[datetime]:
@@ -94,6 +101,14 @@ class AttributionNotFoundError(Exception):
 
 
 class DuplicateClaimError(Exception):
+    pass
+
+
+class PortalInviteNotFoundError(Exception):
+    pass
+
+
+class PartnerAccountExistsError(Exception):
     pass
 
 
@@ -524,3 +539,203 @@ class PartnerEngine:
             "outstanding_commission_liability_cents": liability.scalar_one(),
             "total_commission_paid_cents": paid.scalar_one(),
         }
+
+    # -- Partner Portal (read-only, Phase 1 of the roadmap's "Channel
+    # Operations" plan) ------------------------------------------------------
+    #
+    # A partner reaches the Portal by logging into the same Clariva
+    # User/JWT system every other authenticated area of this app uses —
+    # `Partner.user_id` is the link, and `PartnerPortalInvite` (token +
+    # Resend email + inline registration) is how that link gets created,
+    # mirroring routers/invitations.py's org-member invite flow almost
+    # exactly. See this file's module docstring update / docs/ARCHITECTURE.md
+    # for the full design rationale.
+
+    async def create_portal_invite(
+        self, db: AsyncSession, *, partner_id: str, invited_by_user_id: str,
+    ) -> Dict[str, Any]:
+        """Links `partner` to a Clariva User account. If a User already
+        exists with the partner's contact_email, skips PartnerPortalInvite
+        entirely and links Partner.user_id directly — same shortcut
+        routers/organizations.py's invite-creation endpoint takes for org
+        invites. Otherwise issues a token-based PartnerPortalInvite (mirrors
+        Invitation) for the router to email.
+
+        Returns {"linked_existing_user": bool, "invite": PartnerPortalInvite | None, "partner": Partner}
+        so the router can decide whether to send an email or just report
+        the direct link."""
+        partner = await self.get_partner(db, partner_id)
+        if partner.status != "approved":
+            raise ValueError(f"Partner '{partner_id}' is not an approved partner (status: {partner.status})")
+        if partner.user_id:
+            raise PartnerAccountExistsError(f"Partner '{partner_id}' is already linked to a portal account.")
+
+        existing_user = await db.execute(select(User).where(User.email == partner.contact_email))
+        user = existing_user.scalar_one_or_none()
+        if user is not None:
+            partner.user_id = user.id
+            await db.flush()
+            await db.refresh(partner)
+            return {"linked_existing_user": True, "invite": None, "partner": partner}
+
+        # Revoke any still-pending invite for this partner before issuing a
+        # new one — one live invite per partner at a time keeps a token
+        # lookup unambiguous (mirrors organizations.py's "refresh the
+        # existing pending Invitation" resend behavior).
+        pending = await db.execute(
+            select(PartnerPortalInvite).where(
+                PartnerPortalInvite.partner_id == partner_id, PartnerPortalInvite.status == "pending",
+            )
+        )
+        for row in pending.scalars().all():
+            row.status = "revoked"
+
+        invite = PartnerPortalInvite(
+            partner_id=partner_id, email=partner.contact_email, token=secrets.token_urlsafe(32),
+            invited_by=invited_by_user_id, status="pending",
+            expires_at=datetime.now(timezone.utc) + timedelta(days=PORTAL_INVITE_EXPIRY_DAYS),
+        )
+        db.add(invite)
+        await db.flush()
+        await db.refresh(invite)
+        return {"linked_existing_user": False, "invite": invite, "partner": partner}
+
+    async def get_portal_invite_by_token(self, db: AsyncSession, token: str) -> PartnerPortalInvite:
+        result = await db.execute(select(PartnerPortalInvite).where(PartnerPortalInvite.token == token))
+        invite = result.scalar_one_or_none()
+        if invite is None:
+            raise PortalInviteNotFoundError(token)
+        return invite
+
+    def portal_invite_validity(self, invite: PartnerPortalInvite) -> Optional[str]:
+        """None = valid; otherwise a short reason code — mirrors
+        routers/invitations.py's _invitation_validity() exactly, including
+        the naive/aware stripping (see this module's _naive() docstring)."""
+        if invite.status == "revoked":
+            return "revoked"
+        if invite.status == "accepted":
+            return "accepted"
+        if invite.expires_at and _naive(invite.expires_at) < _naive(datetime.now(timezone.utc)):
+            return "expired"
+        return None
+
+    async def accept_portal_invite(
+        self, db: AsyncSession, *, token: str, full_name: str, hashed_password: str,
+    ) -> User:
+        """Mirrors routers/invitations.py::accept_invitation step-by-step,
+        minus the org-membership creation (a partner isn't an org member) —
+        links the new User onto Partner.user_id instead. Takes an
+        already-hashed password rather than hashing here, since this engine
+        (like every other engine in this codebase) doesn't import from
+        routers/auth.py — the router hashes it via the same hash_password()
+        every other auth path uses, then passes the result in. Raises
+        ValueError/PartnerAccountExistsError for caller-facing conditions;
+        the router translates those to HTTPExceptions."""
+        invite = await self.get_portal_invite_by_token(db, token)
+        reason = self.portal_invite_validity(invite)
+        if reason:
+            raise ValueError(f"This invitation has been {reason}.")
+
+        if not full_name.strip():
+            raise ValueError("Full name is required.")
+
+        existing = await db.execute(select(User).where(User.email == invite.email))
+        if existing.scalar_one_or_none():
+            raise PartnerAccountExistsError(
+                "An account with this email already exists. Please log in instead."
+            )
+
+        partner = await self.get_partner(db, invite.partner_id)
+
+        user = User(
+            email=invite.email, hashed_password=hashed_password, full_name=full_name.strip(),
+            organization=f"{partner.name} (Partner)",
+        )
+        db.add(user)
+        await db.flush()
+
+        partner.user_id = user.id
+        invite.status = "accepted"
+        invite.accepted_at = datetime.now(timezone.utc)
+        await db.flush()
+        await db.refresh(user)
+        return user
+
+    async def get_partner_by_user_id(self, db: AsyncSession, user_id: str) -> Optional[Partner]:
+        result = await db.execute(select(Partner).where(Partner.user_id == user_id))
+        return result.scalar_one_or_none()
+
+    async def get_partner_overview(self, db: AsyncSession, partner_id: str) -> Dict[str, Any]:
+        """Partner-scoped KPIs for the Portal's landing screen — Appendix
+        B's first acceptance criterion: "A partner can identify active
+        customers, attributed subscription revenue, current commission,
+        available payout and lifetime earnings from the first screen."
+        Every query here is scoped to `partner_id`; see
+        list_attributed_customers()'s docstring for the matching rule
+        about never joining into customer content tables."""
+        await self.get_partner(db, partner_id)  # raises PartnerNotFoundError if unknown
+
+        customers = await db.execute(
+            select(func.count(CustomerAttribution.id)).where(CustomerAttribution.partner_id == partner_id)
+        )
+
+        # Plain naive UTC, passed as a bind parameter (not compared directly
+        # against a Python datetime) — same convention as credit_engine.py's
+        # _spent_in_period(), which sidesteps the naive/aware comparison
+        # issue entirely by letting the DB driver handle the comparison.
+        month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        revenue = await db.execute(
+            select(func.coalesce(func.sum(CommissionEntry.qualifying_revenue_cents), 0)).where(
+                CommissionEntry.partner_id == partner_id, CommissionEntry.is_adjustment == False,  # noqa: E712
+                CommissionEntry.status != "reversed",
+            )
+        )
+        this_month = await db.execute(
+            select(func.coalesce(func.sum(CommissionEntry.commission_amount_cents), 0)).where(
+                CommissionEntry.partner_id == partner_id, CommissionEntry.is_adjustment == False,  # noqa: E712
+                CommissionEntry.status != "reversed", CommissionEntry.created_at >= month_start,
+            )
+        )
+        available = await db.execute(
+            select(func.coalesce(func.sum(CommissionEntry.commission_amount_cents), 0)).where(
+                CommissionEntry.partner_id == partner_id, CommissionEntry.status == "available",
+            )
+        )
+        lifetime = await db.execute(
+            select(func.coalesce(func.sum(CommissionEntry.commission_amount_cents), 0)).where(
+                CommissionEntry.partner_id == partner_id, CommissionEntry.is_adjustment == False,  # noqa: E712
+                CommissionEntry.status != "reversed",
+            )
+        )
+
+        return {
+            "active_customers": customers.scalar_one(),
+            "attributed_subscription_revenue_cents": revenue.scalar_one(),
+            "commission_this_month_cents": this_month.scalar_one(),
+            "available_for_payout_cents": available.scalar_one(),
+            "lifetime_earnings_cents": lifetime.scalar_one(),
+        }
+
+    async def list_attributed_customers(self, db: AsyncSession, partner_id: str) -> List[Dict[str, Any]]:
+        """Partner Portal customer list — Appendix B: "Partner users cannot
+        access customer grant content without an explicit separate
+        authorization mechanism." This deliberately joins only
+        Organization.name onto CustomerAttribution's own columns; it must
+        never join into Proposal/FOARecord/ProjectKnowledge or any other
+        table that holds a customer's actual grant content."""
+        result = await db.execute(
+            select(CustomerAttribution, Organization.name)
+            .join(Organization, Organization.id == CustomerAttribution.organization_id)
+            .where(CustomerAttribution.partner_id == partner_id)
+            .order_by(CustomerAttribution.attributed_at.desc())
+        )
+        return [
+            {
+                "organization_id": attribution.organization_id,
+                "organization_name": org_name,
+                "attribution_type": attribution.attribution_type,
+                "attributed_at": attribution.attributed_at,
+            }
+            for attribution, org_name in result.all()
+        ]
