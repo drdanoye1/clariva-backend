@@ -1988,6 +1988,11 @@ class OrgAdminOut(BaseModel):
     # first real use, for an org that hasn't touched AI credits yet (no
     # ledger row created just by listing it).
     ai_credit_balance: float = 100.0
+    # Disambiguates orgs that share a display name (a real, expected case —
+    # nothing stops two different signups from both being called "Acme
+    # Inc") in every UI surface that lists orgs by name alone, e.g. the
+    # Commission Ledger's manual-entry org picker (admin-partners.tsx).
+    created_by_email: Optional[str] = None
 
 
 class OrgPlanUpdateRequest(BaseModel):

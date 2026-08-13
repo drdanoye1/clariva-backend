@@ -163,10 +163,19 @@ async def admin_list_organizations(
     )
     balances = {l.org_id: l.balance for l in ledger_result.scalars().all()}
 
+    # Bulk-fetch creators too, same pattern as the ledger fetch above —
+    # this is what disambiguates two orgs that happen to share a display
+    # name (a real, expected case: nothing stops two different signups
+    # both being called "Acme Inc"). Surfaced in every UI that lists orgs
+    # by name alone, e.g. the Commission Ledger's manual-entry org picker.
+    creator_result = await db.execute(select(User).where(User.id.in_([o.created_by for o in orgs])))
+    creator_emails = {u.id: u.email for u in creator_result.scalars().all()}
+
     return [
         OrgAdminOut(
             id=o.id, name=o.name, plan=o.plan, created_at=o.created_at,
             ai_credit_balance=balances.get(o.id, DEFAULT_STARTING_BALANCE),
+            created_by_email=creator_emails.get(o.created_by),
         )
         for o in orgs
     ]

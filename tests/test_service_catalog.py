@@ -582,7 +582,10 @@ def test_admin_can_list_and_override_org_plan(client, registered_user):
 
     list_resp = client.get("/api/v1/admin/organizations", headers=registered_user["headers"])
     assert list_resp.status_code == 200, list_resp.text
-    assert any(o["id"] == org_id for o in list_resp.json())
+    listed = next(o for o in list_resp.json() if o["id"] == org_id)
+    # Disambiguates two orgs that share a display name in every UI surface
+    # that lists orgs by name alone — see routers/admin.py's created_by_email.
+    assert listed["created_by_email"] == registered_user["email"]
 
     update_resp = client.patch(
         f"/api/v1/admin/organizations/{org_id}/plan",
