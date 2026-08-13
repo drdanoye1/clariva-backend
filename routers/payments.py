@@ -118,12 +118,12 @@ PLANS = {
     "large": {
         "name":        "Clariva Large",
         "amount":      499900,
-        "description": "Clariva Large — monthly platform access for large teams, expanded Managed Grant Data, priority administration and support.",
+        "description": "Clariva Large — monthly platform access for large teams, expanded Managed Data, priority administration and support.",
     },
     "large_annual": {
         "name":        "Clariva Large (Annual)",
         "amount":      4999000,
-        "description": "Clariva Large — annual platform access for large teams, expanded Managed Grant Data, priority administration and support.",
+        "description": "Clariva Large — annual platform access for large teams, expanded Managed Data, priority administration and support.",
     },
     "enterprise": {
         "name":        "Clariva Enterprise",
