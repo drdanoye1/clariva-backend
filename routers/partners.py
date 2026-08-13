@@ -33,14 +33,16 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from database import get_db
-from models.db_models import Partner, User
+from models.db_models import AuditLog, Partner, User
 from models.schemas import LoginResponse
 from routers.admin import require_superadmin
 from routers.auth import _issue_tokens, get_current_user, hash_password
+from routers.organizations import AuditLogOut
 from email_service import render_partner_portal_invite_email, send_email
 from engines.partner_engine import (
     AttributionNotFoundError, CommissionEntryNotFoundError, DealRegistrationNotFoundError,
@@ -97,6 +99,18 @@ class PartnerRejectRequest(BaseModel):
 class ProgramStatusUpdateRequest(BaseModel):
     program_status: str  # registered | silver | gold | platinum
 
+class PartnerUpdateRequest(BaseModel):
+    """Correction of an application's own fields — see
+    engines/partner_engine.py::update_partner's docstring. Every field
+    optional so the Admin Console can PATCH just what changed;
+    `exclude_unset=True` at the call site distinguishes "not provided" from
+    "explicitly cleared", which matters for notes/partner_type."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    contact_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    contact_email: Optional[EmailStr] = None
+    partner_type: Optional[str] = None
+    notes: Optional[str] = None
+
 class DealRegistrationCreateRequest(BaseModel):
     partner_id: str
     organization_name: str = Field(..., min_length=1, max_length=255)
@@ -121,6 +135,19 @@ class DealRegistrationOut(BaseModel):
     status: str
     protection_expires_at: Optional[str] = None
     created_at: Optional[str] = None
+
+class DealRegistrationUpdateRequest(BaseModel):
+    """Correction of a deal registration's own fields — see
+    engines/partner_engine.py::update_deal's docstring. Same
+    exclude_unset=True PATCH semantics as PartnerUpdateRequest above."""
+    organization_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
+    domain: Optional[str] = None
+    proposed_plan: Optional[str] = None
+    estimated_value_cents: Optional[int] = Field(default=None, ge=0)
+    approved_commissionable_value_cents: Optional[int] = Field(default=None, ge=0)
+    notes: Optional[str] = None
 
 class DealApproveRequest(BaseModel):
     protection_days: Optional[int] = Field(default=None, ge=1, le=730)
@@ -178,6 +205,10 @@ class PayoutOut(BaseModel):
     status: str
     notes: Optional[str] = None
     created_at: Optional[str] = None
+
+class PlanOptionOut(BaseModel):
+    id: str      # matches payments.py PLANS keys — the only legitimate values
+    label: str   # display name, e.g. "Clariva Team (Annual)"
 
 class ChannelOverviewOut(BaseModel):
     active_partners: int
@@ -265,6 +296,36 @@ def _entry_out(e) -> CommissionEntryOut:
         status=e.status, is_adjustment=e.is_adjustment,
         created_at=e.created_at.isoformat() if e.created_at else None,
     )
+
+async def _audit_history(db: AsyncSession, object_type: str, object_id: str, limit: int = 100) -> List[AuditLogOut]:
+    """Shared by the two /activity endpoints below — same actor-join
+    pattern as routers/organizations.py::get_audit_log, just filtered by
+    object_type/object_id instead of org_id (Partner Center audit rows are
+    written with org_id=None, since a Partner isn't an Organization, so
+    that endpoint's org-scoped query would never surface them)."""
+    result = await db.execute(
+        select(AuditLog)
+        .where(AuditLog.object_type == object_type, AuditLog.object_id == object_id)
+        .order_by(AuditLog.created_at.desc())
+        .limit(min(limit, 500))
+    )
+    entries = result.scalars().all()
+    actor_ids = {e.actor_id for e in entries}
+    actors: dict = {}
+    if actor_ids:
+        u_result = await db.execute(select(User).where(User.id.in_(actor_ids)))
+        actors = {u.id: u for u in u_result.scalars().all()}
+    return [
+        AuditLogOut(
+            id=e.id, actor_id=e.actor_id,
+            actor_email=actors[e.actor_id].email if e.actor_id in actors else None,
+            actor_name=actors[e.actor_id].full_name if e.actor_id in actors else None,
+            action=e.action, object_type=e.object_type, object_id=e.object_id, detail=e.detail,
+            created_at=e.created_at.isoformat() if e.created_at else None,
+        )
+        for e in entries
+    ]
+
 
 def _payout_out(p) -> PayoutOut:
     return PayoutOut(
@@ -368,6 +429,46 @@ async def admin_set_program_status(
         object_type="partner", object_id=partner.id, detail={"program_status": body.program_status},
     )
     return _partner_out(partner)
+
+
+@router.patch("/admin/applications/{partner_id}", response_model=PartnerOut)
+async def admin_update_application(
+    partner_id: str, body: PartnerUpdateRequest,
+    current_user: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Correct an application's own fields (name/contact/email/type/notes)
+    without going through approve/reject/suspend — see
+    engines/partner_engine.py::update_partner's docstring. Every change is
+    logged with a precise before/after diff; a no-op PATCH (nothing
+    actually differs) still 200s but writes no audit row."""
+    try:
+        partner, diff = await partner_engine.update_partner(db, partner_id, body.model_dump(exclude_unset=True))
+    except PartnerNotFoundError:
+        raise HTTPException(status_code=404, detail="Partner not found.")
+    if diff:
+        await log_action(
+            db, actor_id=current_user.id, action="partner.application.edited",
+            object_type="partner", object_id=partner.id, detail={"changes": diff},
+        )
+    return _partner_out(partner)
+
+
+@router.get("/admin/applications/{partner_id}/activity", response_model=List[AuditLogOut])
+async def admin_get_application_activity(
+    partner_id: str,
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every audited action taken on this partner — approve/reject/
+    suspend/program-status/edit/portal-invite — newest first. This is the
+    history that's been written to the audit log all along but had no
+    screen to view it on (see _audit_history's docstring)."""
+    try:
+        await partner_engine.get_partner(db, partner_id)
+    except PartnerNotFoundError:
+        raise HTTPException(status_code=404, detail="Partner not found.")
+    return await _audit_history(db, "partner", partner_id)
 
 
 @router.get("/admin/applications/{partner_id}/customers", response_model=List[PartnerPortalCustomerOut])
@@ -477,6 +578,42 @@ async def admin_reject_deal_registration(
     return _deal_out(deal)
 
 
+@router.patch("/admin/deal-registrations/{deal_id}", response_model=DealRegistrationOut)
+async def admin_update_deal_registration(
+    deal_id: str, body: DealRegistrationUpdateRequest,
+    current_user: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Correct a deal registration's own fields, including post-approval —
+    see engines/partner_engine.py::update_deal's docstring. Every change is
+    logged with a precise before/after diff."""
+    try:
+        deal, diff = await partner_engine.update_deal(db, deal_id, body.model_dump(exclude_unset=True))
+    except DealRegistrationNotFoundError:
+        raise HTTPException(status_code=404, detail="Deal registration not found.")
+    if diff:
+        await log_action(
+            db, actor_id=current_user.id, action="partner.deal_registration.edited",
+            object_type="deal_registration", object_id=deal.id, detail={"changes": diff},
+        )
+    return _deal_out(deal)
+
+
+@router.get("/admin/deal-registrations/{deal_id}/activity", response_model=List[AuditLogOut])
+async def admin_get_deal_registration_activity(
+    deal_id: str,
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every audited action on this deal registration — created/approved/
+    rejected/edited — newest first (see _audit_history's docstring)."""
+    try:
+        await partner_engine.get_deal(db, deal_id)
+    except DealRegistrationNotFoundError:
+        raise HTTPException(status_code=404, detail="Deal registration not found.")
+    return await _audit_history(db, "deal_registration", deal_id)
+
+
 # ── Admin: commission rule (Program Settings) ───────────────────────────────
 
 @router.get("/admin/commission-rule", response_model=CommissionRuleOut)
@@ -505,6 +642,19 @@ async def admin_update_commission_rule(
         },
     )
     return _rule_out(rule)
+
+
+@router.get("/admin/plan-options", response_model=List[PlanOptionOut])
+async def admin_list_plan_options(_: User = Depends(require_superadmin)):
+    """Backs the Commission Ledger's Plan ID dropdown. Returns the exact
+    keys payments.py::PLANS uses — the same values the Square webhook
+    stamps onto an automatic commission entry's plan_id — so a manual
+    entry's plan_id can never drift into a value the real billing system
+    would never produce. Local import avoids a module-load-time dependency
+    between routers/payments.py and routers/partners.py; this is the only
+    place partners.py needs anything from payments.py."""
+    from routers.payments import PLANS
+    return [PlanOptionOut(id=key, label=cfg["name"]) for key, cfg in PLANS.items()]
 
 
 # ── Admin: commission ledger ─────────────────────────────────────────────────

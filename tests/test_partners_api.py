@@ -296,3 +296,190 @@ def test_admin_payout_endpoint_rejects_empty_entry_list(client, registered_user)
         headers=headers,
     )
     assert resp.status_code == 422
+
+
+# ── Editing applications/deals + activity log (tracked-change requirement) ──
+
+def test_admin_update_application_requires_superadmin(client, registered_user):
+    partner = _apply(client)
+    resp = client.patch(
+        f"/api/v1/partners/admin/applications/{partner['id']}",
+        json={"name": "New Name"}, headers=registered_user["headers"],
+    )
+    assert resp.status_code == 403
+
+
+def test_admin_update_application_unknown_partner_404s(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    resp = client.patch(
+        "/api/v1/partners/admin/applications/not-a-real-id",
+        json={"name": "New Name"}, headers=registered_user["headers"],
+    )
+    assert resp.status_code == 404
+
+
+def test_admin_update_application_edits_fields_and_logs_diff(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    headers = registered_user["headers"]
+    partner = _apply(client, name="Addie Parnters")
+
+    patch_resp = client.patch(
+        f"/api/v1/partners/admin/applications/{partner['id']}",
+        json={"name": "Addie Partners", "contact_email": "fixed@example.com"},
+        headers=headers,
+    )
+    assert patch_resp.status_code == 200, patch_resp.text
+    updated = patch_resp.json()
+    assert updated["name"] == "Addie Partners"
+    assert updated["contact_email"] == "fixed@example.com"
+    # Untouched fields survive the PATCH unchanged.
+    assert updated["contact_name"] == partner["contact_name"]
+
+    activity_resp = client.get(f"/api/v1/partners/admin/applications/{partner['id']}/activity", headers=headers)
+    assert activity_resp.status_code == 200, activity_resp.text
+    entries = activity_resp.json()
+    edited = next(e for e in entries if e["action"] == "partner.application.edited")
+    assert edited["actor_email"] == registered_user["email"]
+    assert edited["detail"]["changes"]["name"] == {"old": "Addie Parnters", "new": "Addie Partners"}
+    assert edited["detail"]["changes"]["contact_email"]["new"] == "fixed@example.com"
+
+
+def test_admin_update_application_noop_writes_no_audit_row(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    headers = registered_user["headers"]
+    partner = _apply(client)
+
+    # Re-submitting the exact same value is a no-op — nothing actually
+    # changed, so no "edited" row should appear.
+    resp = client.patch(
+        f"/api/v1/partners/admin/applications/{partner['id']}",
+        json={"name": partner["name"]}, headers=headers,
+    )
+    assert resp.status_code == 200
+
+    activity_resp = client.get(f"/api/v1/partners/admin/applications/{partner['id']}/activity", headers=headers)
+    assert not any(e["action"] == "partner.application.edited" for e in activity_resp.json())
+
+
+def test_admin_application_activity_requires_superadmin(client, registered_user):
+    partner = _apply(client)
+    resp = client.get(f"/api/v1/partners/admin/applications/{partner['id']}/activity", headers=registered_user["headers"])
+    assert resp.status_code == 403
+
+
+def test_admin_application_activity_includes_status_transitions(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    headers = registered_user["headers"]
+    partner = _apply(client)
+    client.post(f"/api/v1/partners/admin/applications/{partner['id']}/approve", headers=headers)
+    client.post(f"/api/v1/partners/admin/applications/{partner['id']}/suspend", json={"reason": "test"}, headers=headers)
+
+    resp = client.get(f"/api/v1/partners/admin/applications/{partner['id']}/activity", headers=headers)
+    assert resp.status_code == 200
+    actions = [e["action"] for e in resp.json()]
+    assert "partner.application.approved" in actions
+    assert "partner.suspended" in actions
+    # Newest first.
+    assert actions.index("partner.suspended") < actions.index("partner.application.approved")
+
+
+def _register_deal(client, headers, partner_id: str) -> dict:
+    resp = client.post(
+        "/api/v1/partners/admin/deal-registrations",
+        json={"partner_id": partner_id, "organization_name": "Prospect Co", "domain": f"{uuid.uuid4().hex[:8]}.example"},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def test_admin_update_deal_registration_requires_superadmin(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    headers = registered_user["headers"]
+    partner = _apply(client)
+    client.post(f"/api/v1/partners/admin/applications/{partner['id']}/approve", headers=headers)
+    deal = _register_deal(client, headers, partner["id"])
+
+    # registered_user IS superadmin here (needed to set up the deal) — use
+    # a fresh non-superadmin caller to actually exercise the 403 path.
+    other = _register_and_login(client, "notadmin")
+    resp = client.patch(
+        f"/api/v1/partners/admin/deal-registrations/{deal['id']}",
+        json={"organization_name": "New Name"}, headers=other["headers"],
+    )
+    assert resp.status_code == 403
+
+
+def test_admin_update_deal_registration_unknown_deal_404s(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    resp = client.patch(
+        "/api/v1/partners/admin/deal-registrations/not-a-real-id",
+        json={"organization_name": "New Name"}, headers=registered_user["headers"],
+    )
+    assert resp.status_code == 404
+
+
+def test_admin_update_deal_registration_edits_fields_and_logs_diff(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    headers = registered_user["headers"]
+    partner = _apply(client)
+    client.post(f"/api/v1/partners/admin/applications/{partner['id']}/approve", headers=headers)
+    deal = _register_deal(client, headers, partner["id"])
+    client.post(
+        f"/api/v1/partners/admin/deal-registrations/{deal['id']}/approve",
+        json={"approved_commissionable_value_cents": 500000}, headers=headers,
+    )
+
+    # Correctable even after approval — the negotiated Enterprise figure changed.
+    patch_resp = client.patch(
+        f"/api/v1/partners/admin/deal-registrations/{deal['id']}",
+        json={"organization_name": "Corrected Co", "approved_commissionable_value_cents": 750000},
+        headers=headers,
+    )
+    assert patch_resp.status_code == 200, patch_resp.text
+    updated = patch_resp.json()
+    assert updated["organization_name"] == "Corrected Co"
+    assert updated["approved_commissionable_value_cents"] == 750000
+
+    activity_resp = client.get(f"/api/v1/partners/admin/deal-registrations/{deal['id']}/activity", headers=headers)
+    assert activity_resp.status_code == 200
+    entries = activity_resp.json()
+    edited = next(e for e in entries if e["action"] == "partner.deal_registration.edited")
+    assert edited["detail"]["changes"]["organization_name"] == {"old": "Prospect Co", "new": "Corrected Co"}
+    assert edited["detail"]["changes"]["approved_commissionable_value_cents"] == {"old": 500000, "new": 750000}
+    actions = [e["action"] for e in entries]
+    assert "partner.deal_registration.created" in actions
+    assert "partner.deal_registration.approved" in actions
+
+
+def test_admin_deal_registration_activity_requires_superadmin(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    headers = registered_user["headers"]
+    partner = _apply(client)
+    client.post(f"/api/v1/partners/admin/applications/{partner['id']}/approve", headers=headers)
+    deal = _register_deal(client, headers, partner["id"])
+
+    other = _register_and_login(client, "notadmin2")
+    resp = client.get(f"/api/v1/partners/admin/deal-registrations/{deal['id']}/activity", headers=other["headers"])
+    assert resp.status_code == 403
+
+
+def test_admin_plan_options_requires_superadmin(client, registered_user):
+    resp = client.get("/api/v1/partners/admin/plan-options", headers=registered_user["headers"])
+    assert resp.status_code == 403
+
+
+def test_admin_plan_options_returns_real_plan_keys(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    resp = client.get("/api/v1/partners/admin/plan-options", headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    options = resp.json()
+    ids = {o["id"] for o in options}
+    # Matches payments.py::PLANS exactly — the same values the Square
+    # webhook stamps onto an automatic commission entry's plan_id.
+    assert "enterprise" in ids
+    assert "team" in ids
+    assert "organization" in ids
+    assert "large" in ids
+    enterprise = next(o for o in options if o["id"] == "enterprise")
+    assert enterprise["label"] == "Clariva Enterprise"

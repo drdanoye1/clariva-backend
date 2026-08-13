@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -75,6 +75,18 @@ VALID_PROGRAM_STATUSES = ("registered", "silver", "gold", "platinum")
 # portal login" runs slower than an internal teammate accepting a team
 # invite, and re-issuing is an extra admin click that's easy to avoid.
 PORTAL_INVITE_EXPIRY_DAYS = 14
+
+# Fields an admin may correct on an existing application/deal registration
+# after the fact (typo fixes, a wrong contact email, etc.) — deliberately
+# excludes anything a status-transition method above already owns
+# (status, referral_code, program_status, protection_expires_at, reviewed_*)
+# so update_partner()/update_deal() below can never be used as a backdoor
+# around approve/reject/suspend.
+EDITABLE_PARTNER_FIELDS = ("name", "contact_name", "contact_email", "partner_type", "notes")
+EDITABLE_DEAL_FIELDS = (
+    "organization_name", "contact_name", "contact_email", "domain",
+    "proposed_plan", "estimated_value_cents", "approved_commissionable_value_cents", "notes",
+)
 
 
 def _naive(dt: Optional[datetime]) -> Optional[datetime]:
@@ -189,6 +201,36 @@ class PartnerEngine:
         await db.refresh(partner)
         return partner
 
+    async def update_partner(self, db: AsyncSession, partner_id: str, changes: Dict[str, Any]) -> Tuple[Partner, Dict[str, Any]]:
+        """Admin correction of an application's own fields — a typo in the
+        firm name, a wrong contact email, etc. Distinct from every status-
+        transition method above, which never touches these fields (see
+        EDITABLE_PARTNER_FIELDS). `changes` may contain any subset of those
+        fields; anything else is silently ignored so a caller can pass a
+        Pydantic model's `.dict(exclude_unset=True)` straight through.
+        Returns (partner, diff) where diff contains only fields whose value
+        actually changed, each as {"old": ..., "new": ...} — this is what
+        routers/partners.py logs to the audit trail, so "who changed what"
+        is always a precise before/after, never a vague "was edited"."""
+        partner = await self.get_partner(db, partner_id)
+        diff: Dict[str, Any] = {}
+        for field in EDITABLE_PARTNER_FIELDS:
+            if field not in changes:
+                continue
+            new_value = changes[field]
+            if isinstance(new_value, str):
+                new_value = new_value.strip()
+                if field == "contact_email":
+                    new_value = new_value.lower()
+            old_value = getattr(partner, field)
+            if new_value != old_value:
+                diff[field] = {"old": old_value, "new": new_value}
+                setattr(partner, field, new_value)
+        if diff:
+            await db.flush()
+            await db.refresh(partner)
+        return partner, diff
+
     # -- Deal registrations -------------------------------------------------
 
     async def register_deal(
@@ -273,6 +315,34 @@ class PartnerEngine:
         await db.flush()
         await db.refresh(deal)
         return deal
+
+    async def update_deal(self, db: AsyncSession, deal_id: str, changes: Dict[str, Any]) -> Tuple[DealRegistration, Dict[str, Any]]:
+        """Admin correction of a deal registration's own fields — see
+        update_partner()'s docstring for the same reasoning (excludes
+        status/protection/review fields, only touches EDITABLE_DEAL_FIELDS,
+        returns a precise before/after diff for the audit log). Editable
+        even after approval: `approved_commissionable_value_cents` in
+        particular is legitimately correctable if the negotiated Enterprise
+        figure changes before a manual commission entry is created against
+        it (see record_manual_commission's docstring)."""
+        deal = await self.get_deal(db, deal_id)
+        diff: Dict[str, Any] = {}
+        for field in EDITABLE_DEAL_FIELDS:
+            if field not in changes:
+                continue
+            new_value = changes[field]
+            if isinstance(new_value, str):
+                new_value = new_value.strip()
+                if field == "domain":
+                    new_value = new_value.lower() or None
+            old_value = getattr(deal, field)
+            if new_value != old_value:
+                diff[field] = {"old": old_value, "new": new_value}
+                setattr(deal, field, new_value)
+        if diff:
+            await db.flush()
+            await db.refresh(deal)
+        return deal, diff
 
     # -- Attribution ----------------------------------------------------------
 

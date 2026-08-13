@@ -28,6 +28,7 @@ gets written regardless.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,6 +55,16 @@ async def log_action(
         object_type=object_type,
         object_id=object_id,
         detail=detail,
+        # Stamped here in Python (microsecond precision) rather than left to
+        # the column's server_default=func.now(): SQLite's func.now() only
+        # has second resolution, so two audit rows written by fast
+        # successive requests in the same wall-clock second (e.g. approve
+        # then suspend in one test) get identical created_at values, making
+        # `ORDER BY created_at DESC` (routers/partners.py's activity feed,
+        # routers/organizations.py's audit-log endpoint) non-deterministic
+        # for "newest first" — it can silently return insertion order
+        # instead. `AuditLog.id` is a random UUID, not a usable tiebreaker.
+        created_at=datetime.now(timezone.utc),
     )
     db.add(entry)
     await db.flush()
