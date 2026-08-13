@@ -370,6 +370,33 @@ async def admin_set_program_status(
     return _partner_out(partner)
 
 
+@router.get("/admin/applications/{partner_id}/customers", response_model=List[PartnerPortalCustomerOut])
+async def admin_list_partner_customers(
+    partner_id: str,
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Surfaces a partner's already-attributed customers (real signups tied
+    to their referral code — see PartnerEngine.list_attributed_customers)
+    directly in the Admin Console, so an admin creating a manual commission
+    entry doesn't have to separately look up an Organization's id via
+    GET /admin/organizations. Reuses the same engine method and response
+    shape the Partner Portal's own GET /portal/customers uses."""
+    try:
+        await partner_engine.get_partner(db, partner_id)
+    except PartnerNotFoundError:
+        raise HTTPException(status_code=404, detail="Partner not found.")
+    customers = await partner_engine.list_attributed_customers(db, partner_id)
+    return [
+        PartnerPortalCustomerOut(
+            organization_id=c["organization_id"], organization_name=c["organization_name"],
+            attribution_type=c["attribution_type"],
+            attributed_at=c["attributed_at"].isoformat() if c["attributed_at"] else None,
+        )
+        for c in customers
+    ]
+
+
 # ── Admin: deal registrations ───────────────────────────────────────────────
 
 @router.post("/admin/deal-registrations", response_model=DealRegistrationOut, status_code=201)

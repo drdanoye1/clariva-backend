@@ -128,6 +128,78 @@ def test_admin_approve_unknown_application_404s(client, registered_user):
     assert resp.status_code == 404
 
 
+# ── Admin: per-partner attributed customers (Admin Console org picker) ──────
+
+def _register_and_login(client, label: str) -> dict:
+    email = f"{label}-{uuid.uuid4().hex[:10]}@example.com"
+    password = "TestPassword123!"
+    resp = client.post("/api/v1/auth/register", json={
+        "email": email, "password": password,
+        "full_name": f"{label.title()} User", "organization": "Test Org",
+    })
+    assert resp.status_code == 201, resp.text
+    login = client.post("/api/v1/auth/login", data={"username": email, "password": password})
+    assert login.status_code == 200, login.text
+    token = login.json()["access_token"]
+    return {"email": email, "user_id": resp.json()["id"], "headers": {"Authorization": f"Bearer {token}"}}
+
+
+def _create_org(client, owner_headers: dict, referral_code: str = None) -> str:
+    body = {"name": f"Org {uuid.uuid4().hex[:8]}"}
+    if referral_code:
+        body["referral_code"] = referral_code
+    resp = client.post("/api/v1/organizations/", json=body, headers=owner_headers)
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def test_admin_list_partner_customers_requires_superadmin(client, registered_user):
+    partner = _apply(client)
+    resp = client.get(
+        f"/api/v1/partners/admin/applications/{partner['id']}/customers",
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 403
+
+
+def test_admin_list_partner_customers_unknown_partner_404s(client, registered_user):
+    _make_superadmin(registered_user["user_id"])
+    resp = client.get(
+        "/api/v1/partners/admin/applications/not-a-real-id/customers",
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 404
+
+
+def test_admin_list_partner_customers_returns_attributed_orgs(client, registered_user):
+    """The endpoint behind the Admin Console's "Customers" toggle — see
+    admin-partners.tsx's handleToggleCustomers / handleUseForManualEntry.
+    Confirms both the empty state (a fresh approval with no signups yet)
+    and the populated state once a real Organization is created with the
+    partner's referral code."""
+    _make_superadmin(registered_user["user_id"])
+    headers = registered_user["headers"]
+
+    partner = _apply(client)
+    approve_resp = client.post(f"/api/v1/partners/admin/applications/{partner['id']}/approve", headers=headers)
+    assert approve_resp.status_code == 200, approve_resp.text
+    approved = approve_resp.json()
+
+    empty_resp = client.get(f"/api/v1/partners/admin/applications/{partner['id']}/customers", headers=headers)
+    assert empty_resp.status_code == 200
+    assert empty_resp.json() == []
+
+    owner = _register_and_login(client, "customerowner")
+    org_id = _create_org(client, owner["headers"], referral_code=approved["referral_code"])
+
+    resp = client.get(f"/api/v1/partners/admin/applications/{partner['id']}/customers", headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["organization_id"] == org_id
+    assert body[0]["attribution_type"] == "partner_sourced"
+
+
 def test_admin_can_register_and_approve_a_deal(client, registered_user):
     _make_superadmin(registered_user["user_id"])
     headers = registered_user["headers"]
