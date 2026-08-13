@@ -115,11 +115,47 @@ PLANS = {
         "amount":      249000,
         "description": "Clariva Organization — annual platform access for up to 15 users, advanced administration, API access.",
     },
+    "large": {
+        "name":        "Clariva Large",
+        "amount":      499900,
+        "description": "Clariva Large — monthly platform access for large teams, expanded Managed Grant Data, priority administration and support.",
+    },
+    "large_annual": {
+        "name":        "Clariva Large (Annual)",
+        "amount":      4999000,
+        "description": "Clariva Large — annual platform access for large teams, expanded Managed Grant Data, priority administration and support.",
+    },
     "enterprise": {
         "name":        "Clariva Enterprise",
-        "amount":      59900,
+        # Commercial Architecture Phase 1: raised from 59900 ($599) to keep
+        # Enterprise priced above the new Large tier ($4,999/mo,
+        # PLANS["large"] above) — Large a Payment Link never existed against
+        # a self-serve Enterprise checkout path anyway (planId is null on
+        # the Enterprise card; it routes to /demo, never here), so this
+        # figure is a marketing anchor only, not a live charge amount.
+        "amount":      999900,
         "description": "Clariva Enterprise — starting monthly platform access; custom users, capacity, and support. Contact sales for a tailored quote.",
     },
+}
+
+# ── Public-facing tier display names ────────────────────────────────────────
+# Commercial Architecture Phase 1 ("Standardized Subscription & Pricing
+# Labeling" SOP, Aug 2026): the public plan *names* change, but the stored
+# Organization.plan value and every tier-string comparison across the
+# codebase (BULK_ALLOWED_PLANS, ComplimentaryAllowance.plan,
+# service_catalog_engine._get_org_plan, admin plan-override endpoints, PLANS
+# keys above, etc.) deliberately keep their existing internal values — no
+# data migration, no rename of stored rows. This dict is the single lookup
+# any UI surface uses to translate an internal tier into the new label.
+# Existing customers keep their current billed price/tier; only the label
+# they see changes (per explicit user decision, Aug 2026).
+TIER_DISPLAY_NAMES = {
+    "free":         "Starter",
+    "professional": "Professional",
+    "team":         "Small",
+    "organization": "Medium",
+    "large":        "Large",
+    "enterprise":   "Enterprise",
 }
 
 # Every plan_id in PLANS maps to exactly one underlying tier stored in
@@ -135,6 +171,21 @@ PLAN_INTERVAL_DAYS = {False: 30, True: 365}  # keyed by "is_annual"
 # large enough that Square's flat per-transaction fee doesn't eat an
 # unreasonable share of it.
 MIN_FUND_TOPUP_CENTS = 1000  # $10.00
+
+# ── Additional Seats ─────────────────────────────────────────────────────────
+# Commercial Architecture Phase 1 — per-seat pricing for the three tiers the
+# source spec's seat table covers (Small/Medium/Large = internal team/
+# organization/large). Professional and Enterprise are deliberately absent:
+# Professional is a single-user plan by design (no seat add-on), and
+# Enterprise seats are negotiated as part of a custom quote (contact sales),
+# not self-serve checkout — same reasoning pricing.tsx already uses for
+# keeping Enterprise off the self-serve plan-checkout path.
+SEAT_PRICES_CENTS = {
+    "team":         2500,  # Small — $25/seat/month
+    "organization": 2000,  # Medium — $20/seat/month
+    "large":        1500,  # Large — $15/seat/month
+}
+MAX_SEATS_PER_PURCHASE = 100  # guards against a fat-fingered order-of-magnitude typo
 
 
 def _plan_tier_and_interval(plan_id: str) -> tuple[str, int]:
@@ -272,6 +323,19 @@ class FundCheckoutResponse(BaseModel):
     amount_cents: int
 
 
+class SeatsCheckoutRequest(BaseModel):
+    org_id: str
+    seat_count: int = Field(ge=1, le=MAX_SEATS_PER_PURCHASE)
+    redirect_url: Optional[str] = None
+
+
+class SeatsCheckoutResponse(BaseModel):
+    checkout_url: str
+    org_id: str
+    seat_count: int
+    amount_cents: int
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/create-checkout", response_model=CheckoutResponse)
@@ -353,6 +417,63 @@ async def create_fund_checkout(
 
     return FundCheckoutResponse(
         checkout_url=payment_link["url"], org_id=body.org_id, amount_cents=body.amount_cents,
+    )
+
+
+@router.post("/create-seats-checkout", response_model=SeatsCheckoutResponse)
+async def create_seats_checkout(
+    body: SeatsCheckoutRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Build a Square Payment Link for Additional Seats (Commercial
+    Architecture Phase 1). Priced per-seat/month against the org's
+    *current* plan tier (SEAT_PRICES_CENTS) — read fresh at checkout time
+    rather than trusting a client-supplied tier, same "don't trust the
+    client for anything billing touches" posture as create_checkout.
+    Requires the org to already be on a tier with a seat price (Small/
+    Medium/Large); Professional has no seat add-on and Enterprise seats are
+    a contact-sales conversation, not self-serve checkout.
+    """
+    await _assert_permission(body.org_id, current_user.id, "manage_credits", db)
+
+    org = (await db.execute(select(Organization).where(Organization.id == body.org_id))).scalar_one_or_none()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+
+    seat_price = SEAT_PRICES_CENTS.get(org.plan)
+    if seat_price is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Additional seats are available on the Small, Medium, and Large plans. "
+                   "Professional is single-user; Enterprise seats are part of your custom quote — contact sales.",
+        )
+
+    amount_cents = seat_price * body.seat_count
+
+    base_url, access_token = _square_config()
+    location_id = await _get_location_id(base_url, access_token)
+    redirect = body.redirect_url or "https://grant.aistartupcopilot.org/org?seats=success"
+
+    payment_link = await _create_order_payment_link(
+        base_url=base_url, access_token=access_token, location_id=location_id,
+        item_name=f"Clariva Additional Seats ({body.seat_count} × ${seat_price / 100:,.2f}/mo)",
+        amount_cents=amount_cents,
+        description=f"{body.seat_count} additional seat(s) for one month on the {TIER_DISPLAY_NAMES.get(org.plan, org.plan)} plan.",
+        metadata={
+            "kind": "seat_purchase",
+            "org_id": body.org_id,
+            "seat_count": body.seat_count,
+            "plan_at_purchase": org.plan,
+            "initiated_by_user_id": current_user.id,
+        },
+        buyer_email=current_user.email, redirect_url=redirect,
+    )
+
+    return SeatsCheckoutResponse(
+        checkout_url=payment_link["url"], org_id=body.org_id,
+        seat_count=body.seat_count, amount_cents=amount_cents,
     )
 
 
@@ -531,6 +652,28 @@ async def square_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         await db.commit()
         _log.info("Credited $%.2f AI Services Fund top-up to org %s via Square order %s.", dollars, org_id, order_id)
         return {"status": "applied", "kind": kind, "org_id": org_id, "amount_cents": amount_cents}
+
+    if kind == "seat_purchase":
+        try:
+            seat_count = int(metadata.get("seat_count", "0"))
+        except ValueError:
+            seat_count = 0
+        if seat_count <= 0:
+            await db.commit()
+            return {"status": "ignored", "reason": "invalid seat_count"}
+
+        org.purchased_seats = (org.purchased_seats or 0) + seat_count
+        await db.flush()
+
+        if actor_id:
+            await log_action(
+                db, actor_id=actor_id, action="billing.seats_purchased", org_id=org_id,
+                object_type="organization", object_id=org_id,
+                detail={"seat_count": seat_count, "new_total": org.purchased_seats, "square_order_id": order_id},
+            )
+        await db.commit()
+        _log.info("Added %d purchased seat(s) to org %s (total now %d) via Square order %s.", seat_count, org_id, org.purchased_seats, order_id)
+        return {"status": "applied", "kind": kind, "org_id": org_id, "seat_count": seat_count, "total_purchased_seats": org.purchased_seats}
 
     _log.warning("Square webhook for order %s has unknown metadata kind %s.", order_id, kind)
     await db.commit()

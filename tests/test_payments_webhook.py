@@ -337,3 +337,181 @@ def test_downgrade_expired_plans_is_idempotent(client, registered_user):
     # Second run finds nothing left to downgrade — must not error.
     _run(downgrade_expired_plans.main())
     assert _get_org(org_id).plan == "free"
+
+
+# ── Commercial Architecture Phase 1 — Large tier + display names ───────────
+
+def test_plans_dict_has_large_tier_at_correct_amounts():
+    large = payments_router.PLANS["large"]
+    assert large["amount"] == 499900  # $4,999.00
+    large_annual = payments_router.PLANS["large_annual"]
+    assert large_annual["amount"] == 4999000  # $49,990.00
+
+
+def test_plans_dict_enterprise_priced_above_large():
+    # Large ($4,999/mo) must never be more expensive than Enterprise's
+    # marketing anchor — the whole point of raising Enterprise's figure in
+    # this phase (see the comment on PLANS["enterprise"]["amount"]).
+    assert payments_router.PLANS["enterprise"]["amount"] > payments_router.PLANS["large"]["amount"]
+
+
+def test_tier_display_names_covers_every_internal_plan_key():
+    # Every tier a real org can be on must have a display label — a
+    # missing entry would silently fall back to the raw internal string
+    # wherever tierDisplayName()/TIER_DISPLAY_NAMES.get() is used.
+    for tier in ("free", "professional", "team", "organization", "large", "enterprise"):
+        assert tier in payments_router.TIER_DISPLAY_NAMES
+    assert payments_router.TIER_DISPLAY_NAMES["team"] == "Small"
+    assert payments_router.TIER_DISPLAY_NAMES["organization"] == "Medium"
+    assert payments_router.TIER_DISPLAY_NAMES["large"] == "Large"
+
+
+def test_bulk_allowed_plans_includes_large():
+    from routers.foa import BULK_ALLOWED_PLANS
+    assert "large" in BULK_ALLOWED_PLANS
+    assert set(BULK_ALLOWED_PLANS) == {"team", "organization", "large", "enterprise"}
+
+
+def test_complimentary_allowance_seed_includes_large_rows():
+    from engines.service_catalog_engine import COMPLIMENTARY_ALLOWANCE_SEED
+    large_rows = [row for row in COMPLIMENTARY_ALLOWANCE_SEED if row[0] == "large"]
+    # Same four service_keys the other three tiers get complimentary rows for.
+    assert {row[1] for row in large_rows} == {
+        "grant_opportunity_analysis", "doc_cover_letter",
+        "proposal_development_standard", "award_setup_activation",
+    }
+
+
+# ── Additional Seats — create-seats-checkout + webhook ─────────────────────
+
+def test_create_seats_checkout_requires_manage_credits_permission(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    _set_org_plan_and_expiry(org_id, "team", None)
+    other_email = f"other-{uuid.uuid4().hex[:8]}@example.com"
+    client.post("/api/v1/auth/register", json={"email": other_email, "password": "TestPassword123!", "full_name": "Other", "organization": "Other Org"})
+    login = client.post("/api/v1/auth/login", data={"username": other_email, "password": "TestPassword123!"})
+    other_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    resp = client.post("/api/v1/payments/create-seats-checkout", json={"org_id": org_id, "seat_count": 3}, headers=other_headers)
+    assert resp.status_code == 403
+
+
+def test_create_seats_checkout_rejects_ineligible_plan(client, registered_user):
+    # Default "free" plan has no seat price — SEAT_PRICES_CENTS only
+    # covers team/organization/large.
+    org_id = _create_org(client, registered_user["headers"])
+    resp = client.post("/api/v1/payments/create-seats-checkout", json={"org_id": org_id, "seat_count": 2}, headers=registered_user["headers"])
+    assert resp.status_code == 400
+
+    _set_org_plan_and_expiry(org_id, "professional", None)
+    resp = client.post("/api/v1/payments/create-seats-checkout", json={"org_id": org_id, "seat_count": 2}, headers=registered_user["headers"])
+    assert resp.status_code == 400  # Professional is single-user, no seat add-on
+
+    _set_org_plan_and_expiry(org_id, "enterprise", None)
+    resp = client.post("/api/v1/payments/create-seats-checkout", json={"org_id": org_id, "seat_count": 2}, headers=registered_user["headers"])
+    assert resp.status_code == 400  # Enterprise seats are a custom quote, not self-serve
+
+
+def test_create_seats_checkout_rejects_zero_or_over_max_seats(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    _set_org_plan_and_expiry(org_id, "team", None)
+    resp = client.post("/api/v1/payments/create-seats-checkout", json={"org_id": org_id, "seat_count": 0}, headers=registered_user["headers"])
+    assert resp.status_code == 422
+    resp = client.post("/api/v1/payments/create-seats-checkout", json={"org_id": org_id, "seat_count": 9999}, headers=registered_user["headers"])
+    assert resp.status_code == 422
+
+
+def test_create_seats_checkout_503s_without_square_credentials(client, registered_user, monkeypatch):
+    monkeypatch.setattr(payments_router.settings, "SQUARE_PRODUCTION_ACCESS_TOKEN", "")
+    monkeypatch.setattr(payments_router.settings, "SQUARE_SANDBOX_ACCESS_TOKEN", "")
+    org_id = _create_org(client, registered_user["headers"])
+    _set_org_plan_and_expiry(org_id, "organization", None)
+    resp = client.post("/api/v1/payments/create-seats-checkout", json={"org_id": org_id, "seat_count": 5}, headers=registered_user["headers"])
+    assert resp.status_code == 503
+
+
+def test_create_seats_checkout_prices_against_current_plan_tier(client, registered_user, monkeypatch):
+    org_id = _create_org(client, registered_user["headers"])
+    _set_org_plan_and_expiry(org_id, "organization", None)  # Medium — $20/seat/mo
+
+    captured = {}
+
+    async def fake_create_order_payment_link(**kwargs):
+        captured.update(kwargs)
+        return {"url": "https://squareup.example/checkout/fake"}
+
+    async def fake_get_location_id(base_url, token):
+        return "loc-1"
+
+    monkeypatch.setattr(payments_router, "_create_order_payment_link", fake_create_order_payment_link)
+    monkeypatch.setattr(payments_router, "_square_config", lambda: ("https://fake", "fake-token"))
+    monkeypatch.setattr(payments_router, "_get_location_id", fake_get_location_id)
+
+    resp = client.post("/api/v1/payments/create-seats-checkout", json={"org_id": org_id, "seat_count": 4}, headers=registered_user["headers"])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["seat_count"] == 4
+    assert body["amount_cents"] == 4 * 2000  # 4 seats * $20.00
+    assert captured["amount_cents"] == 4 * 2000
+    assert captured["metadata"]["kind"] == "seat_purchase"
+    assert captured["metadata"]["seat_count"] == 4
+    assert captured["metadata"]["plan_at_purchase"] == "organization"
+
+
+def test_webhook_applies_seat_purchase_and_increments_purchased_seats(client, registered_user, monkeypatch):
+    org_id = _create_org(client, registered_user["headers"])
+    _set_org_plan_and_expiry(org_id, "team", None)
+    assert _get_org(org_id).purchased_seats == 0
+
+    async def fake_fetch(base_url, access_token, order_id):
+        return {"kind": "seat_purchase", "org_id": org_id, "seat_count": "3", "plan_at_purchase": "team", "initiated_by_user_id": registered_user["user_id"]}
+    monkeypatch.setattr(payments_router, "_fetch_order_metadata", fake_fetch)
+    monkeypatch.setattr(payments_router, "_square_config", lambda: ("https://fake", "fake-token"))
+
+    resp = _post_webhook(client, _payment_updated_event(order_id="order-seats"))
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "applied", "kind": "seat_purchase", "org_id": org_id, "seat_count": 3, "total_purchased_seats": 3}
+    assert _get_org(org_id).purchased_seats == 3
+
+    # A second purchase adds on top of the first rather than replacing it.
+    async def fake_fetch_2(base_url, access_token, order_id):
+        return {"kind": "seat_purchase", "org_id": org_id, "seat_count": "2", "plan_at_purchase": "team", "initiated_by_user_id": registered_user["user_id"]}
+    monkeypatch.setattr(payments_router, "_fetch_order_metadata", fake_fetch_2)
+    resp2 = _post_webhook(client, _payment_updated_event(order_id="order-seats-2"))
+    assert resp2.status_code == 200
+    assert _get_org(org_id).purchased_seats == 5
+
+
+def test_webhook_ignores_seat_purchase_with_invalid_seat_count(client, registered_user, monkeypatch):
+    org_id = _create_org(client, registered_user["headers"])
+    _set_org_plan_and_expiry(org_id, "team", None)
+
+    async def fake_fetch(base_url, access_token, order_id):
+        return {"kind": "seat_purchase", "org_id": org_id, "seat_count": "0"}
+    monkeypatch.setattr(payments_router, "_fetch_order_metadata", fake_fetch)
+    monkeypatch.setattr(payments_router, "_square_config", lambda: ("https://fake", "fake-token"))
+
+    resp = _post_webhook(client, _payment_updated_event(order_id="order-bad-seats"))
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ignored"
+    assert _get_org(org_id).purchased_seats == 0
+
+
+def test_downgrade_expired_plans_resets_purchased_seats(client, registered_user):
+    org_id = _create_org(client, registered_user["headers"])
+    _set_org_plan_and_expiry(org_id, "team", datetime.now(timezone.utc) - timedelta(days=1))
+
+    async def _bump_seats():
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Organization).where(Organization.id == org_id))
+            org = result.scalar_one()
+            org.purchased_seats = 7
+            await db.commit()
+    _run(_bump_seats())
+    assert _get_org(org_id).purchased_seats == 7
+
+    _run(downgrade_expired_plans.main())
+
+    org = _get_org(org_id)
+    assert org.plan == "free"
+    assert org.purchased_seats == 0

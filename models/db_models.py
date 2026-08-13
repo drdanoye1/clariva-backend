@@ -504,10 +504,15 @@ class Organization(Base):
     # Enterprise Pricing & Engineering Economics (Phase 2 — On-Demand
     # Marketplace & Org Funding Controls). Drives complimentary-allowance
     # lookups (ComplimentaryAllowance.plan) and future entitlement grants.
-    # free | professional | team | organization | enterprise. Defaults to
-    # "free" so every org created before this column existed (or via any
-    # path that doesn't set it explicitly) is treated as the no-paid-plan
-    # tier rather than silently granted allowances it never paid for.
+    # free | professional | team | organization | large | enterprise. These
+    # are internal tier keys only — public-facing labels (Starter/
+    # Professional/Small/Medium/Large/Enterprise) live in
+    # payments.py::TIER_DISPLAY_NAMES and are looked up from this value at
+    # display time, never stored here (Commercial Architecture Phase 1,
+    # Aug 2026 — no migration of stored plan values). Defaults to "free" so
+    # every org created before this column existed (or via any path that
+    # doesn't set it explicitly) is treated as the no-paid-plan tier rather
+    # than silently granted allowances it never paid for.
     plan = Column(String(30), default="free", nullable=False)
 
     # Real-money payment wiring (post-launch addendum — closes the gap where
@@ -525,6 +530,21 @@ class Organization(Base):
     # complimentary-allowance eligibility in service_catalog_engine.py — that
     # engine keys off `plan` alone, same as before this column existed.
     plan_expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Commercial Architecture Phase 1 — Additional Seats. A running count of
+    # extra per-seat licenses purchased on top of whatever user cap the plan
+    # card advertises (Small/Medium/Large — internally team/organization/
+    # large), billed via routers/payments.py's create-seats-checkout +
+    # webhook (SEAT_PRICES, kind="seat_purchase"), same one-time-Payment-
+    # Link-per-charge pattern as the plan subscription itself. NOT enforced
+    # anywhere as an invite cap today — organizations.py has no seat-limit
+    # check at all (confirmed by repo search, Aug 2026), so this column is
+    # currently informational/billing-only: it records what the org has
+    # paid for, for display on org.tsx and future enforcement if that's
+    # ever added. Reset to 0 by scripts/downgrade_expired_plans.py when a
+    # plan lapses back to "free" — purchased seats on a plan that no longer
+    # exists have nothing to attach to.
+    purchased_seats = Column(Integer, default=0, nullable=False)
 
     memberships      = relationship("OrgMembership", back_populates="organization", cascade="all, delete-orphan")
     shared_proposals = relationship("OrgProposal",   back_populates="organization", cascade="all, delete-orphan")

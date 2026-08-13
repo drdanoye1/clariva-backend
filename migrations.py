@@ -277,6 +277,13 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     # Organization.plan_expires_at's docstring in models/db_models.py and
     # scripts/downgrade_expired_plans.py.
     ("organizations", "plan_expires_at", "DATETIME", "TIMESTAMPTZ"),
+
+    # --- organizations (Commercial Architecture Phase 1 — Additional Seats) ---
+    # See Organization.purchased_seats's docstring in models/db_models.py.
+    # Defaults to 0 so every existing org reads as "no extra seats
+    # purchased," which is correct — nothing before this column existed
+    # could have bought any.
+    ("organizations", "purchased_seats", "INTEGER DEFAULT 0", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 # New tables introduced by Phase 2 (service_catalog_items,

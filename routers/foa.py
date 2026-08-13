@@ -865,7 +865,7 @@ async def _analyze_single_opportunity(db: AsyncSession, record: FOARecord, curre
 # back to paid credits, so nothing bulk-specific needed inventing on the
 # pricing side.
 
-BULK_ALLOWED_PLANS = ("team", "organization", "enterprise")
+BULK_ALLOWED_PLANS = ("team", "organization", "large", "enterprise")
 BULK_MAX_ITEMS = 50  # guards against a single request looping 500+ paid AI calls
 
 
@@ -882,7 +882,7 @@ async def _assert_bulk_tier(db: AsyncSession, org_id: str) -> None:
     if plan not in BULK_ALLOWED_PLANS:
         raise HTTPException(
             status_code=403,
-            detail="Bulk Opportunity Intelligence is available on Team, Organization, and Enterprise plans.",
+            detail="Bulk Opportunity Intelligence is available on Team, Organization, Large, and Enterprise plans.",
         )
 
 

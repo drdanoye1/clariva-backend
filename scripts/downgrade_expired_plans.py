@@ -98,8 +98,15 @@ async def main() -> None:
         for org in orgs:
             try:
                 previous_plan = org.plan
+                previous_seats = org.purchased_seats
                 org.plan = "free"
                 org.plan_expires_at = None
+                # Purchased seats (Commercial Architecture Phase 1) are
+                # billed against a specific paid tier's seat price — once
+                # the org has no paid plan, those seats have nothing to
+                # attach to. Reset rather than carry a stale count forward
+                # to whatever tier the org resubscribes to later.
+                org.purchased_seats = 0
                 # System-initiated, not any one member's action — use the
                 # org's creator as the audit actor (same "someone has to be
                 # the actor" constraint audit.log_action enforces
@@ -108,7 +115,7 @@ async def main() -> None:
                 await log_action(
                     db, actor_id=org.created_by, action="billing.plan_expired", org_id=org.id,
                     object_type="organization", object_id=org.id,
-                    detail={"previous_plan": previous_plan, "downgraded_to": "free"},
+                    detail={"previous_plan": previous_plan, "downgraded_to": "free", "seats_cleared": previous_seats},
                 )
                 await db.commit()
                 downgraded += 1

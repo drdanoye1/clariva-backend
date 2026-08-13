@@ -223,6 +223,7 @@ COMPLIMENTARY_ALLOWANCE_SEED: List[Dict] = [
     ("professional", "grant_opportunity_analysis", 2, 90),
     ("team",         "grant_opportunity_analysis", 5, 90),
     ("organization", "grant_opportunity_analysis", 10, 90),
+    ("large",        "grant_opportunity_analysis", 20, 90),
 
     # "Supporting Documents" allowance applies to any one doc_* service —
     # seeded against the most commonly used one (Cover Letter); consume()
@@ -231,15 +232,24 @@ COMPLIMENTARY_ALLOWANCE_SEED: List[Dict] = [
     ("professional", "doc_cover_letter", 2, 90),
     ("team",         "doc_cover_letter", 3, 90),
     ("organization", "doc_cover_letter", 5, 90),
+    ("large",        "doc_cover_letter", 8, 90),
 
     ("professional", "proposal_development_standard", None, 90),  # "Limited trial" — see NOTE below
     ("team",         "proposal_development_standard", 1, 90),
     ("organization", "proposal_development_standard", 1, 90),
+    ("large",        "proposal_development_standard", 2, 90),
 
     ("professional", "award_setup_activation", None, 90),  # "Limited trial"
     ("team",         "award_setup_activation", 1, 90),
     ("organization", "award_setup_activation", 1, 90),
+    ("large",        "award_setup_activation", 2, 90),
 ]
+# "large" tier quantities above (20/8/2/2) are not from a specific SOP table
+# cell — the source spec's allowance table stops at Organization — and were
+# extrapolated by continuing that table's growth curve one step further.
+# Flagged for product review same as the "Limited trial" interpretation note
+# below; adjust the tuples above if/when a real Large-tier allowance number
+# is specified.
 # NOTE: spec §2.3 describes Professional's Standard-Proposal and Award-Setup
 # rows as "Limited trial" rather than a fixed count. Modeled here as
 # quantity=1 (one trial use) rather than quantity=None/"unlimited", since
