@@ -193,6 +193,20 @@ def test_parse_url_tags_source_type_and_org(client, registered_user, mock_parser
     assert record.source == "state_local"
 
 
+def test_parse_url_tags_crowdsourcing_source(client, registered_user, mock_parser):
+    """Added after a user's HeroX challenge link had nowhere accurate to be
+    tagged except "Other/Manual" — see MANUAL_SOURCE_TYPES's docstring in
+    routers/foa.py."""
+    resp = client.post(
+        "/api/v1/foa/parse-url",
+        json={"url": "https://www.herox.com/SomeChallenge", "source_type": "crowdsourcing"},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    record = _get_foa_sync(resp.json()["foa_id"])
+    assert record.source == "crowdsourcing"
+
+
 # ── upload ────────────────────────────────────────────────────────────────────
 
 def test_upload_tags_source_type_via_form_fields(client, registered_user, mock_parser):

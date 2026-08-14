@@ -187,7 +187,20 @@ def _clean_parse_error(exc: Exception) -> HTTPException:
 # docs/ARCHITECTURE.md's funding-sources section), so rather than build a
 # sync integration against data that isn't reliably filterable, the
 # opportunity is on making the manual path fast and properly categorized.
-MANUAL_SOURCE_TYPES = {"manual", "state_local", "foundation", "international"}
+# Added "crowdsourcing" after a user tried to add a HeroX challenge and hit
+# two separate problems: (1) they pasted HeroX's homepage
+# (https://www.herox.com/) rather than a specific challenge's page — a
+# platform homepage is a listing shell with no single opportunity in it, so
+# it can never parse into one FOARecord regardless of source_type, same as
+# pasting grants.gov's homepage instead of a specific NOFO link would fail;
+# and (2) even a *correct* HeroX challenge URL had nowhere accurate to be
+# tagged — "Other/Manual" is a legitimate answer but throws away real
+# signal, since prize/crowdsourcing challenges (HeroX, Challenge.gov,
+# InnoCentive, Kaggle competitions, etc.) are a distinct, recognizable
+# funding source organizations track deliberately, same reasoning as
+# state_local/foundation/international above: no reliable sync-able API,
+# so it's a manual-add category instead of a real integration.
+MANUAL_SOURCE_TYPES = {"manual", "state_local", "foundation", "international", "crowdsourcing"}
 
 
 async def _resolve_manual_source(
