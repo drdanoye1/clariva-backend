@@ -3,13 +3,14 @@ Scope of Work Engine router — exercised through the real HTTP endpoints.
 
 Only the CRUD/ownership/staleness/budget-sync surface is covered here — the
 AI-generation endpoints (generate-methodology, generate-evaluation-plan,
-generate-work-breakdown, derive-from-proposal, suggest-field) need a real
-OpenAI call and are intentionally out of scope for this suite, same policy
-as proposals.py's generate-section (see conftest.py's module docstring).
-derive-from-proposal and suggest-field each have one validation path that
-short-circuits before any OpenAI call (no generated sections to derive from;
-an unrecognized field name) — those paths are covered below since they don't
-need a real API call.
+generate-work-breakdown, derive-from-proposal, generate-risks-kpis,
+suggest-field) need a real OpenAI call and are intentionally out of scope
+for this suite, same policy as proposals.py's generate-section (see
+conftest.py's module docstring). derive-from-proposal, generate-risks-kpis,
+and suggest-field each have one validation path that short-circuits before
+any OpenAI call (no generated sections to derive from; an unrecognized
+field name) — those paths are covered below since they don't need a real
+API call.
 """
 from __future__ import annotations
 
@@ -247,6 +248,29 @@ def test_derive_from_proposal_requires_ownership(client, registered_user):
     other = _register_and_login(client, "other3")
     resp = client.post(
         f"/api/v1/proposals/{proposal_id}/scope-of-work/derive-from-proposal",
+        headers=other["headers"],
+    )
+    assert resp.status_code == 404
+
+
+def test_generate_risks_kpis_400s_with_no_generated_sections(client, registered_user):
+    """Same validation-only convention as derive-from-proposal above — the
+    AI Suggest button next to Risks/KPIs added after a user asked for a
+    proposal-grounded alternative to hand-adding disjointed rows."""
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    resp = client.post(
+        f"/api/v1/proposals/{proposal_id}/scope-of-work/generate-risks-kpis",
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 400
+    assert "generated section content" in resp.json()["detail"]
+
+
+def test_generate_risks_kpis_requires_ownership(client, registered_user):
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    other = _register_and_login(client, "other5")
+    resp = client.post(
+        f"/api/v1/proposals/{proposal_id}/scope-of-work/generate-risks-kpis",
         headers=other["headers"],
     )
     assert resp.status_code == 404

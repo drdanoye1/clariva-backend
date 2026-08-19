@@ -26,8 +26,8 @@ from models.schemas import (
     DeriveFromProposalOut, EvaluationPlanGenerateOut, FieldSuggestOut,
     FieldSuggestRequest, MethodologyGenerateOut, MethodologyGenerateRequest,
     MilestoneCreate, MilestoneOut, MilestoneUpdate, ProjectKnowledgeOut,
-    ProjectKnowledgeUpdate, ScopeOfWorkFull, ScopeOfWorkOut, ScopeOfWorkUpdate,
-    TaskCreate, TaskOut, TaskUpdate, WorkBreakdownGenerateOut,
+    ProjectKnowledgeUpdate, RisksKpisGenerateOut, ScopeOfWorkFull, ScopeOfWorkOut,
+    ScopeOfWorkUpdate, TaskCreate, TaskOut, TaskUpdate, WorkBreakdownGenerateOut,
     WorkBreakdownGenerateRequest, WorkPackageCreate, WorkPackageOut, WorkPackageUpdate,
 )
 from config import settings
@@ -326,6 +326,28 @@ async def derive_from_proposal(
         price_cents_charged=int(GENERATION_COST * 100) if org_id else 0,
     )
     return DeriveFromProposalOut(**draft)
+
+
+@router.post("/{proposal_id}/scope-of-work/generate-risks-kpis", response_model=RisksKpisGenerateOut)
+async def generate_risks_kpis(
+    proposal_id: str, org_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """AI alternative to the manual +Add Risk/+Add KPI buttons — reads the
+    proposal's already-generated section content and proposes risks/KPIs
+    grounded in it, rather than a disjointed hand-typed list. Returned for
+    review; the frontend appends these to the existing risks/kpis arrays
+    and nothing is persisted until Save Project Knowledge is clicked.
+    400s if the proposal has no generated section content yet (same gate
+    as derive-from-proposal above)."""
+    proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
+    await _meter(org_id, current_user.id, db, reason=f"scope_of_work:risks_kpis:{proposal_id}")
+    pk = await engine.get_or_create_project_knowledge(db, proposal_id)
+    draft = await engine.generate_risks_and_kpis(
+        db, proposal, pk, org_id=org_id, user_id=current_user.id,
+        price_cents_charged=int(GENERATION_COST * 100) if org_id else 0,
+    )
+    return RisksKpisGenerateOut(**draft)
 
 
 @router.post("/{proposal_id}/scope-of-work/suggest-field", response_model=FieldSuggestOut)

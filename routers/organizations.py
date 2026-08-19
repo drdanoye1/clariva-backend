@@ -18,14 +18,20 @@ from models.db_models import (
     AuditLog, Invitation, Organization, OrgMembership, OrgProposal,
     Proposal, Team, TeamMembership, User,
 )
-from models.schemas import OrganizationBrandingOut, OrganizationBrandingUpdate
+from models.schemas import (
+    DocumentBrandTemplateCreateRequest, DocumentBrandTemplateOut,
+    DocumentBrandTemplateResolvedOut, OrganizationBrandingOut,
+    OrganizationBrandingUpdate, OrganizationDefaultBrandTemplateUpdate,
+)
 from routers.auth import get_current_user
 from audit import log_action
 from rbac import ROLES, is_valid_role, roles_with_permission
 from engines.partner_engine import PartnerEngine
+from engines.brand_template_engine import BrandTemplateEngine
 
 router = APIRouter()
 partner_engine = PartnerEngine()
+brand_template_engine = BrandTemplateEngine()
 
 INVITATION_EXPIRY_DAYS = 7
 
@@ -622,6 +628,106 @@ async def update_branding(
     await log_action(db, actor_id=current_user.id, action="org.branding_updated", org_id=org_id,
                       object_type="organization", object_id=org_id)
     await db.commit()
+    return OrganizationBrandingOut(
+        org_id=org.id, white_label_enabled=org.white_label_enabled,
+        brand_name=org.brand_name, logo_url=org.logo_url, primary_color=org.primary_color,
+    )
+
+
+# ── Document co-brand / white-label template registry (CLARIVA-DOCGEN-
+#    SPEC-001, Phase 13) ─────────────────────────────────────────────────────
+# A richer, versioned sibling to the single-row branding above: an org can
+# have MULTIPLE named brand templates (e.g. a partner co-brand variant vs
+# their own standalone identity), each independently versioned, applied per
+# export or set as the org's default. See engines/brand_template_engine.py
+# for the resolution/fallback design and BrandTemplateEngine.resolve()'s
+# org-isolation invariant. Same "any member may view, only manage_branding
+# (owner) may change" access split as the branding endpoints above.
+
+@router.get("/{org_id}/brand-templates", response_model=List[DocumentBrandTemplateOut])
+async def list_brand_templates(
+    org_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    await _assert_member(org_id, current_user.id, db)
+    await _get_org_or_404(org_id, db)
+    return await brand_template_engine.list_active_templates_for_org(db, org_id)
+
+
+@router.get("/{org_id}/brand-templates/resolve", response_model=DocumentBrandTemplateResolvedOut)
+async def resolve_brand_template(
+    org_id: str, template_key: Optional[str] = None,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Live preview of the effective, merged branding for a given key (or
+    the org's own default_brand_template_key if template_key is omitted) —
+    what an export would actually apply right now."""
+    await _assert_member(org_id, current_user.id, db)
+    org = await _get_org_or_404(org_id, db)
+    key = template_key or org.default_brand_template_key
+    return await brand_template_engine.resolve(db, key, org_id)
+
+
+@router.get("/{org_id}/brand-templates/{template_key}/versions", response_model=List[DocumentBrandTemplateOut])
+async def list_brand_template_versions(
+    org_id: str, template_key: str,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """This org's own version history for template_key. Always org-scoped
+    (see BrandTemplateEngine.list_versions's org_id contract) — never
+    exposes another org's private versions, and system templates have no
+    org-visible version history here (there is exactly one, admin-managed
+    elsewhere)."""
+    await _assert_member(org_id, current_user.id, db)
+    await _get_org_or_404(org_id, db)
+    return await brand_template_engine.list_versions(db, template_key, org_id)
+
+
+@router.post("/{org_id}/brand-templates", response_model=DocumentBrandTemplateOut)
+async def create_brand_template(
+    org_id: str, body: DocumentBrandTemplateCreateRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    await _assert_permission(org_id, current_user.id, "manage_branding", db)
+    await _get_org_or_404(org_id, db)
+    result = await brand_template_engine.create_version(
+        db, template_key=body.template_key, org_id=org_id, name=body.name,
+        logo_url=body.logo_url, primary_color=body.primary_color,
+        header_text=body.header_text, footer_text=body.footer_text,
+        hide_clariva_branding=body.hide_clariva_branding, notes=body.notes,
+        created_by_user_id=current_user.id, activate=body.activate,
+    )
+    await log_action(db, actor_id=current_user.id, action="org.brand_template_created", org_id=org_id,
+                      object_type="document_brand_template", object_id=result.id)
+    await db.commit()
+    return result
+
+
+@router.post("/{org_id}/brand-templates/{template_id}/activate", response_model=DocumentBrandTemplateOut)
+async def activate_brand_template(
+    org_id: str, template_id: str,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    await _assert_permission(org_id, current_user.id, "manage_branding", db)
+    await _get_org_or_404(org_id, db)
+    result = await brand_template_engine.activate_version(db, template_id, org_id)
+    await log_action(db, actor_id=current_user.id, action="org.brand_template_activated", org_id=org_id,
+                      object_type="document_brand_template", object_id=template_id)
+    await db.commit()
+    return result
+
+
+@router.patch("/{org_id}/brand-templates/default", response_model=OrganizationBrandingOut)
+async def set_default_brand_template(
+    org_id: str, body: OrganizationDefaultBrandTemplateUpdate,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    await _assert_permission(org_id, current_user.id, "manage_branding", db)
+    org = await _get_org_or_404(org_id, db)
+    await brand_template_engine.set_default_for_org(db, org_id, body.template_key)
+    await log_action(db, actor_id=current_user.id, action="org.brand_template_default_set", org_id=org_id,
+                      object_type="organization", object_id=org_id)
+    await db.commit()
+    await db.refresh(org)
     return OrganizationBrandingOut(
         org_id=org.id, white_label_enabled=org.white_label_enabled,
         brand_name=org.brand_name, logo_url=org.logo_url, primary_color=org.primary_color,

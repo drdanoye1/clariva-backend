@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -16,12 +16,15 @@ from config import settings
 from database import get_db
 from models.db_models import Proposal, ProposalSection, ProposalStatusEvent, FOARecord, OrgContextDB, User, new_uuid
 from engines.company_profile import get_org_context
-from models.schemas import ProposalCreate, ProposalOut, SectionContent, SectionGenerateRequest
+from models.schemas import ProposalCreate, ProposalOut, SectionContent, SectionGenerateRequest, ComplianceReport, TenseValidationOut
+from engines.compliance_engine import ComplianceEngine
 from engines.grant_templates import get_sections as get_grant_sections, list_grant_types
 from routers.auth import get_current_user
 from engines.proposal_generator import ProposalGeneratorEngine
+from engines.tense_validator import TenseValidatorEngine
+from engines.agency_profile_engine import AgencyProfileEngine
 from engines.workflow_engine import WorkflowEngine
-from engines.credit_engine import CreditEngine, GENERATION_COST, InsufficientCreditsError, debit_or_402
+from engines.credit_engine import CreditEngine, GENERATION_COST, VALIDATION_COST, InsufficientCreditsError, debit_or_402
 from engines.service_catalog_engine import ServiceCatalogEngine
 from engines import usage_tracking
 from routers.organizations import _assert_member
@@ -50,6 +53,9 @@ router        = APIRouter()
 generator     = ProposalGeneratorEngine()
 workflow      = WorkflowEngine()
 catalog_engine = ServiceCatalogEngine()
+compliance_engine = ComplianceEngine()
+tense_validator = TenseValidatorEngine()
+agency_profile_engine = AgencyProfileEngine()
 
 
 def _derive_proposal_tier(foa: Optional[FOARecord]) -> str:
@@ -184,6 +190,7 @@ async def _load_proposal(proposal_id: str, db: AsyncSession, owner_id: Optional[
                 word_count=s.word_count,
                 page_estimate=s.page_estimate,
                 compliance_flags=s.compliance_flags or [],
+                structured_content=s.structured_content,
             )
             for s in sections
         ],
@@ -316,6 +323,36 @@ async def get_proposal(
     return await _load_proposal(proposal_id, db, owner_id=current_user.id)
 
 
+@router.get("/{proposal_id}/compliance", response_model=ComplianceReport)
+async def get_proposal_compliance(
+    proposal_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Phase 5 export QA gate (CLARIVA-DOCGEN-SPEC-001) — run ComplianceEngine
+    against the proposal's current sections without exporting anything, so
+    the UI can show findings (unresolved placeholders, malformed tables/URLs,
+    invalid section schema, page-limit issues) before the user ever clicks
+    Export. Same engine and same ComplianceReport the /documents/export
+    endpoint uses when require_clean_export=True — this is a preview of
+    exactly what that gate would see."""
+    proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
+    sec_result = await db.execute(
+        select(ProposalSection)
+        .where(ProposalSection.proposal_id == proposal_id)
+        .order_by(ProposalSection.order_index)
+    )
+    sections = sec_result.scalars().all()
+    # Phase 7 — same admin-editable AgencyProfile resolution export() uses,
+    # so this preview matches exactly what require_clean_export=True would see.
+    resolved_profile = await agency_profile_engine.resolve(db, getattr(proposal, "agency", None) or "OTHER")
+    return compliance_engine.validate(
+        proposal, sections,
+        section_limits_override=resolved_profile.section_limits,
+        total_limit_override=resolved_profile.total_page_limit,
+    )
+
+
 @router.post("/{proposal_id}/generate-section", response_model=SectionContent)
 async def generate_section(
     proposal_id: str,
@@ -348,18 +385,29 @@ async def generate_section(
     if not section:
         raise HTTPException(status_code=404, detail="Section not found")
 
+    # Phase 7 — resolve once, pass the merged value in (see
+    # proposal_generator.py::generate_section()'s agency_override docstring
+    # for why this isn't a `db` handle passed straight through).
+    resolved_profile = await agency_profile_engine.resolve(db, getattr(proposal, "agency", None) or "OTHER")
+
     generated = await generator.generate_section(
         section_id=body.section_id,
         section_title=section.title,
         proposal=proposal,
         company_profile=company_profile,
         additional_context=body.additional_context,
+        agency_override=resolved_profile,
     )
 
-    section.content          = generated["content"]
-    section.word_count       = generated["word_count"]
-    section.page_estimate    = generated["page_estimate"]
-    section.compliance_flags = generated.get("missing_flags", [])
+    section.content            = generated["content"]
+    section.word_count         = generated["word_count"]
+    section.page_estimate      = generated["page_estimate"]
+    section.compliance_flags   = generated.get("missing_flags", [])
+    # Phase 4 (block-JSON migration) — structured_content is now the
+    # authoritative render source (document_output.py prefers it when
+    # present); `content` above stays in sync as its derived plain-text
+    # mirror. Nullable/additive column, so nothing else needs to change.
+    section.structured_content = generated.get("structured_content")
 
     # Phase 3 §4.7 — Administrator-Only Engineering Economics.
     usage = generated.get("_usage") or {}
@@ -379,6 +427,7 @@ async def generate_section(
         word_count=section.word_count,
         page_estimate=section.page_estimate,
         compliance_flags=section.compliance_flags or [],
+        structured_content=section.structured_content,
     )
 
 
@@ -439,6 +488,12 @@ async def generate_all_sections(
                                 reason=f"proposal_generation:all:{proposal_id}")
 
     if empty_sections:
+        # Phase 7 — resolve the agency profile ONCE before the gather (same
+        # "load once, reuse across every parallel call" reasoning as
+        # company_profile above) rather than inside each parallel task,
+        # since AsyncSession is not safe for concurrent use.
+        resolved_profile = await agency_profile_engine.resolve(db, getattr(proposal, "agency", None) or "OTHER")
+
         # Fire all AI calls in parallel — reduces total time from O(n*15s) to O(15s)
         results = await asyncio.gather(
             *[
@@ -447,6 +502,7 @@ async def generate_all_sections(
                     section_title=s.title,
                     proposal=proposal,
                     company_profile=company_profile,
+                    agency_override=resolved_profile,
                 )
                 for s in empty_sections
             ],
@@ -462,10 +518,11 @@ async def generate_all_sections(
                     "Section %s generation failed: %s", section.section_id, result
                 )
                 continue
-            section.content          = result["content"]
-            section.word_count       = result["word_count"]
-            section.page_estimate    = result["page_estimate"]
-            section.compliance_flags = result.get("missing_flags", [])
+            section.content            = result["content"]
+            section.word_count         = result["word_count"]
+            section.page_estimate      = result["page_estimate"]
+            section.compliance_flags   = result.get("missing_flags", [])
+            section.structured_content = result.get("structured_content")
 
             # Phase 3 §4.7 — Administrator-Only Engineering Economics. COGS
             # is recorded per section regardless of billing path (it's a
@@ -487,6 +544,115 @@ async def generate_all_sections(
     proposal.status = "in_review"
     await db.flush()
     return await _load_proposal(proposal_id, db)
+
+
+def _grant_label(proposal: Any) -> str:
+    """Lightweight grant-label string for prompt context — no need for the
+    full get_grant_type()/get_generation_context() machinery proposal_generator.py
+    uses, since this is just flavor text for the tense-check prompt, not
+    something the model's terminology rules depend on."""
+    return (
+        getattr(proposal, "program_label", None)
+        or (getattr(proposal, "grant_type", None) or "").replace("_", " ").title()
+        or getattr(proposal, "agency", None)
+        or ""
+    )
+
+
+@router.post("/{proposal_id}/sections/{section_id}/validate-tense", response_model=TenseValidationOut)
+async def validate_section_tense(
+    proposal_id: str,
+    section_id: str,
+    org_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Phase 6 export QA (CLARIVA-DOCGEN-SPEC-001) — future-tense validator.
+    Same org_id / credit-metering contract as generate_section: pass org_id
+    to meter against that org's AI credit pool at VALIDATION_COST (a fraction
+    of GENERATION_COST — this reads existing content, it doesn't regenerate
+    it); omit it for free personal use. Stateless — findings are returned
+    directly, not persisted, so re-checking after an edit always reflects the
+    current content with no stale-cache risk."""
+    proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
+    if org_id:
+        await _assert_member(org_id, current_user.id, db)
+        await debit_or_402(credit_engine, db, org_id, current_user.id, VALIDATION_COST,
+                            reason=f"proposal_tense_check:{section_id}")
+
+    sec_result = await db.execute(
+        select(ProposalSection).where(
+            ProposalSection.proposal_id == proposal_id,
+            ProposalSection.section_id == section_id,
+        )
+    )
+    section = sec_result.scalar_one_or_none()
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found")
+
+    result = await tense_validator.validate_section(
+        section_id=section.section_id,
+        section_title=section.title,
+        content=section.content or "",
+        grant_label=_grant_label(proposal),
+        db=db, org_id=org_id, user_id=current_user.id,
+        price_cents_charged=int(VALIDATION_COST * 100) if org_id else 0,
+    )
+    await db.flush()
+    return result
+
+
+@router.post("/{proposal_id}/validate-tense", response_model=List[TenseValidationOut])
+async def validate_all_sections_tense(
+    proposal_id: str,
+    org_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Bulk version of validate_section_tense — same per-section
+    VALIDATION_COST charge for each non-empty section (org-scoped only),
+    fired in parallel like generate_all_sections. Empty sections are skipped
+    entirely (no charge, nothing to check)."""
+    proposal = await _get_proposal_or_404(proposal_id, current_user.id, db)
+
+    sec_result = await db.execute(
+        select(ProposalSection)
+        .where(ProposalSection.proposal_id == proposal_id)
+        .order_by(ProposalSection.order_index)
+    )
+    sections = [s for s in sec_result.scalars().all() if (s.content or "").strip()]
+
+    if sections and org_id:
+        await _assert_member(org_id, current_user.id, db)
+        await debit_or_402(credit_engine, db, org_id, current_user.id,
+                            VALIDATION_COST * len(sections),
+                            reason=f"proposal_tense_check:all:{proposal_id}")
+
+    grant_label = _grant_label(proposal)
+    results = await asyncio.gather(
+        *[
+            tense_validator.validate_section(
+                section_id=s.section_id, section_title=s.title, content=s.content or "",
+                grant_label=grant_label, db=db, org_id=org_id, user_id=current_user.id,
+                price_cents_charged=int(VALIDATION_COST * 100) if org_id else 0,
+            )
+            for s in sections
+        ],
+        return_exceptions=True,
+    )
+
+    out: List[TenseValidationOut] = []
+    for section, result in zip(sections, results):
+        if isinstance(result, Exception):
+            import logging
+            logging.getLogger(__name__).error(
+                "Tense validation for section %s failed: %s", section.section_id, result
+            )
+            continue
+        out.append(result)
+
+    await db.flush()
+    return out
 
 
 @router.patch("/{proposal_id}/sections/{section_id}", response_model=SectionContent)
@@ -512,6 +678,13 @@ async def update_section_content(
     section.content       = body.content
     section.word_count    = words
     section.page_estimate = round(words / 500, 2)
+    # A manual raw-text edit can't be safely reinterpreted as structured
+    # blocks, and document_output.py's exporter prefers structured_content
+    # over content whenever it's present — leaving a stale block JSON here
+    # would silently render the OLD AI draft instead of the user's edit.
+    # Clear it so export falls back to the legacy content renderer, which
+    # reflects exactly what the user just saved.
+    section.structured_content = None
     await db.flush()
 
     return SectionContent(
@@ -521,6 +694,7 @@ async def update_section_content(
         word_count=section.word_count,
         page_estimate=section.page_estimate,
         compliance_flags=section.compliance_flags or [],
+        structured_content=section.structured_content,
     )
 
 

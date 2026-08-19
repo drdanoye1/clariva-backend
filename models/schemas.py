@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -251,6 +251,15 @@ class SectionContent(BaseModel):
     word_count: int
     page_estimate: float
     compliance_flags: list = []
+    # Word/PDF Report Generation Development Specification (CLARIVA-DOCGEN-
+    # SPEC-001), Phase 1 — the canonical block-JSON representation of this
+    # section, if generation/editing has produced one yet. `content` above
+    # remains the derived plain-text field every other code path (search,
+    # embedding, TXT export, legacy render_content() path) reads; this is
+    # the structured source of truth once populated. Null for every section
+    # until Phase 4 (content generation) migrates to emitting it. Same
+    # additive/nullable split as DocumentVersion.structured_data.
+    structured_content: Optional[Dict[str, Any]] = None
 
 class ProposalCreate(BaseModel):
     title: str
@@ -388,6 +397,23 @@ class ExportRequest(BaseModel):
     include_compliance_status: bool = True
     generate_figures: bool = False
     format_options: Optional[ExportFormatOptions] = None
+    # Phase 5 export QA gate (CLARIVA-DOCGEN-SPEC-001) — when True, the export
+    # aborts with a 422 (no file generated, nothing uploaded to R2) if
+    # ComplianceEngine finds any error-severity violation (unresolved
+    # blocking placeholder, malformed table, invalid section schema, etc.).
+    # False (default) preserves today's behavior exactly: export always
+    # succeeds and the findings just ride along on ExportResponse.compliance_report
+    # for the caller to act on or ignore — a mid-draft export for internal
+    # review shouldn't be blocked by gaps the user already knows about.
+    require_clean_export: bool = False
+    # CLARIVA-DOCGEN-SPEC-001 Phase 13 — explicit brandingProfile override.
+    # None (default) preserves today's behavior: since this endpoint always
+    # exports with org_id=None (see routers/documents.py's comment on why),
+    # an explicit key here can only ever resolve a Clariva SYSTEM template
+    # (org_id null), never a private org white-label variant — the
+    # org-scoped brand-templates endpoints on routers/organizations.py are
+    # the path for that.
+    brand_template_key: Optional[str] = None
 
 class ExportResponse(BaseModel):
     proposal_id: str
@@ -395,6 +421,9 @@ class ExportResponse(BaseModel):
     download_url: str
     file_size_bytes: int
     exported_at: datetime
+    # Always populated (even when require_clean_export=False) so callers can
+    # show a "N issues — review before submission" banner post-export.
+    compliance_report: Optional["ComplianceReport"] = None
 
 
 # ── Stored Files (Version 3.0 upgrade, "Real File Storage" Phase C) ────────────
@@ -717,6 +746,17 @@ class DeriveFromProposalOut(BaseModel):
     source_sections_used: List[str] = []
 
 
+class RisksKpisGenerateOut(BaseModel):
+    """AI-proposed risks/KPIs grounded in the proposal's already-generated
+    section content — returned for review and appended to the existing
+    risks/kpis arrays client-side; nothing is saved until the user clicks
+    Save Project Knowledge, same "draft first, save separately" contract
+    as DeriveFromProposalOut above."""
+    risks: List[RiskItem] = []
+    kpis: List[KPIItem] = []
+    source_sections_used: List[str] = []
+
+
 class FieldSuggestRequest(BaseModel):
     field: str  # one of: objectives, need_statement, outputs, outcomes
     current_value: Optional[str] = None
@@ -890,6 +930,14 @@ class DocumentVersionCreate(BaseModel):
     file_url: Optional[str] = None
     format: Optional[str] = None
     change_note: Optional[str] = None
+    # Logic Model Chart Generator (Development Brief 2026-08-14) — lets the
+    # frontend's inline bullet editor publish a hand-edited chart as a new
+    # version with no AI call (free, instant) by round-tripping the same
+    # structured_data shape GET /documents/{id}/versions returns. Ignored
+    # for every other document type, same additive/nullable pattern as the
+    # matching DocumentVersion columns (backend/models/db_models.py).
+    structured_data: Optional[Dict[str, Any]] = None
+    framework: Optional[str] = None
 
 class DocumentVersionOut(BaseModel):
     id: str
@@ -900,6 +948,14 @@ class DocumentVersionOut(BaseModel):
     format: Optional[str] = None
     change_note: Optional[str] = None
     has_embedding: bool = False
+    # Logic Model Chart Generator (Development Brief 2026-08-14, Engineering
+    # Addendum §18) — the structured {framework, title, <stage>: [...]}
+    # object this version was generated with, if any. Null for every other
+    # document type, and for Logic Models generated before this shipped
+    # (see DocumentVersion.structured_data's docstring) — the frontend
+    # falls back to Detailed-only display of `content` in that case.
+    structured_data: Optional[Dict[str, Any]] = None
+    framework: Optional[str] = None
     created_by: str
     created_at: datetime
 
@@ -970,6 +1026,528 @@ class GenerateSupportingDocumentRequest(BaseModel):
     recipient_name: Optional[str] = None
     recipient_organization: Optional[str] = None
     additional_context: Optional[str] = None
+    # Logic Model Chart Generator (Development Brief 2026-08-14) — only
+    # meaningful when doc_type == "logic_model"; ignored for every other
+    # doc_type, same additive/nullable-and-ignored-elsewhere pattern as
+    # every other optional field on this shared request. "standard" (5
+    # stages, Inputs→Activities→Outputs→Outcomes→Impact) or "extended" (6
+    # stages, splits Outcomes into Short-Term/Intermediate before
+    # Long-Term Impact) — see the brief's §2.
+    framework: Optional[str] = "standard"
+
+
+# ── Logic Model Chart Generator (Development Brief 2026-08-14) ──────────────
+# The brief's §6 JSON schemas, expressed as Pydantic models so the engine's
+# structured-generation call can validate against them directly (§16:
+# "attempt one structured regeneration if validation fails" / "never expose
+# malformed JSON to the user") rather than trusting free-form AI JSON.
+
+class LogicModelStandardData(BaseModel):
+    framework: Literal["standard"] = "standard"
+    title: str
+    inputs: List[str] = []
+    activities: List[str] = []
+    outputs: List[str] = []
+    outcomes: List[str] = []
+    impact: List[str] = []
+
+
+class LogicModelExtendedData(BaseModel):
+    framework: Literal["extended"] = "extended"
+    title: str
+    inputs: List[str] = []
+    activities: List[str] = []
+    outputs: List[str] = []
+    shortTermOutcomes: List[str] = []
+    intermediateOutcomes: List[str] = []
+    longTermImpact: List[str] = []
+
+
+# Stage keys per framework, in display order — the single source of truth
+# both the engine (prompt construction, validation) and any future
+# server-side rendering share, so the two never drift apart. Mirrors the
+# brief's §7 desktop pathway order exactly.
+LOGIC_MODEL_STAGE_KEYS: Dict[str, List[str]] = {
+    "standard": ["inputs", "activities", "outputs", "outcomes", "impact"],
+    "extended": ["inputs", "activities", "outputs", "shortTermOutcomes", "intermediateOutcomes", "longTermImpact"],
+}
+LOGIC_MODEL_STAGE_LABELS: Dict[str, str] = {
+    "inputs": "Inputs", "activities": "Activities", "outputs": "Outputs",
+    "outcomes": "Outcomes", "impact": "Impact",
+    "shortTermOutcomes": "Short-Term Outcomes", "intermediateOutcomes": "Intermediate Outcomes",
+    "longTermImpact": "Long-Term Impact",
+}
+# Which stages survive a framework switch unchanged (§10/§16: "preserve
+# compatible Inputs, Activities, and Outputs where possible and
+# regenerate/restructure outcome stages"). Only these three are common to
+# both frameworks by construction.
+LOGIC_MODEL_PRESERVED_ON_SWITCH = ["inputs", "activities", "outputs"]
+
+
+class LogicModelRegenerateStageRequest(BaseModel):
+    stage: str  # one of LOGIC_MODEL_STAGE_KEYS[<current framework>]
+
+
+class LogicModelSwitchFrameworkRequest(BaseModel):
+    framework: str  # "standard" | "extended" — the framework to switch TO
+
+
+class LogicModelCopyToProposalRequest(BaseModel):
+    section_id: str
+    mode: Literal["append", "replace"] = "append"
+
+
+# ── Universal Document Block Schema (Report Formatting & Figures Upgrade,
+# Phase 1, 2026-08-19) ───────────────────────────────────────────────────────
+# Canonical semantic content model shared by every Clariva-generated Word/
+# PDF export, per CLARIVA-DOCGEN-SPEC-001 §3 ("Canonical Document JSON
+# Schema"). Content generation (Phase 4) will emit these block types instead
+# of the markdown-ish string proposal_generator.py produces today; the DOCX
+# renderer (Phase 2) will consume them directly instead of doc_utils.py::
+# render_content()'s regex line-parser.
+#
+# Storage: ProposalSection.structured_content (JSON, nullable — see that
+# column's docstring in models/db_models.py). `content` (Text) stays the
+# derived/flattened plain-text field every other code path (search,
+# embedding, TXT export, the pre-Phase-2 DOCX/PDF path) already reads — the
+# same "structured JSON is authoritative, content is the derived display/
+# search text" split the Logic Model Chart feature established with
+# structured_data + flatten_logic_model_to_text(). A matching
+# flatten_section_blocks_to_text() helper lands in Phase 2 alongside the
+# renderer.
+#
+# Each block's `type` field is a Literal used as the discriminator for the
+# DocumentBlock union below, so Pydantic routes each dict to the correct
+# block class and raises on any unrecognized type — CLARIVA-DOCGEN-SPEC-001
+# §3: "Unknown block types SHALL fail validation in production."
+
+class TextRun(BaseModel):
+    """One run of rich text inside a paragraph/runIn body — §3.2."""
+    text: str
+    bold: bool = False
+    italic: bool = False
+    # Marks the bold label segment of a run-in style paragraph when a
+    # renderer wants to walk `runs` uniformly instead of switching on block
+    # type. Optional and currently informational only.
+    semanticRole: Optional[Literal["runInLabel"]] = None
+    # Set when this run is a citation reference rather than plain prose; the
+    # renderer resolves it against the section's ReferencesBlock entries.
+    citationId: Optional[str] = None
+
+
+class MissingPlaceholder(BaseModel):
+    """§3.3 Missing Data Contract — content SHALL NOT be silently invented.
+    Used either as a standalone block (a whole section still awaiting data)
+    or nested in a ParagraphBlock's `missing` field (an inline gap inside
+    otherwise-real prose). Renderers show a controlled callout in draft mode
+    and block final-submission export while a "blocking" instance remains
+    (enforced by the Phase 5 export QA gate, not by this schema)."""
+    field: str
+    label: str
+    severity: Literal["blocking", "warning"] = "blocking"
+
+
+class ParagraphBlock(BaseModel):
+    type: Literal["paragraph"] = "paragraph"
+    # `text` is a convenience shorthand for prose with no inline bold/
+    # italic; `runs` carries rich formatting. Exactly one SHOULD be set —
+    # the renderer prefers `runs` when both are present.
+    text: Optional[str] = None
+    runs: Optional[List[TextRun]] = None
+    missing: Optional[MissingPlaceholder] = None
+
+
+class RunInBlock(BaseModel):
+    """Bold label + body in one paragraph — Personnel, Equipment, Travel,
+    Indirect Costs, etc. §3.1 and §4/§5's "Clariva Run-In" DOCX style."""
+    type: Literal["runIn"] = "runIn"
+    label: str
+    text: str
+
+
+class BulletListBlock(BaseModel):
+    type: Literal["bulletList"] = "bulletList"
+    items: List[str]
+
+
+class NumberedListBlock(BaseModel):
+    type: Literal["numberedList"] = "numberedList"
+    items: List[str]
+
+
+class TableBlock(BaseModel):
+    """A real Word table — columns[]/rows[], never Markdown pipe syntax.
+    §5.1: numeric/currency columns right-aligned, short status/date columns
+    centered, narrative columns left-aligned; `columnAlign` lets the caller
+    set this explicitly, otherwise the renderer infers it per column."""
+    type: Literal["table"] = "table"
+    columns: List[str]
+    rows: List[List[str]]
+    caption: Optional[str] = None
+    columnAlign: Optional[List[Literal["left", "center", "right"]]] = None
+
+
+class SchedulePhase(BaseModel):
+    """One Gantt row. A Clariva extension beyond CLARIVA-DOCGEN-SPEC-001's
+    base block set, added specifically to fix the malformed-schedule-table
+    defect the Professional Report Formatting Standard's §1 review calls
+    out: the current renderer (doc_utils.py::add_gantt_table()) regex-scans
+    free-form prose for the literal string "Phase Name (Months X-Y)" and
+    silently falls back to a placeholder box on any deviation. A
+    ScheduleBlock of these makes the phase/month data real, validated input
+    instead of a string pattern the model has to reproduce exactly."""
+    name: str
+    start_month: int = Field(ge=1)
+    end_month: int = Field(ge=1)
+
+
+class ScheduleBlock(BaseModel):
+    type: Literal["schedule"] = "schedule"
+    title: str = "Project Schedule"
+    phases: List[SchedulePhase]
+
+
+class FigureBlock(BaseModel):
+    """§3.1 and §5.2 — every figure SHALL have assetId, caption, and
+    altText. `assetId` is null until the AI Figure Generation pipeline
+    (Phases 9-12) produces and stores the asset; the renderer shows a
+    controlled draft placeholder in that case rather than a caption
+    pretending the figure exists (§5.2's explicit prohibition)."""
+    type: Literal["figure"] = "figure"
+    assetId: Optional[str] = None
+    figureNumber: Optional[int] = None
+    caption: str
+    altText: Optional[str] = None
+
+
+class CalloutBlock(BaseModel):
+    """Styled note/warning/missing-information box — §3.1."""
+    type: Literal["callout"] = "callout"
+    kind: Literal["warning", "note", "missing", "info"] = "note"
+    title: Optional[str] = None
+    text: str
+
+
+class PageBreakBlock(BaseModel):
+    type: Literal["pageBreak"] = "pageBreak"
+
+
+class ReferenceEntry(BaseModel):
+    text: str
+    url: Optional[str] = None
+
+
+class ReferencesBlock(BaseModel):
+    """Hanging-indent reference list — §3.1: "no escaped URL artifacts.\""""
+    type: Literal["references"] = "references"
+    entries: List[ReferenceEntry]
+
+
+DocumentBlock = Annotated[
+    Union[
+        ParagraphBlock, RunInBlock, BulletListBlock, NumberedListBlock,
+        TableBlock, ScheduleBlock, FigureBlock, CalloutBlock, PageBreakBlock,
+        ReferencesBlock,
+    ],
+    Field(discriminator="type"),
+]
+
+
+class StructuredSectionContent(BaseModel):
+    """The JSON shape stored in ProposalSection.structured_content. Mirrors
+    CLARIVA-DOCGEN-SPEC-001's Section object (§3) minus `id`/`title`/
+    `level`, which already exist as native ProposalSection/section-registry
+    fields — no need to duplicate them inside the JSON blob."""
+    schemaVersion: Literal["1.0"] = "1.0"
+    blocks: List[DocumentBlock] = []
+
+
+# ── Future-tense validator (Phase 6, per-section LLM QA pass) ───────────────
+# CLARIVA-DOCGEN-SPEC-001 Phase 6 — deliberately a second LLM call rather than
+# a rules-based/regex tense checker (explicit product decision): grant prose
+# legitimately mixes tenses (past for the applicant's track record, future for
+# proposed work, present for ongoing facts), and only a model with the
+# surrounding context can tell which is which. A regex for "we developed"
+# can't distinguish "we developed this approach in our prior award" (correct
+# past tense) from "we developed this approach" describing PROPOSED work
+# (should be "we will develop").
+
+class TenseIssue(BaseModel):
+    """One flagged sentence/clause from the LLM's tense-consistency pass."""
+    quote: str          # the exact (or near-exact) offending text, for locating it in the section
+    problem: str         # why this is wrong, e.g. "past tense used for proposed future work"
+    suggested_fix: str   # a corrected rewrite of the same sentence
+
+
+class TenseCheckOutput(BaseModel):
+    """Raw shape the LLM is asked to return — validated then wrapped into
+    TenseValidationOut (adds section_id/checked_at) by the router."""
+    clean: bool
+    issues: List[TenseIssue] = []
+
+
+class TenseValidationOut(BaseModel):
+    """API response for both the single-section and all-sections tense-check
+    endpoints (routers/proposals.py)."""
+    section_id: str
+    title: str
+    clean: bool
+    issues: List[TenseIssue] = []
+    checked_at: datetime
+
+
+# ── Agency-Profile Resolver (CLARIVA-DOCGEN-SPEC-001, Phase 7) ─────────────────
+# Makes per-agency prompt guidance (proposal_generator.py's AGENCY_GUIDANCE)
+# and page-limit rules (compliance_engine.py's AGENCY_SECTION_LIMITS /
+# AGENCY_TOTAL_LIMITS) admin-editable at runtime via versioned DB rows
+# (models.db_models.AgencyProfile), instead of requiring a code deploy for
+# every agency-guidance update. See engines/agency_profile_engine.py.
+
+class AgencyProfileVersionOut(BaseModel):
+    """One historical or active version row for an agency — the admin-facing
+    list/detail view. Mirrors AgencyProfile's columns 1:1."""
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    agency_code: str
+    version: int
+    is_active: bool
+    guidance_text: Optional[str] = None
+    section_limits: Optional[Dict[str, int]] = None
+    total_page_limit: Optional[int] = None
+    notes: Optional[str] = None
+    created_by_user_id: Optional[str] = None
+    created_at: datetime
+
+
+class AgencyProfileResolvedOut(BaseModel):
+    """The merged, effective profile for one agency — always fully populated
+    (every field falls back to the hardcoded AGENCY_GUIDANCE / AGENCY_SECTION_LIMITS
+    / AGENCY_TOTAL_LIMITS default when no DB override exists for that specific
+    field). `version` is None when no AgencyProfile row is active for this
+    agency at all, so callers/UI can distinguish "using platform defaults"
+    from "using an admin-configured profile"."""
+    agency_code: str
+    guidance_text: str
+    section_limits: Dict[str, int] = {}
+    total_page_limit: int
+    version: Optional[int] = None
+
+
+class AgencyProfileVersionCreate(BaseModel):
+    """Request body for creating a new (inactive by default) version. Every
+    field is optional — null/omitted means "no override, keep falling back
+    to the hardcoded default for this field" (see AgencyProfileResolvedOut).
+    activate=True creates the version and immediately makes it the active one
+    in the same call, saving the admin a second request for the common case."""
+    guidance_text: Optional[str] = None
+    section_limits: Optional[Dict[str, int]] = None
+    total_page_limit: Optional[int] = None
+    notes: Optional[str] = None
+    activate: bool = False
+
+
+# ── AI Figure Generation & Technical Illustration (docs/2_Upgrades_Clariva_AI_
+#    Figure_Specification_V01.docx, Phase 9 — "Figure JSON model") ─────────────
+# Mirrors models/db_models.py::ProposalFigureSet/ProposalFigure — see that
+# class's docstring for why this is two related tables (queryable
+# approval_status/figure_number) rather than one JSON blob, and for why
+# figure_type/diagram_family/visual_style/view_type stay plain `str` instead
+# of strict enums (the spec explicitly treats its own examples as
+# non-exhaustive, e.g. §1's "...or another high-level functional
+# representation appropriate to the proposal"). Only the three fields this
+# app fully owns as closed sets — technical-accuracy classification,
+# approval status, and figure-set status — get real enums below.
+
+class TechnicalAccuracyClassification(str, Enum):
+    """Spec §17 — every functional node and Figure 2 callout must be
+    classified so a "conceptual" element is never presented as a finalized
+    design decision (§18)."""
+    CONFIRMED  = "confirmed"    # explicitly described in proposal content
+    INFERRED   = "inferred"     # reasonably necessary but not explicitly specified
+    CONCEPTUAL = "conceptual"   # introduced to create a coherent visualization
+
+
+class FigureApprovalStatus(str, Enum):
+    """Spec §22 — no AI-generated figure becomes final without user review
+    when the workflow supports approval. Phase 12 is what actually enforces
+    transitions between these; this phase just defines the vocabulary."""
+    PENDING             = "pending"
+    APPROVED            = "approved"
+    REJECTED            = "rejected"
+    NEEDS_REGENERATION  = "needs_regeneration"
+
+
+class FigureSetStatus(str, Enum):
+    """Set-level rollup — see ProposalFigureSet.status's column comment for
+    the full planning -> generating -> ready -> approved/rejected lifecycle."""
+    PLANNING   = "planning"
+    GENERATING = "generating"
+    READY      = "ready"
+    APPROVED   = "approved"
+    REJECTED   = "rejected"
+
+
+class FigureNode(BaseModel):
+    """Spec §5/§17 — one functional stage within a figure, e.g. Figure 1's
+    "2 AI Algorithm Training" node. `order` is 1-indexed and independent of
+    dict/list ordering so a renderer never has to trust JSON key order."""
+    id: str
+    label: str
+    order: int
+    classification: TechnicalAccuracyClassification = TechnicalAccuracyClassification.CONFIRMED
+
+
+class FigureCallout(BaseModel):
+    """Spec §14 Panel B / §16 — one numbered legend entry on a Figure 2
+    technical illustration. `relates_to_node` is a FigureNode.id from the
+    figure this one depends on (§11 functional-to-physical traceability),
+    letting a reviewer trace "2 AI Processing" on Figure 2 back to "2 AI
+    Algorithm Training" on Figure 1 — null when this callout doesn't map
+    cleanly onto a single Figure 1 node (e.g. a purely structural/support
+    component like an enclosure)."""
+    number: int
+    label: str
+    relates_to_node: Optional[str] = None
+    classification: TechnicalAccuracyClassification = TechnicalAccuracyClassification.CONFIRMED
+
+
+class FigurePanel(BaseModel):
+    """Spec §14 — Figure 2's recommended two-panel design. `role` is
+    typically "perspective" (Panel A — what it looks like) or "sectional"
+    (Panel B — what's inside it), per §13's guidance that
+    perspective+sectional together answer both questions."""
+    panel: str            # "A" | "B" | ... (not restricted to exactly two — §9 allows Figure 3+)
+    role: str             # e.g. "perspective" | "sectional" | "exploded"
+    description: Optional[str] = None
+
+
+class FigureRelationship(BaseModel):
+    """Spec §10/§11/§23 — how this figure builds on an earlier one in the
+    same set. Absent (None) on Figure 1, which has nothing to depend on."""
+    depends_on_figure_number: int
+    relationship_type: str = "physical_implementation_of_functional_model"
+    preserve_functional_sequence: bool = True
+    preserve_numbering: bool = True
+
+
+class ProposalFigureOut(BaseModel):
+    """API/engine representation of one models.db_models.ProposalFigure row.
+    Field name deliberately mirrors the ORM column `relationship_data`
+    verbatim (not aliased to `relationship`) — SQLAlchemy's own
+    `relationship()` import makes a same-named Pydantic field alias-vs-
+    attribute interaction easy to get subtly wrong, and every other *Out
+    schema in this codebase (e.g. AgencyProfileVersionOut) mirrors its ORM
+    columns 1:1 rather than renaming fields for cosmetics."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    figure_set_id: str
+    figure_number: int
+    figure_type: str
+    role: Optional[str] = None
+    purpose: Optional[str] = None
+
+    diagram_family: Optional[str] = None
+    layout: Optional[str] = None
+    detail_level: Optional[str] = None
+    visual_style: Optional[str] = None
+    view_type: Optional[str] = None
+
+    nodes: List[FigureNode] = []
+    callouts: List[FigureCallout] = []
+    panels: List[FigurePanel] = []
+    relationship_data: Optional[FigureRelationship] = None
+
+    caption: Optional[str] = None
+    alt_text: Optional[str] = None
+    concept_disclosure: Optional[str] = None
+
+    requires_user_approval: bool = True
+    approval_status: FigureApprovalStatus = FigureApprovalStatus.PENDING
+    qa_report: Optional[Dict[str, Any]] = None
+    generation_metadata: Optional[Dict[str, Any]] = None
+    stored_file_id: Optional[str] = None
+
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+
+class VisualCommunicationPlan(BaseModel):
+    """Spec §3 — the AI's plan, produced BEFORE any figure is generated.
+    Phase 10 populates this; stored verbatim on
+    ProposalFigureSet.visual_communication_plan."""
+    materially_improves_understanding: bool
+    concepts_requiring_visuals: List[str] = []
+    recommended_figure_count: int = 0
+    figure_1_purpose: Optional[str] = None
+    figure_2_purpose: Optional[str] = None
+    relationship_notes: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ProposalFigureSetOut(BaseModel):
+    """API/engine representation of one models.db_models.ProposalFigureSet
+    row, spec §23's "figureSet" object made concrete."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    proposal_id: str
+    source_section: str
+    status: FigureSetStatus = FigureSetStatus.PLANNING
+    visual_communication_plan: Optional[VisualCommunicationPlan] = None
+    figures: List[ProposalFigureOut] = []
+
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+
+class VisualCommunicationPlanRequest(BaseModel):
+    """AI Figure Generation spec, Phase 10 — request body for
+    POST /proposals/{proposal_id}/figures/plan. `source_section` matches
+    ProposalSection.section_id (e.g. "technical_approach")."""
+    source_section: str
+
+
+class Figure1GenerateRequest(BaseModel):
+    """AI Figure Generation spec §8, Phase 10 — Figure 1 User Controls.
+    Every field is optional: null means "AI Recommended" (§8's own control
+    option), and the AI's per-field recommendation is used instead. A
+    provided value always overrides the AI's recommendation for that field
+    (§30 Principle 5 — "User Controls Representation")."""
+    diagram_family: Optional[str] = None
+    layout: Optional[str] = None
+    detail_level: Optional[str] = None
+    visual_style: Optional[str] = None
+
+
+class Figure2GenerateRequest(BaseModel):
+    """AI Figure Generation spec §13, Phase 11 — Figure 2 User Controls.
+    Same "null means AI Recommended, else overrides" contract as
+    Figure1GenerateRequest above. Figure 2 has no diagram_family/
+    detail_level controls (those are Figure-1-only per §8 vs. §13) —
+    view_type is Figure 2's structural equivalent to Figure 1's layout."""
+    view_type: Optional[str] = None
+    visual_style: Optional[str] = None
+
+
+class FigureAnnotationUpdateRequest(BaseModel):
+    """AI Figure Generation spec §20/§22, Phase 12 — the "Edit
+    Illustration Brief" / caption-and-callout human-edit actions. Every
+    field is optional: only submitted (non-null) fields are updated, so a
+    caller can PATCH just the caption without touching callouts. Free/
+    unmetered — a human edit, not an AI call."""
+    caption: Optional[str] = None
+    alt_text: Optional[str] = None
+    concept_disclosure: Optional[str] = None
+    callouts: Optional[List[FigureCallout]] = None
+
+
+class FigureApprovalUpdateRequest(BaseModel):
+    """AI Figure Generation spec §22, Phase 12 — "No AI-generated
+    technical illustration shall automatically become the final proposal
+    figure without user review." One request body for the full state
+    machine (pending/approved/rejected/needs_regeneration)."""
+    status: FigureApprovalStatus
 
 
 # ── Funding Intelligence & Grant Tracking (PRD §15, Phase 4) ────────────────────
@@ -2081,3 +2659,81 @@ class EngineeringEconomicsDashboardOut(BaseModel):
     complimentary_conversion: List[ComplimentaryConversionOut]
     platform_costs: List[PlatformCostConfigOut]
     model_pricing: List[ModelPricingConfigOut]
+
+
+# ── Customer Co-Brand / White-Label Template Registry (CLARIVA-DOCGEN-
+#    SPEC-001, Phase 13) ────────────────────────────────────────────────────
+# Gives the document JSON schema's `brandingProfile` field (§3, example
+# "clariva_standard") a real backing implementation, mirroring the
+# Agency-Profile Resolver's versioned/data-driven pattern above (see
+# models.db_models.DocumentBrandTemplate and
+# engines/brand_template_engine.py). org_id is the ownership/security
+# boundary — see DocumentBrandTemplate's docstring.
+
+class DocumentBrandTemplateOut(BaseModel):
+    """One historical or active version row — the admin-facing list/detail
+    view. Mirrors DocumentBrandTemplate's columns 1:1."""
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    template_key: str
+    org_id: Optional[str] = None
+    version: int
+    is_active: bool
+    name: str
+    logo_url: Optional[str] = None
+    primary_color: Optional[str] = None
+    header_text: Optional[str] = None
+    footer_text: Optional[str] = None
+    hide_clariva_branding: bool
+    notes: Optional[str] = None
+    created_by_user_id: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+
+class DocumentBrandTemplateResolvedOut(BaseModel):
+    """The merged, effective branding for one (template_key, org_id) pair —
+    always fully populated per-field via BrandTemplateEngine.resolve()'s
+    fallback chain: this template's own field, else the owning
+    Organization's own logo_url/primary_color (Phase 6 columns), else the
+    hardcoded clariva_standard system default, else no branding for that
+    field. `version` is None when no DocumentBrandTemplate row is active
+    for this key at all, so callers/UI can distinguish "using platform
+    defaults" from "using an admin-configured template" — same convention
+    as AgencyProfileResolvedOut.version above."""
+    template_key: str
+    name: str
+    logo_url: Optional[str] = None
+    primary_color: Optional[str] = None
+    header_text: Optional[str] = None
+    footer_text: Optional[str] = None
+    hide_clariva_branding: bool = False
+    version: Optional[int] = None
+
+
+class DocumentBrandTemplateCreateRequest(BaseModel):
+    """Request body for creating a new (inactive by default) version of an
+    org's white-label template. Always org-scoped — this endpoint never
+    creates a system template (org_id null), matching
+    BrandTemplateEngine.create_version()'s own org-scoped-only contract.
+    Every branding field is optional — null/omitted means "no override,
+    fall back per DocumentBrandTemplateResolvedOut's chain" for that field.
+    activate=True creates the version and immediately makes it the org's
+    active one in the same call."""
+    template_key: str
+    name: str
+    logo_url: Optional[str] = None
+    primary_color: Optional[str] = None
+    header_text: Optional[str] = None
+    footer_text: Optional[str] = None
+    hide_clariva_branding: bool = False
+    notes: Optional[str] = None
+    activate: bool = False
+
+
+class OrganizationDefaultBrandTemplateUpdate(BaseModel):
+    """Sets Organization.default_brand_template_key — the template_key
+    applied automatically to every export for this org unless a specific
+    export call overrides it. None clears the override, reverting the org
+    to the hardcoded clariva_standard system template."""
+    template_key: Optional[str] = None

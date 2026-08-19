@@ -1,0 +1,7 @@
+# Consumed by the heroku-community/apt buildpack (see docs/ARCHITECTURE.md's
+# Phase 8 entry, CLARIVA-DOCGEN-SPEC-001, for the exact `heroku buildpacks:add`
+# command). Provides the `soffice` binary utils/pdf_convert.py shells out to
+# for headless DOCX->PDF conversion. -writer (not the full libreoffice
+# meta-package) keeps the slug smaller while covering the one filter this
+# app uses (writer_pdf_Export).
+libreoffice-writer

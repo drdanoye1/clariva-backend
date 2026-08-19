@@ -14,6 +14,7 @@ from models.db_models import (
     AICreditLedger, ModelPricingConfig, Organization, PlatformCostConfig, User, Proposal,
 )
 from models.schemas import (
+    AgencyProfileResolvedOut, AgencyProfileVersionCreate, AgencyProfileVersionOut,
     CreditBalanceOut, CreditTopupRequest, EngineeringEconomicsDashboardOut,
     ModelPricingConfigOut, ModelPricingConfigUpdate, OrgAdminOut, OrgPlanUpdateRequest,
     PlatformCostConfigOut, PlatformCostConfigUpdate,
@@ -22,11 +23,13 @@ from routers.auth import get_current_user
 from routers.credits import _balance_out
 from engines.credit_engine import CreditEngine, DEFAULT_STARTING_BALANCE
 from engines.engineering_economics_engine import EngineeringEconomicsEngine
+from engines.agency_profile_engine import AgencyProfileEngine
 from audit import log_action
 
 router = APIRouter()
 credit_engine = CreditEngine()
 economics_engine = EngineeringEconomicsEngine()
+agency_profile_engine = AgencyProfileEngine()
 
 
 # ── Superadmin dependency ─────────────────────────────────────────────────────
@@ -339,3 +342,99 @@ async def admin_update_cost_config(
         detail={"old_value_cents": old_value, "new_value_cents": body.value_cents},
     )
     return row
+
+
+# ── Agency-Profile Resolver (CLARIVA-DOCGEN-SPEC-001, Phase 7) ─────────────────
+# Admin-editable, versioned per-agency guidance text and page limits — see
+# engines/agency_profile_engine.py's module docstring for the full design
+# rationale. Superadmin-only, same require_superadmin/log_action convention
+# as the pricing endpoints above.
+
+@router.get("/agency-profiles", response_model=List[AgencyProfileResolvedOut])
+async def admin_list_agency_profiles(
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """One resolved (merged with hardcoded defaults) row per known agency —
+    the admin console's agency picker/overview."""
+    return await agency_profile_engine.list_agencies_summary(db)
+
+
+@router.get("/agency-profiles/{agency_code}", response_model=AgencyProfileResolvedOut)
+async def admin_get_agency_profile(
+    agency_code: str,
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await agency_profile_engine.resolve(db, agency_code)
+
+
+@router.get("/agency-profiles/{agency_code}/versions", response_model=List[AgencyProfileVersionOut])
+async def admin_list_agency_profile_versions(
+    agency_code: str,
+    _: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Full version history for one agency, newest first — audit/rollback view."""
+    return await agency_profile_engine.list_versions(db, agency_code)
+
+
+@router.post("/agency-profiles/{agency_code}/versions", response_model=AgencyProfileVersionOut)
+async def admin_create_agency_profile_version(
+    agency_code: str,
+    body: AgencyProfileVersionCreate,
+    current_user: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Append-only — never mutates an existing version. Pass activate=true
+    to make this the live version immediately (one request instead of two
+    for the common case)."""
+    row = await agency_profile_engine.create_version(
+        db, agency_code=agency_code,
+        guidance_text=body.guidance_text, section_limits=body.section_limits,
+        total_page_limit=body.total_page_limit, notes=body.notes,
+        created_by_user_id=current_user.id, activate=body.activate,
+    )
+    await log_action(
+        db, actor_id=current_user.id, action="admin.agency_profile.version_created",
+        object_type="agency_profile", object_id=row.id,
+        detail={"agency_code": row.agency_code, "version": row.version, "activated": body.activate},
+    )
+    return row
+
+
+@router.post("/agency-profiles/{agency_code}/versions/{version}/activate", response_model=AgencyProfileVersionOut)
+async def admin_activate_agency_profile_version(
+    agency_code: str,
+    version: int,
+    current_user: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    row = await agency_profile_engine.activate_version(db, agency_code, version)
+    await log_action(
+        db, actor_id=current_user.id, action="admin.agency_profile.version_activated",
+        object_type="agency_profile", object_id=row.id,
+        detail={"agency_code": row.agency_code, "version": row.version},
+    )
+    return row
+
+
+@router.post("/agency-profiles/seed-defaults", response_model=List[AgencyProfileVersionOut])
+async def admin_seed_agency_profile_defaults(
+    current_user: User = Depends(require_superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Idempotent — creates and activates version 1 (seeded verbatim from the
+    hardcoded AGENCY_GUIDANCE/AGENCY_SECTION_LIMITS/AGENCY_TOTAL_LIMITS
+    dicts) for every agency that has no AgencyProfile row yet. Never
+    overwrites an agency that already has one. Lets an admin move an agency
+    from "silent code fallback" to "editable DB row" without hand-copying
+    the hardcoded guidance text."""
+    created = await agency_profile_engine.seed_defaults(db, created_by_user_id=current_user.id)
+    if created:
+        await log_action(
+            db, actor_id=current_user.id, action="admin.agency_profile.defaults_seeded",
+            object_type="agency_profile", object_id=None,
+            detail={"agency_codes": [row.agency_code for row in created]},
+        )
+    return created

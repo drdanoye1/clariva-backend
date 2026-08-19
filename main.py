@@ -23,6 +23,7 @@ from routers import connectors, api_keys, public_api, marketplace, invitations
 from routers import portfolio
 from routers import service_catalog
 from routers import partners
+from routers import figures
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -122,6 +123,7 @@ app.include_router(auth.router,          prefix="/api/v1/auth",          tags=["
 app.include_router(foa.router,           prefix="/api/v1/foa",           tags=["FOA"])
 app.include_router(proposals.router,     prefix="/api/v1/proposals",     tags=["Proposals"])
 app.include_router(scope_of_work.router, prefix="/api/v1/proposals",     tags=["Scope of Work"])
+app.include_router(figures.router,       prefix="/api/v1/proposals",     tags=["Figures"])
 app.include_router(scoring.router,       prefix="/api/v1/scoring",       tags=["Scoring"])
 app.include_router(reviewer.router,      prefix="/api/v1/reviewer",      tags=["Reviewer Simulation"])
 app.include_router(documents.router,     prefix="/api/v1/documents",     tags=["Document Export"])

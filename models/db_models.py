@@ -422,6 +422,22 @@ class ProposalSection(Base):
     page_estimate    = Column(Float, default=0.0)
     compliance_flags = Column(JSON, default=list)
     order_index      = Column(Integer, default=0)
+    # Word/PDF Report Generation Development Specification (CLARIVA-DOCGEN-
+    # SPEC-001), Phase 1 — the canonical block-JSON representation of this
+    # section's content (models/schemas.py::StructuredSectionContent),
+    # stored independently of `content` above. `content` remains the
+    # plain-text field every existing code path (search/embedding,
+    # utils/doc_utils.py::render_content()'s current DOCX/PDF path, TXT
+    # export) reads by default; `structured_content` becomes the source of
+    # truth for the new semantic DOCX renderer (Phase 2) once populated.
+    # Nullable and unused by every section until content generation
+    # (Phase 4) migrates to emitting it — same additive/backward-compatible
+    # split DocumentVersion.structured_data established for the Logic
+    # Model Chart feature. A null value here with real `content` means
+    # either a pre-Phase-4 section or one edited through a path that only
+    # touches plain text; renderers MUST fall back to the legacy
+    # render_content() path in that case, never treat it as an error.
+    structured_content = Column(JSON, nullable=True)
     created_at       = Column(DateTime(timezone=True), server_default=func.now())
     updated_at       = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -545,6 +561,18 @@ class Organization(Base):
     # plan lapses back to "free" — purchased seats on a plan that no longer
     # exists have nothing to attach to.
     purchased_seats = Column(Integer, default=0, nullable=False)
+
+    # CLARIVA-DOCGEN-SPEC-001 Phase 13 — Customer co-brand/white-label
+    # template registry. Null = "use the hardcoded clariva_standard system
+    # template" (today's behavior, unchanged). Set = this org's chosen
+    # default DocumentBrandTemplate.template_key, applied automatically to
+    # every export unless a specific export call overrides it. Deliberately
+    # NOT a foreign key to document_brand_templates.id (a version row) — it
+    # points at a template_key so BrandTemplateEngine.resolve() can always
+    # follow whichever version is currently is_active for that key, same
+    # "key not row id" indirection AgencyProfile-resolving callers already
+    # use for agency_code.
+    default_brand_template_key = Column(String(60), nullable=True)
 
     memberships      = relationship("OrgMembership", back_populates="organization", cascade="all, delete-orphan")
     shared_proposals = relationship("OrgProposal",   back_populates="organization", cascade="all, delete-orphan")
@@ -1134,6 +1162,27 @@ class DocumentVersion(Base):
     # (e.g. OpenAI unreachable); search falls back to keyword matching for
     # that version rather than blocking the save.
     embedding      = Column(JSON, nullable=True)
+
+    # Logic Model Chart Generator (Clariva Marketplace Development Brief,
+    # 2026-08-14, Engineering Addendum §18) — the exact Option 1/Option 2
+    # JSON shape from that brief's §6 (framework, title, and the stage
+    # arrays), stored independently of `content` above. `content` remains
+    # the source `document_library_engine.py` embeds/searches/displays by
+    # default; `structured_data` is the source of truth for chart
+    # rendering and per-bullet editing. Nullable and unused by every other
+    # document type (cover letters, MOUs, etc.) — only populated when
+    # `Document.library_type == "logic_model"` and generation used the new
+    # structured-JSON prompt (engines/supporting_documents_engine.py). A
+    # null value here with real `content` means either a non-chart
+    # document type, or a Logic Model generated before this feature
+    # shipped — see the frontend's legacy-fallback handling.
+    structured_data = Column(JSON, nullable=True)
+    # "standard" | "extended" — mirrors structured_data["framework"] as
+    # its own column so the framework is queryable/displayable without
+    # unpacking JSON (e.g. for a badge in the version list). Kept in sync
+    # with structured_data by the engine; never set independently.
+    framework       = Column(String(20), nullable=True)
+
     created_by     = Column(String(36), ForeignKey("users.id"), nullable=False)
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -2289,3 +2338,335 @@ class PartnerPayout(Base):
 
     created_by_user_id          = Column(String(36), ForeignKey("users.id"), nullable=True)
     created_at                    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgencyProfile(Base):
+    """
+    Word/PDF Report Generation Development Specification (CLARIVA-DOCGEN-
+    SPEC-001), Phase 7 — "Agency-profile resolver (versioned, data-driven)".
+    Before this table, per-agency prompt guidance (proposal_generator.py's
+    AGENCY_GUIDANCE dict) and page-limit rules (compliance_engine.py's
+    AGENCY_SECTION_LIMITS/AGENCY_TOTAL_LIMITS dicts) were hardcoded Python —
+    any update (an agency changing its evaluation criteria, a new fiscal
+    year's page limits) required a code deploy. This table makes them
+    admin-editable at runtime instead, without a deploy.
+
+    Same append-only, engine-enforced "only one is_active=True row per key
+    at a time" versioning convention as CommissionRule above: creating a new
+    version never mutates an existing row, and activating a version flips
+    the previous active row's is_active to False in the same transaction
+    (see engines/agency_profile_engine.py::activate_version()). Historical
+    versions stay queryable for audit/rollback even after a newer one goes
+    live.
+
+    Every field is nullable and independently overridable — a version can
+    override just guidance_text and leave section_limits/total_page_limit
+    null, in which case the resolver falls back to the hardcoded dict for
+    that field specifically (see AgencyProfileEngine.resolve()'s per-field
+    fallback, not an all-or-nothing row-level fallback). This means an admin
+    editing only the prose guidance for one agency doesn't have to also
+    re-enter every page limit correctly to avoid regressing them.
+
+    agency_code deliberately has no FK/enum constraint — it must accept any
+    string the existing AGENCY_GUIDANCE/AGENCY_SECTION_LIMITS dicts key on
+    today (NSF, NIH, DOD, DARPA, DOE, NASA, ARPA_E, HUD, HHS, USDA, EPA,
+    DOL, SBA, EDA, NEA, NSF_NONPROFIT, ...) plus any future agency an admin
+    wants to add profile data for that doesn't have hardcoded defaults at
+    all yet.
+    """
+    __tablename__ = "agency_profiles"
+
+    id                 = Column(String(36), primary_key=True, default=new_uuid)
+    agency_code        = Column(String(50), nullable=False, index=True)
+    version            = Column(Integer, nullable=False, default=1)
+    is_active          = Column(Boolean, nullable=False, default=False)
+
+    # Null = "no override for this field, resolver falls back to the
+    # hardcoded dict" (see this class's docstring above).
+    guidance_text      = Column(Text, nullable=True)
+    section_limits     = Column(JSON, nullable=True)      # {"project_summary": 1, "technical_merit": 12, ...}
+    total_page_limit   = Column(Integer, nullable=True)
+
+    notes              = Column(Text, nullable=True)      # admin-facing changelog/rationale for this version
+
+    created_by_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at         = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ProposalFigureSet(Base):
+    """
+    Clariva AI Figure Generation & Technical Illustration Development
+    Specification (docs/2_Upgrades_Clariva_AI_Figure_Specification_V01.docx),
+    Phase 9 — "Figure JSON model (figureSet schema)".
+
+    §23 of the spec shows the governing "figureSet" JSON object — one set
+    per proposal section that needs figures, containing an ordered list of
+    coordinated figures (Figure 1 functional/process model, Figure 2
+    physical/technical implementation, optional Figure 3 critical-detail
+    view). §28 requires figures to be "semantic document assets" rather
+    than uncontrolled images embedded in narrative text, with each figure
+    retaining a long list of structured fields (purpose, source section,
+    functional nodes, style/view, callouts, caption, alt text, concept
+    status, approval status, generation metadata, asset location) — see
+    ProposalFigure below for those.
+
+    Modeled as two real tables (this parent + ProposalFigure children)
+    rather than one JSON blob column, unlike DocumentVersion.structured_data
+    or ProposalSection.structured_content: Phase 12's cross-figure QA and
+    approval workflow needs to query/filter/update individual figures
+    directly (e.g. "every figure across the platform still pending
+    approval"), which a single opaque JSON blob per section can't support
+    without loading and re-parsing every set. The nested, genuinely
+    document-shaped parts that Phase 12 will only ever read/write as a
+    whole (visual_communication_plan, and each figure's own nodes/
+    callouts/panels/relationship/generation_metadata below) still use JSON
+    columns — same "relational for what needs to be queried independently,
+    JSON for what's read/written as one unit" split this codebase already
+    uses elsewhere (e.g. Award's top-level columns vs. its JSON detail
+    fields).
+
+    This phase defines the schema only — no AI generation, no router
+    endpoints yet. Phase 10 (Figure 1 generation) and Phase 11 (Figure 2
+    generation + traceability) populate these tables; Phase 12 (cross-figure
+    QA + annotation + approval workflow) reads/writes approval_status and
+    qa_report. A brand-new table needs no migrations.py entry — see
+    AgencyProfile's docstring above for why.
+    """
+    __tablename__ = "proposal_figure_sets"
+
+    id          = Column(String(36), primary_key=True, default=new_uuid)
+    proposal_id = Column(String(36), ForeignKey("proposals.id"), nullable=False, index=True)
+    # The ProposalSection.section_id this figure set illustrates (e.g.
+    # "technical_approach") — matches §23's "sourceSection". Not a real FK
+    # to proposal_sections.id: ProposalSection rows are keyed by
+    # (proposal_id, section_id) pairs, not a single-column PK suitable for
+    # a FK here, and a figure set can legitimately be planned before its
+    # section has been generated yet.
+    source_section = Column(String(100), nullable=False)
+
+    # planning (Visual Communication Plan drafted, §3) -> generating
+    # (Figure 1/2 generation in progress) -> ready (all figures generated,
+    # awaiting review) -> approved (every figure's approval_status is
+    # "approved") -> rejected (user rejected the set outright, needs
+    # regeneration from scratch). Individual figures carry their own
+    # approval_status too — this is the set-level rollup a UI list view
+    # can filter/sort on without joining every figure.
+    status = Column(String(20), nullable=False, default="planning")
+
+    # §3 "AI Visual Planning Before Figure Generation" output — e.g.
+    # {"materially_improves_understanding": true, "concepts_requiring_visuals":
+    # [...], "recommended_figure_count": 2, "notes": "..."}. Populated by
+    # Phase 10's planning step; null until then.
+    visual_communication_plan = Column(JSON, nullable=True)
+
+    created_by_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    proposal = relationship("Proposal", backref="figure_sets")
+    figures = relationship(
+        "ProposalFigure", back_populates="figure_set",
+        cascade="all, delete-orphan", order_by="ProposalFigure.figure_number",
+    )
+
+
+class ProposalFigure(Base):
+    """
+    One entry in a ProposalFigureSet.figures[] list (spec §23/§28) — one row
+    per figure (Figure 1, Figure 2, optional Figure 3+). See
+    ProposalFigureSet's docstring for why this is a real table rather than
+    a JSON list column.
+
+    Every genuinely closed-set field this app controls (not an AI-chosen
+    vocabulary term) is still stored as plain String rather than a DB enum
+    type — SQLite (local dev/tests) and Postgres (production) handle native
+    enum types differently, and this codebase's existing convention
+    (Proposal.status, Award.award_status, AgencyProfile, ...) is
+    string columns validated at the Pydantic layer instead (see
+    models/schemas.py's TechnicalAccuracyClassification/
+    FigureApprovalStatus/FigureSetStatus enums, which DO constrain these
+    specific fields since they're closed sets this app fully owns).
+    figure_type/diagram_family/visual_style/view_type are deliberately
+    left as free-form strings even at the Pydantic layer: §1 and §8/§12/
+    §13 explicitly list these as illustrative examples the AI "may" choose
+    from, not exhaustive enums — e.g. §1 ends its diagram-type list with
+    "or another high-level functional representation appropriate to the
+    proposal." A strict enum would reject a legitimate AI-recommended type
+    the spec explicitly anticipates.
+    """
+    __tablename__ = "proposal_figures"
+
+    id            = Column(String(36), primary_key=True, default=new_uuid)
+    figure_set_id = Column(String(36), ForeignKey("proposal_figure_sets.id"), nullable=False, index=True)
+
+    figure_number = Column(Integer, nullable=False)   # 1, 2, 3, ... — see §31's three-level narrative
+    # e.g. "functional_workflow" | "technical_illustration" (§23's "type").
+    figure_type   = Column(String(50), nullable=False)
+    # e.g. "functional_reference_model" | "physical_implementation" (§23's "role").
+    role          = Column(String(50), nullable=True)
+    purpose       = Column(Text, nullable=True)
+
+    # Figure 1 only (§8): "functional_block" | "process_flow" | "workflow" |
+    # "system_architecture" | "scientific_mechanism" | "experimental_workflow" |
+    # "manufacturing_process" | "ai_recommended" | ... (open-ended, see class docstring).
+    diagram_family = Column(String(50), nullable=True)
+    # Figure 1 (§8): "horizontal" | "vertical" | "hierarchical" | "circular_feedback".
+    layout         = Column(String(30), nullable=True)
+    # Both figures: "simplified" | "standard" | "detailed" (Figure 1, §8) or
+    # "conceptual" | "standard" | "detailed" (Figure 2, §20).
+    detail_level   = Column(String(20), nullable=True)
+    # Figure 1's Visual Treatment (§8: clariva_professional | black_white |
+    # publication_style | agency_branding) OR Figure 2's Illustration Style
+    # (§12: photorealistic | black_white | line_diagram) — same column,
+    # since exactly one applies per figure depending on figure_number.
+    visual_style   = Column(String(40), nullable=True)
+    # Figure 2 only (§13): "perspective" | "sectional" | "perspective_sectional" |
+    # "exploded" | "architecture" | "ai_recommended".
+    view_type      = Column(String(30), nullable=True)
+
+    # §5/§17 — ordered functional stages this figure represents, each with a
+    # technical-accuracy classification: [{"id": "sensor_array_installation",
+    # "label": "Sensor Array Installation", "order": 1,
+    # "classification": "confirmed"}, ...]. Figure 1's primary content;
+    # Figure 2 references these by id/number for traceability (§11).
+    # default=list (not nullable=True with no default) to match
+    # ProjectKnowledge.risks/kpis's convention above — ProposalFigureOut.nodes
+    # is a non-Optional List[FigureNode] = [], so an unset row must read back
+    # as [] rather than None.
+    nodes = Column(JSON, default=list)
+
+    # §14 Panel B / §16 — Figure 2's numbered component legend, each
+    # optionally tied back to a Figure 1 node for traceability:
+    # [{"number": 1, "label": "Camera array", "relates_to_node":
+    # "sensor_array_installation", "classification": "confirmed"}, ...].
+    # default=list — same reasoning as nodes above.
+    callouts = Column(JSON, default=list)
+
+    # §14 — Figure 2's two-panel design: [{"panel": "A", "role":
+    # "perspective", "description": "..."}, {"panel": "B", "role":
+    # "sectional", "description": "..."}]. Empty list for Figure 1
+    # (single-panel) and for a Figure 2 that isn't using the two-panel
+    # layout. default=list — same reasoning as nodes above.
+    panels = Column(JSON, default=list)
+
+    # §10/§11/§23 — this figure's dependency on an earlier one in the same
+    # set: {"depends_on_figure_number": 1, "relationship_type":
+    # "physical_implementation_of_functional_model",
+    # "preserve_functional_sequence": true, "preserve_numbering": true}.
+    # Null for Figure 1 (nothing to depend on).
+    relationship_data = Column(JSON, nullable=True)
+
+    caption  = Column(Text, nullable=True)   # §25 coordinated caption standard
+    alt_text = Column(Text, nullable=True)   # §28 accessibility requirement
+    # §18 — required disclosure text when this figure contains conceptual
+    # (not-yet-finalized) elements, e.g. "Conceptual illustration; final
+    # configuration will be determined during design and prototype
+    # development." Null when the figure has no conceptual elements to
+    # disclose (see each node/callout's own "classification" field).
+    concept_disclosure = Column(Text, nullable=True)
+
+    # §22 — "No AI-generated technical illustration shall automatically
+    # become the final proposal figure without user review." True for
+    # every figure by default; Phase 12 is what actually enforces this in
+    # a workflow.
+    requires_user_approval = Column(Boolean, nullable=False, default=True)
+    # "pending" | "approved" | "rejected" | "needs_regeneration" — see
+    # models/schemas.py::FigureApprovalStatus.
+    approval_status = Column(String(20), nullable=False, default="pending")
+
+    # §24 Automated Cross-Figure QA findings — populated by Phase 12, e.g.
+    # {"passed": true, "checks": [...], "checked_at": "..."}. Null until
+    # that phase runs a check against this figure.
+    qa_report = Column(JSON, nullable=True)
+
+    # §19 Two-Stage Technical Illustration Generation + general provenance:
+    # {"stage": "visual_generation" | "programmatic_annotation", "model":
+    # "...", "prompt_tokens": N, "completion_tokens": N, "candidate_count":
+    # N, "generated_at": "..."}.
+    generation_metadata = Column(JSON, nullable=True)
+
+    # §28 "asset location" — the actual generated image, once Phase 10/11
+    # produce one. Direct FK (not StoredFile's usual object_type/object_id
+    # polymorphism) since a ProposalFigure always points at exactly one
+    # current StoredFile row, unlike StoredFile's other consumers where the
+    # "owning" side varies by object_type.
+    stored_file_id = Column(String(36), ForeignKey("stored_files.id"), nullable=True)
+
+    created_by_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    figure_set = relationship("ProposalFigureSet", back_populates="figures")
+    stored_file = relationship("StoredFile")
+
+
+class DocumentBrandTemplate(Base):
+    """
+    Word/PDF Report Generation Development Specification (CLARIVA-DOCGEN-
+    SPEC-001), Phase 13 — "Customer co-brand/white-label template registry"
+    (§14 P2 priority: "Supports Clariva Custom Solutions and enterprise
+    deployments"). Gives the document JSON schema's `brandingProfile` field
+    (§3, example value "clariva_standard") a real backing implementation —
+    it was previously unwired anywhere in the codebase, unlike its sibling
+    `agencyProfile` field which AgencyProfileEngine has resolved since
+    Phase 7.
+
+    Same append-only, engine-enforced "only one is_active=True row per
+    (template_key, org_id) at a time" versioning convention as AgencyProfile
+    above: creating a new version never mutates an existing row, and
+    activating a version flips the previous active row's is_active to False
+    in the same transaction (see engines/brand_template_engine.py::
+    activate_version()).
+
+    org_id is nullable and is the security/ownership boundary: a null
+    org_id row is a Clariva SYSTEM template (e.g. the seeded
+    "clariva_standard" baseline, available to every org), while a non-null
+    org_id row is a customer's PRIVATE white-label variant, resolvable only
+    by that exact org — see BrandTemplateEngine.resolve()'s two-step query
+    (org-scoped first, system-scoped fallback second), which makes
+    cross-org leakage structurally impossible rather than relying on a
+    post-hoc filter.
+
+    Every branding field is nullable and independently overridable, same
+    per-field fallback philosophy as AgencyProfile: a template row that
+    only sets header_text/footer_text and leaves logo_url/primary_color
+    null falls back to the owning Organization's own logo_url/primary_color
+    (Phase 6 columns) for those specific fields rather than rendering no
+    branding at all — see BrandTemplateEngine.resolve()'s per-field
+    fallback chain (template row -> Organization row -> hardcoded
+    "clariva_standard" system default -> no branding applied).
+    """
+    __tablename__ = "document_brand_templates"
+
+    id       = Column(String(36), primary_key=True, default=new_uuid)
+    # e.g. "clariva_standard" (system default, org_id null) or a
+    # customer-chosen slug like "acme_partner_cobrand" (org_id set).
+    template_key = Column(String(60), nullable=False, index=True)
+    # Null = Clariva system template, visible/resolvable to every org.
+    # Set = a private white-label variant owned by exactly that org — see
+    # class docstring's security note.
+    org_id   = Column(String(36), ForeignKey("organizations.id"), nullable=True, index=True)
+    version  = Column(Integer, nullable=False, default=1)
+    is_active = Column(Boolean, nullable=False, default=False)
+
+    name     = Column(String(255), nullable=False)   # admin-facing label, e.g. "Acme Partner Co-Brand"
+
+    # Null = "no override for this field, resolver falls back to the
+    # owning Organization's own branding column, then to the hardcoded
+    # system default" (see class docstring's fallback chain).
+    logo_url      = Column(String(1000), nullable=True)
+    primary_color = Column(String(20), nullable=True)   # hex, e.g. "#1d4ed8" — same format as Organization.primary_color
+    header_text   = Column(String(500), nullable=True)  # optional short line rendered above the title (e.g. partner name)
+    footer_text   = Column(String(500), nullable=True)  # optional short line rendered in the document footer, alongside page numbers
+
+    # True suppresses Clariva's own footer attribution text (there is no
+    # literal "Clariva" branding in the document body to suppress — see
+    # engines/document_output.py — so this only affects the optional
+    # Clariva attribution line in the footer, for full white-label resale).
+    hide_clariva_branding = Column(Boolean, nullable=False, default=False)
+
+    notes    = Column(Text, nullable=True)   # admin-facing changelog/rationale for this version
+
+    created_by_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())

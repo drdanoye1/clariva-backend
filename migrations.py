@@ -294,6 +294,44 @@ COLUMN_MIGRATIONS: List[ColumnMigration] = [
     # PartnerPortalInvite accept flow. See Partner.user_id's docstring in
     # models/db_models.py.
     ("partners", "user_id", "VARCHAR(36)", "VARCHAR(36)"),
+
+    # --- document_versions (Logic Model Chart Generator — Clariva
+    # Marketplace Development Brief, 2026-08-14, Engineering Addendum
+    # §18) --------------------------------------------------------------
+    # `document_versions` already exists in production (Phase 3 Document
+    # Library), so these two new columns need real migration entries
+    # rather than relying on create_all() — same pattern as
+    # `partners.user_id` just above. Both nullable, no backfill: every
+    # row written before this shipped is a non-chart document (or a
+    # pre-chart Logic Model) and correctly reads as "no structured data."
+    # See DocumentVersion.structured_data/framework's docstrings in
+    # models/db_models.py.
+    ("document_versions", "structured_data", "JSON", "JSON"),
+    ("document_versions", "framework",       "VARCHAR(20)", "VARCHAR(20)"),
+
+    # --- proposal_sections (Word/PDF Report Generation Development
+    # Specification, CLARIVA-DOCGEN-SPEC-001, Phase 1) -------------------
+    # `proposal_sections` already exists in production, so this needs a
+    # real migration entry rather than relying on create_all() — same
+    # pattern as document_versions.structured_data above. Nullable, no
+    # backfill: every row written before this shipped has no structured
+    # block content yet and correctly reads as "use `content` (plain
+    # text) instead." See ProposalSection.structured_content's docstring
+    # in models/db_models.py.
+    ("proposal_sections", "structured_content", "JSON", "JSON"),
+
+    # --- organizations (Word/PDF Report Generation Development
+    # Specification, CLARIVA-DOCGEN-SPEC-001, Phase 13 — customer co-brand/
+    # white-label template registry) -------------------------------------
+    # `organizations` already exists in production, so this needs a real
+    # migration entry rather than relying on create_all() — same pattern as
+    # proposal_sections.structured_content above. Nullable, no backfill:
+    # every org that existed before this shipped correctly reads as "no
+    # chosen default brand template yet, resolver falls back to the
+    # hardcoded clariva_standard system template." See
+    # Organization.default_brand_template_key's docstring in
+    # models/db_models.py.
+    ("organizations", "default_brand_template_key", "VARCHAR(60)", "VARCHAR(60)"),
 ]
 
 # partner_portal_invites (Partner Portal addendum) is a new table — no

@@ -110,6 +110,42 @@ def test_export_success_persists_stored_file_and_returns_presigned_url(client, r
     assert stored.checksum is not None
 
 
+def test_export_pdf_produces_a_real_pdf_via_whichever_renderer_is_available(client, registered_user, monkeypatch):
+    """Word/PDF Report Generation Development Specification
+    (CLARIVA-DOCGEN-SPEC-001), Phase 8 — format=pdf now tries headless
+    LibreOffice first (utils/pdf_convert.py) and falls back to the legacy
+    reportlab renderer if no soffice binary is available in this test
+    environment. Either way the response must be a real, valid PDF — this
+    test doesn't assume which renderer produced it (see
+    test_pdf_convert.py for a LibreOffice-specific, skip-if-unavailable
+    test of the conversion itself)."""
+    import storage
+
+    captured = {}
+
+    async def fake_upload_file(org_id, category, content, filename, content_type):
+        captured["content"] = content
+        captured["content_type"] = content_type
+        return "fake/proposal_export/key.pdf"
+
+    async def fake_get_download_url(storage_key, filename=None, expires_in=3600):
+        return "https://example-bucket.r2.example.com/fake/proposal_export/key.pdf"
+
+    monkeypatch.setattr(storage, "upload_file", fake_upload_file)
+    monkeypatch.setattr(storage, "get_download_url", fake_get_download_url)
+
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    resp = client.post(
+        "/api/v1/documents/export",
+        json={"proposal_id": proposal_id, "format": "pdf"},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured["content_type"] == "application/pdf"
+    assert captured["content"][:4] == b"%PDF", "export must produce a real PDF regardless of which renderer handled it"
+    assert len(captured["content"]) > 500
+
+
 def test_export_requires_ownership(client, registered_user):
     resp = client.post(
         "/api/v1/documents/export",
@@ -160,6 +196,94 @@ def test_list_proposal_exports_returns_history_after_export(client, registered_u
 def test_list_proposal_exports_requires_ownership(client, registered_user):
     resp = client.get(f"/api/v1/documents/exports/{uuid.uuid4().hex}", headers=registered_user["headers"])
     assert resp.status_code == 404
+
+
+def _inject_missing_placeholder(proposal_id: str) -> None:
+    """Directly write a [MISSING: ...] gap into the proposal's first
+    auto-created section — same "write straight to the DB via
+    AsyncSessionLocal" pattern test_billing_wireup.py uses to set up state
+    that isn't reachable through the API alone."""
+    from database import AsyncSessionLocal
+    from models.db_models import ProposalSection
+
+    async def _do():
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(ProposalSection).where(ProposalSection.proposal_id == proposal_id))
+            sections = result.scalars().all()
+            assert sections, "expected at least one auto-created section"
+            sections[0].content = "Some real content with a [MISSING: budget figure] gap left in it."
+            sections[0].word_count = 12
+            await db.commit()
+    asyncio.run(_do())
+
+
+def test_export_blocked_when_require_clean_export_and_unresolved_placeholder(client, registered_user, monkeypatch):
+    """Phase 5 export QA gate — require_clean_export=True must abort BEFORE
+    any file is generated or uploaded when ComplianceEngine finds an
+    error-severity violation (here, an unresolved [MISSING: ...] placeholder).
+    storage.upload_file is monkeypatched to raise so the test fails loudly if
+    the gate doesn't actually stop the export before that point."""
+    import storage
+
+    async def fail_if_called(*a, **kw):
+        raise AssertionError("upload_file should not be called when the export QA gate blocks the export")
+
+    monkeypatch.setattr(storage, "upload_file", fail_if_called)
+
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    _inject_missing_placeholder(proposal_id)
+
+    resp = client.post(
+        "/api/v1/documents/export",
+        json={"proposal_id": proposal_id, "format": "txt", "require_clean_export": True},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    report = detail["compliance_report"]
+    assert report["passed"] is False
+    assert any(v["rule"] == "Missing placeholder" and v["severity"] == "error" for v in report["violations"])
+
+    # Nothing was persisted — the gate fired before any StoredFile row.
+    from database import AsyncSessionLocal
+    from models.db_models import StoredFile
+
+    async def _fetch():
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(StoredFile).where(StoredFile.object_id == proposal_id))
+            return result.scalar_one_or_none()
+    assert asyncio.run(_fetch()) is None
+
+
+def test_export_succeeds_with_attached_compliance_report_when_not_strict(client, registered_user, monkeypatch):
+    """Default behavior (require_clean_export omitted/False) is unchanged
+    from before this phase: the export always succeeds. The only new thing
+    is that ExportResponse.compliance_report now rides along so the caller
+    can see the same findings without a second round trip."""
+    import storage
+
+    async def fake_upload_file(org_id, category, content, filename, content_type):
+        return "fake/proposal_export/report.txt"
+
+    async def fake_get_download_url(storage_key, filename=None, expires_in=3600):
+        return f"https://example-bucket.r2.example.com/{storage_key}"
+
+    monkeypatch.setattr(storage, "upload_file", fake_upload_file)
+    monkeypatch.setattr(storage, "get_download_url", fake_get_download_url)
+
+    proposal_id = _create_proposal(client, registered_user["headers"])
+    _inject_missing_placeholder(proposal_id)
+
+    resp = client.post(
+        "/api/v1/documents/export",
+        json={"proposal_id": proposal_id, "format": "txt"},
+        headers=registered_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    report = resp.json()["compliance_report"]
+    assert report is not None
+    assert report["passed"] is False
+    assert any(v["rule"] == "Missing placeholder" for v in report["violations"])
 
 
 def test_local_disk_download_endpoint_no_longer_exists(client, registered_user):

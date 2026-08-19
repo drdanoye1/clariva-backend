@@ -28,7 +28,7 @@ gets written regardless.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +36,41 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.db_models import AuditLog, new_uuid
 
 _log = logging.getLogger(__name__)
+
+# Process-wide "last timestamp handed out" — see _next_created_at()'s
+# docstring for why this exists.
+_last_stamped_at: Optional[datetime] = None
+
+
+def _next_created_at() -> datetime:
+    """Returns a created_at value guaranteed to be strictly greater than
+    every value this function has previously returned in this process.
+
+    The naive fix (stamping datetime.now(timezone.utc) in Python instead of
+    relying on the DB's func.now()) assumes the OS clock has microsecond
+    resolution. It doesn't always: Windows' datetime.now() can return the
+    same tick for two calls only a few hundred microseconds apart, which is
+    routine for two sequential audit_log calls within one request-handling
+    burst (e.g. approve-then-suspend in a test, or any handler that logs
+    twice). When that tie happens, `ORDER BY created_at DESC` (routers/
+    partners.py, routers/collaboration.py, routers/organizations.py) falls
+    back to insertion/row order for the tied rows — i.e. oldest first,
+    exactly backwards from the "newest first" activity feeds this powers.
+
+    This function is a synchronous, non-awaiting critical section (no
+    `await` between the read and write of the module-level variable), which
+    is all the safety a single-threaded asyncio event loop needs — no lock
+    required. It only guards against ties within one worker process; two
+    separate `WEB_CONCURRENCY` workers writing to the same object_id at the
+    literal same instant could still tie, but that's a vanishingly rare
+    cross-process race, not the routine same-process case this fixes.
+    """
+    global _last_stamped_at
+    now = datetime.now(timezone.utc)
+    if _last_stamped_at is not None and now <= _last_stamped_at:
+        now = _last_stamped_at + timedelta(microseconds=1)
+    _last_stamped_at = now
+    return now
 
 
 async def log_action(
@@ -55,16 +90,20 @@ async def log_action(
         object_type=object_type,
         object_id=object_id,
         detail=detail,
-        # Stamped here in Python (microsecond precision) rather than left to
-        # the column's server_default=func.now(): SQLite's func.now() only
-        # has second resolution, so two audit rows written by fast
-        # successive requests in the same wall-clock second (e.g. approve
-        # then suspend in one test) get identical created_at values, making
-        # `ORDER BY created_at DESC` (routers/partners.py's activity feed,
-        # routers/organizations.py's audit-log endpoint) non-deterministic
-        # for "newest first" — it can silently return insertion order
-        # instead. `AuditLog.id` is a random UUID, not a usable tiebreaker.
-        created_at=datetime.now(timezone.utc),
+        # Stamped via _next_created_at() (strictly monotonic within this
+        # process) rather than left to the column's server_default=func.now()
+        # or a bare datetime.now(): the DB default's resolution (seconds on
+        # SQLite) and even Python's own clock resolution (Windows can repeat
+        # a tick across two calls microseconds apart) both allow two audit
+        # rows written by fast successive requests (e.g. approve then
+        # suspend in one test) to collide on created_at, making `ORDER BY
+        # created_at DESC` (routers/partners.py's activity feed, routers/
+        # collaboration.py's, routers/organizations.py's audit-log endpoint)
+        # non-deterministic for "newest first" — it can silently return
+        # insertion order instead. `AuditLog.id` is a random UUID, not a
+        # usable tiebreaker, so this is the actual fix rather than a
+        # cosmetic one.
+        created_at=_next_created_at(),
     )
     db.add(entry)
     await db.flush()

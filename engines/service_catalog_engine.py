@@ -138,6 +138,56 @@ SERVICE_CATALOG_SEED: List[Dict] = [
     {"service_key": "doc_logic_model", "category": "supporting_document", "name": "Logic Model",
      "description": None, "complexity": None, "workspace": "pre_award",
      "subscriber_price_cents": 3500, "payg_price_cents": 4400, "recurring": False},
+    # Logic Model Chart Generator (Development Brief 2026-08-14, Engineering
+    # Addendum §20) — regenerating one stage's bullets, or the outcome-stage(s)
+    # that change on a framework switch, is a much smaller AI call than a full
+    # regeneration. Priced at ~23% of doc_logic_model's subscriber/payg price
+    # (within the brief's recommended 20-25% band) per stage. A framework
+    # switch charges this price once per outcome-stage in the *target*
+    # framework (2 for standard, 3 for extended) — see
+    # supporting_documents_engine.py::switch_framework.
+    {"service_key": "doc_logic_model_stage_regen", "category": "supporting_document", "name": "Logic Model — Regenerate Stage",
+     "description": "Regenerate one stage of an existing Logic Model chart, or one outcome-stage affected by a framework switch, without redrafting the whole chart.",
+     "complexity": None, "workspace": "pre_award",
+     "subscriber_price_cents": 800, "payg_price_cents": 1000, "recurring": False},
+    # --- AI Figure Generation & Technical Illustration System (docs/
+    # 2_Upgrades_Clariva_AI_Figure_Specification_V01.docx), Phase 10-12 ------
+    # Own "figure_generation" category rather than "supporting_document":
+    # a figure set attaches to one narrative section (via source_section)
+    # but is a distinct semantic asset type (§28), not a standalone document.
+    # figure_visual_plan (§3) is priced like a light analysis pass — well
+    # below doc_logic_model_stage_regen ($8/$10) since it produces a plan,
+    # not a rendered deliverable. figure_1_generation (§4-8) produces an
+    # actual rendered diagram asset, so it's priced closer to a mid-tier
+    # supporting document (below the $35/$44 full-document tier, since it's
+    # one figure, not a multi-page narrative document).
+    {"service_key": "figure_visual_plan", "category": "figure_generation", "name": "Figure Visual Communication Plan",
+     "description": "AI analysis of a proposal section determining whether figures would materially improve reviewer understanding, and planning Figure 1/Figure 2's purpose and relationship.",
+     "complexity": None, "workspace": "pre_award",
+     "subscriber_price_cents": 500, "payg_price_cents": 625, "recurring": False},
+    {"service_key": "figure_1_generation", "category": "figure_generation", "name": "Figure 1 — Functional/Process Diagram",
+     "description": "AI extraction of a proposal section's functional workflow into a structured diagram (nodes, sequence, classification) plus a rendered Figure 1 image.",
+     "complexity": None, "workspace": "pre_award",
+     "subscriber_price_cents": 1200, "payg_price_cents": 1500, "recurring": False},
+    # figure_2_generation (§9-§16, §19) is priced well above figure_1_generation:
+    # it makes one or two real DALL-E image-generation calls (Figure 1 is
+    # deterministically rendered with matplotlib and has no per-call image
+    # model cost), plus the same content-extraction/traceability text call
+    # figure_1_generation already prices in. ~$18/$22.50 reflects that real
+    # marginal image-gen cost while staying below the $35/$44 full-document
+    # tier — still one figure, not a multi-page narrative document.
+    {"service_key": "figure_2_generation", "category": "figure_generation", "name": "Figure 2 — Technical/Physical Illustration",
+     "description": "AI-generated technical/physical illustration (one or two panels via DALL-E) tracing back to Figure 1's functional stages, with a numbered component legend and coordinated caption.",
+     "complexity": None, "workspace": "pre_award",
+     "subscriber_price_cents": 1800, "payg_price_cents": 2250, "recurring": False},
+    # figure_qa_check (§24) is an analysis pass over already-generated
+    # figures, not a new asset — priced like figure_visual_plan, slightly
+    # higher since it reads both figures plus the section content in one
+    # call rather than just the section.
+    {"service_key": "figure_qa_check", "category": "figure_generation", "name": "Automated Cross-Figure QA",
+     "description": "AI quality check of Figure 1, Figure 2 (if generated), and the Figure 1<->Figure 2 relationship against Clariva's cross-figure QA checklist.",
+     "complexity": None, "workspace": "pre_award",
+     "subscriber_price_cents": 600, "payg_price_cents": 750, "recurring": False},
     {"service_key": "doc_sustainability_plan", "category": "supporting_document", "name": "Sustainability Plan",
      "description": None, "complexity": None, "workspace": "pre_award",
      "subscriber_price_cents": 3500, "payg_price_cents": 4400, "recurring": False},

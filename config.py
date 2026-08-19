@@ -89,6 +89,20 @@ class Settings(BaseSettings):
     # production; the localhost default only matters for local dev.
     FRONTEND_URL: str = "http://localhost:3000"
 
+    # PDF export (Word/PDF Report Generation Development Specification,
+    # CLARIVA-DOCGEN-SPEC-001, Phase 8) — headless LibreOffice converts the
+    # already-rendered DOCX to PDF, so PDF export reflects the exact same
+    # structured-block content (figures, tables, schedules, callouts,
+    # references) as DOCX export instead of a second, drifted-apart
+    # reportlab renderer. Left blank, utils/pdf_convert.py auto-detects the
+    # `soffice` (or `libreoffice`) binary via shutil.which() on PATH — this
+    # override only matters for an environment where the binary exists but
+    # isn't named/located where PATH lookup finds it. Degrades gracefully
+    # exactly like SAM_GOV_API_KEY/RESEND_API_KEY: if no binary is found
+    # (or the conversion fails for any reason), export falls back to the
+    # legacy reportlab PDF renderer rather than failing the export.
+    SOFFICE_BINARY: str = ""
+
     # Superadmin seed (set in .env / Heroku config vars)
     SUPERADMIN_EMAIL: str = "admin@aistartupcopilot.org"
     SUPERADMIN_PASSWORD: str = ""

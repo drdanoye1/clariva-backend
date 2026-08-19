@@ -69,6 +69,7 @@ class DocumentLibraryEngine:
             db, doc.id, created_by, content=data.get("content"),
             file_url=data.get("file_url"), format=data.get("format"),
             change_note=data.get("change_note") or "Initial version",
+            structured_data=data.get("structured_data"), framework=data.get("framework"),
         )
         return doc
 
@@ -80,17 +81,24 @@ class DocumentLibraryEngine:
             db, document_id, created_by, content=data.get("content"),
             file_url=data.get("file_url"), format=data.get("format"),
             change_note=data.get("change_note"),
+            structured_data=data.get("structured_data"), framework=data.get("framework"),
         )
 
     async def _add_version(
         self, db: AsyncSession, document_id: str, created_by: str,
         content: Optional[str], file_url: Optional[str],
         format: Optional[str], change_note: Optional[str],
+        # Logic Model Chart Generator (Development Brief 2026-08-14) — both
+        # default None so every other document type's call sites above are
+        # unaffected; only the logic_model generate/regenerate endpoints in
+        # routers/documents_library.py ever pass these.
+        structured_data: Optional[Dict[str, Any]] = None, framework: Optional[str] = None,
     ) -> DocumentVersion:
         next_number = await self._next_version_number(db, document_id)
         version = DocumentVersion(
             id=new_uuid(), document_id=document_id, version_number=next_number,
             content=content, file_url=file_url, format=format, change_note=change_note,
+            structured_data=structured_data, framework=framework,
             created_by=created_by,
         )
         db.add(version)

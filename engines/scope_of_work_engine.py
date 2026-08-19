@@ -693,6 +693,103 @@ support. Use null for any field the sections genuinely don't address.
         )
         return parsed
 
+    async def generate_risks_and_kpis(
+        self, db: AsyncSession, proposal: Any, project_knowledge: ProjectKnowledge,
+        org_id: Optional[str] = None, user_id: Optional[str] = None, price_cents_charged: int = 0,
+    ) -> Dict[str, Any]:
+        """Powers the Risks/KPIs sections' "AI Suggest" button — added after
+        a report that manually adding risks/KPIs one at a time via the
+        +Add Risk/+Add KPI buttons produced a disjointed list with no real
+        connection to what the proposal actually says. Reads the same
+        generated ProposalSection content
+        derive_project_knowledge_from_proposal() does (same "requires
+        generated sections" gate and reason: nothing to ground a
+        proposal-specific risk/KPI list in otherwise), plus whatever
+        Project Knowledge fields and risks/KPIs already exist, so results
+        are additive and non-repetitive rather than a generic boilerplate
+        list. Returns an unpersisted result for the caller to append to the
+        existing risks/kpis arrays for review — nothing is saved until Save
+        Project Knowledge is clicked, same as every other AI action here."""
+        result = await db.execute(
+            select(ProposalSection).where(ProposalSection.proposal_id == proposal.id).order_by(ProposalSection.section_id)
+        )
+        sections = [s for s in result.scalars().all() if (s.content or "").strip()]
+        if not sections:
+            raise HTTPException(
+                status_code=400,
+                detail="This proposal doesn't have any generated section content yet to generate risks/KPIs from. Generate proposal sections first, or add them manually below.",
+            )
+
+        blocks: List[str] = []
+        budget = 12000
+        for s in sections:
+            chunk = f"### {s.title}\n{s.content.strip()}"
+            if len(chunk) > budget:
+                chunk = chunk[:budget]
+            blocks.append(chunk)
+            budget -= len(chunk)
+            if budget <= 0:
+                break
+        proposal_text = "\n\n".join(blocks)
+
+        prompt = f"""
+Read the following already-written grant proposal sections and propose a list
+of project risks and key performance indicators (KPIs) as JSON only (no
+markdown fences, no commentary — just the JSON object).
+
+Project title: {getattr(proposal, "title", "")}
+Agency / grant type: {getattr(proposal, "agency", "")} / {getattr(proposal, "grant_type", "")}
+Project objectives: {project_knowledge.objectives or "Not yet specified"}
+Need statement: {project_knowledge.need_statement or "Not yet specified"}
+Intended outputs: {project_knowledge.outputs or "Not yet specified"}
+Intended outcomes: {project_knowledge.outcomes or "Not yet specified"}
+Risks already listed: {json.dumps(project_knowledge.risks or [])}
+KPIs already listed: {json.dumps(project_knowledge.kpis or [])}
+
+--- PROPOSAL SECTIONS ---
+{proposal_text}
+--- END PROPOSAL SECTIONS ---
+
+Return JSON matching exactly this shape:
+{{
+  "risks": [
+    {{"risk": "string", "mitigation": "string", "likelihood": "Low|Medium|High", "impact": "Low|Medium|High"}}
+  ],
+  "kpis": [
+    {{"name": "string", "target": "string", "unit": "string"}}
+  ]
+}}
+
+Propose 3-5 risks and 3-6 KPIs specific to what this proposal actually
+describes (technical approach, timeline, team, deliverables) — not generic
+grant-writing boilerplate. Do not repeat any risk or KPI already listed
+above; propose new, distinct ones, or return a shorter list if the proposal
+genuinely doesn't support more. Do not fabricate numeric targets the text
+doesn't support — use a qualitative target where a precise number isn't
+grounded in the proposal.
+""".strip()
+        try:
+            response = await self.client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert grant reviewer identifying project risks and measurable KPIs from a written proposal. Respond with a single JSON object only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.5,
+                max_tokens=1200,
+            )
+        except Exception as exc:
+            raise _ai_error(exc)
+        parsed = _parse_json_response(response.choices[0].message.content or "")
+        parsed["source_sections_used"] = [s.section_id for s in sections]
+        prompt_tokens, completion_tokens = usage_from_response(response)
+        await usage_tracking.record_usage(
+            db, org_id=org_id, user_id=user_id, operation="scope_of_work:risks_kpis",
+            model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            price_cents_charged=price_cents_charged, reference={"proposal_id": proposal.id},
+        )
+        return parsed
+
     async def suggest_project_knowledge_field(
         self, proposal: Any, project_knowledge: ProjectKnowledge, company_profile: Dict[str, Any],
         field: str, current_value: Optional[str] = None, additional_context: Optional[str] = None,

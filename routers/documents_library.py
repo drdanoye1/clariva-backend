@@ -14,7 +14,7 @@ reused directly rather than reimplemented.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
@@ -24,8 +24,9 @@ from database import get_db
 from models.schemas import (
     ArchiveExpiredOut, DocumentCreate, DocumentOut, DocumentSearchResult,
     DocumentShareCreate, DocumentShareOut, DocumentVersionCreate, DocumentVersionOut,
-    GenerateSupportingDocumentRequest, RetentionPolicyOut, RetentionPolicyRequest,
-    SupportingDocumentTypeOut,
+    GenerateSupportingDocumentRequest, LOGIC_MODEL_PRESERVED_ON_SWITCH, LOGIC_MODEL_STAGE_KEYS,
+    LogicModelRegenerateStageRequest, LogicModelSwitchFrameworkRequest,
+    RetentionPolicyOut, RetentionPolicyRequest, SupportingDocumentTypeOut,
 )
 from models.db_models import DocumentShare, User
 from routers.auth import get_current_user
@@ -45,17 +46,28 @@ sow_engine = ScopeOfWorkEngine()
 catalog_engine = ServiceCatalogEngine()
 
 
+def _to_version_out(version) -> DocumentVersionOut:
+    """Shared DocumentVersion -> DocumentVersionOut mapping — single place
+    that knows about structured_data/framework (Logic Model Chart
+    Generator, Development Brief 2026-08-14) so every endpoint returning a
+    version (document fetch, version list, publish, and the new
+    logic-model generate/regenerate endpoints below) stays in sync rather
+    than re-listing the same fields at each call site, which is how the
+    original two call sites here had already started to drift before this
+    helper existed."""
+    return DocumentVersionOut(
+        id=version.id, document_id=version.document_id, version_number=version.version_number,
+        content=version.content, file_url=version.file_url, format=version.format,
+        change_note=version.change_note, has_embedding=version.embedding is not None,
+        structured_data=version.structured_data, framework=version.framework,
+        created_by=version.created_by, created_at=version.created_at,
+    )
+
+
 async def _to_document_out(db: AsyncSession, doc) -> DocumentOut:
     version_count = await engine.count_versions(db, doc.id)
     latest = await engine.get_latest_version(db, doc.id)
-    latest_out = None
-    if latest:
-        latest_out = DocumentVersionOut(
-            id=latest.id, document_id=latest.document_id, version_number=latest.version_number,
-            content=latest.content, file_url=latest.file_url, format=latest.format,
-            change_note=latest.change_note, has_embedding=latest.embedding is not None,
-            created_by=latest.created_by, created_at=latest.created_at,
-        )
+    latest_out = _to_version_out(latest) if latest else None
     return DocumentOut(
         id=doc.id, org_id=doc.org_id, proposal_id=doc.proposal_id, library_type=doc.library_type,
         title=doc.title, status=doc.status, version_count=version_count, latest_version=latest_out,
@@ -123,19 +135,37 @@ async def generate_supporting_document(
         raise HTTPException(status_code=402, detail=str(exc))
     project_knowledge = await sow_engine.get_or_create_project_knowledge(db, body.proposal_id)
     company_profile = await _load_company_profile(current_user.id, db)
-    content = await supporting_docs_engine.generate(
-        proposal, project_knowledge, company_profile, body.doc_type,
-        recipient_name=body.recipient_name, recipient_organization=body.recipient_organization,
-        additional_context=body.additional_context,
-        db=db, org_id=org_id, user_id=current_user.id,
-        price_cents_charged=txn.price_cents,
-    )
     meta = SUPPORTING_DOCUMENT_TYPES[body.doc_type]
     title = f"{meta['label']} — {proposal.title}"
-    doc = await engine.create_document(db, org_id, current_user.id, {
+    doc_data: Dict[str, Any] = {
         "title": title, "library_type": body.doc_type, "proposal_id": body.proposal_id,
-        "content": content, "format": "txt", "change_note": "AI-generated draft",
-    })
+        "format": "txt", "change_note": "AI-generated draft",
+    }
+    if body.doc_type == "logic_model":
+        # Logic Model Chart Generator (Development Brief 2026-08-14) —
+        # structured-JSON generation path (engines/supporting_documents_
+        # engine.py::generate_logic_model), not the shared prose generate().
+        # `content` is derived from structured_data so the existing
+        # embedding/search/display pipeline in document_library_engine.py
+        # keeps working unchanged (brief §18).
+        structured_data = await supporting_docs_engine.generate_logic_model(
+            proposal, project_knowledge, company_profile, framework=body.framework or "standard",
+            additional_context=body.additional_context,
+            db=db, org_id=org_id, user_id=current_user.id,
+            price_cents_charged=txn.price_cents,
+        )
+        doc_data["structured_data"] = structured_data
+        doc_data["framework"] = structured_data.get("framework")
+        doc_data["content"] = supporting_docs_engine.flatten_logic_model_to_text(structured_data)
+    else:
+        doc_data["content"] = await supporting_docs_engine.generate(
+            proposal, project_knowledge, company_profile, body.doc_type,
+            recipient_name=body.recipient_name, recipient_organization=body.recipient_organization,
+            additional_context=body.additional_context,
+            db=db, org_id=org_id, user_id=current_user.id,
+            price_cents_charged=txn.price_cents,
+        )
+    doc = await engine.create_document(db, org_id, current_user.id, doc_data)
     await log_action(db, actor_id=current_user.id, action="document.created", org_id=org_id,
                       object_type="document", object_id=doc.id, detail={"title": doc.title, "generated": True})
     return await _to_document_out(db, doc)
@@ -180,14 +210,7 @@ async def list_document_versions(
     doc = await engine.get_document_or_404(db, document_id)
     await _assert_member(doc.org_id, current_user.id, db)
     versions = await engine.list_versions(db, document_id)
-    return [
-        DocumentVersionOut(
-            id=v.id, document_id=v.document_id, version_number=v.version_number,
-            content=v.content, file_url=v.file_url, format=v.format, change_note=v.change_note,
-            has_embedding=v.embedding is not None, created_by=v.created_by, created_at=v.created_at,
-        )
-        for v in versions
-    ]
+    return [_to_version_out(v) for v in versions]
 
 
 @router.post("/documents/{document_id}/versions", response_model=DocumentVersionOut, status_code=201)
@@ -197,15 +220,120 @@ async def publish_version(
 ):
     doc = await engine.get_document_or_404(db, document_id)
     await _assert_permission(doc.org_id, current_user.id, "manage_documents", db)
-    version = await engine.publish_version(db, document_id, current_user.id, body.model_dump())
+    data = body.model_dump()
+    # Logic Model bullet editing (frontend LogicModelChart's "Edit" mode)
+    # publishes structured_data without a hand-typed `content` — auto-derive
+    # it here via the same flatten used by generation/regeneration, so the
+    # embedding/search/display pipeline (document_library_engine.py) never
+    # sees a null `content` for an edited chart.
+    if doc.library_type == "logic_model" and data.get("structured_data") and not data.get("content"):
+        data["content"] = supporting_docs_engine.flatten_logic_model_to_text(data["structured_data"])
+    version = await engine.publish_version(db, document_id, current_user.id, data)
     await log_action(db, actor_id=current_user.id, action="document.version_published", org_id=doc.org_id,
                       object_type="document", object_id=document_id, detail={"version_number": version.version_number})
-    return DocumentVersionOut(
-        id=version.id, document_id=version.document_id, version_number=version.version_number,
-        content=version.content, file_url=version.file_url, format=version.format,
-        change_note=version.change_note, has_embedding=version.embedding is not None,
-        created_by=version.created_by, created_at=version.created_at,
+    return _to_version_out(version)
+
+
+async def _logic_model_edit_context(document_id: str, current_user: User, db: AsyncSession):
+    """Shared setup for the two Logic Model editing endpoints below: loads
+    the document + its latest version, checks it's actually a Logic Model
+    with structured_data to edit (not a legacy prose version — brief §19),
+    and loads the same proposal/project-knowledge/company-profile context
+    generate_supporting_document used originally, so regeneration prompts
+    stay grounded in the same source material."""
+    doc = await engine.get_document_or_404(db, document_id)
+    await _assert_permission(doc.org_id, current_user.id, "manage_documents", db)
+    if doc.library_type != "logic_model":
+        raise HTTPException(status_code=400, detail="This editing action only applies to Logic Model documents.")
+    if not doc.proposal_id:
+        raise HTTPException(status_code=400, detail="This Logic Model isn't linked to a proposal, so it can't be regenerated.")
+    latest = await engine.get_latest_version(db, doc.id)
+    if not latest or not latest.structured_data:
+        raise HTTPException(status_code=400, detail="This Logic Model has no structured chart data yet — regenerate the whole document first to get one.")
+    proposal = await _get_proposal_or_404(doc.proposal_id, current_user.id, db)
+    project_knowledge = await sow_engine.get_or_create_project_knowledge(db, doc.proposal_id)
+    company_profile = await _load_company_profile(current_user.id, db)
+    return doc, latest, proposal, project_knowledge, company_profile
+
+
+@router.post("/documents/{document_id}/logic-model/regenerate-stage", response_model=DocumentVersionOut, status_code=201)
+async def regenerate_logic_model_stage(
+    document_id: str, body: LogicModelRegenerateStageRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Regenerates one stage of an existing Logic Model chart in place —
+    Development Brief 2026-08-14's "Regenerate Stage" editing action.
+    Publishes the result as a new document version (full version history is
+    preserved, same as any other edit in this library)."""
+    doc, latest, proposal, project_knowledge, company_profile = await _logic_model_edit_context(document_id, current_user, db)
+    # Validate the stage name is real (structural, no AI needed) before
+    # charging — same "cheap checks before spending credits" ordering
+    # generate_supporting_document uses for doc_type.
+    valid_stages = LOGIC_MODEL_STAGE_KEYS.get(latest.framework or "standard", LOGIC_MODEL_STAGE_KEYS["standard"])
+    if body.stage not in valid_stages:
+        raise HTTPException(status_code=400, detail=f"'{body.stage}' is not a stage in the {latest.framework} framework.")
+    try:
+        txn = await catalog_engine.consume(
+            db, doc.org_id, current_user.id, "doc_logic_model_stage_regen",
+            reference={"document_id": document_id, "stage": body.stage},
+        )
+    except InsufficientCreditsError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
+    updated_data = await supporting_docs_engine.regenerate_stage(
+        proposal, project_knowledge, company_profile, latest.structured_data, body.stage,
+        db=db, org_id=doc.org_id, user_id=current_user.id, price_cents_charged=txn.price_cents,
     )
+    new_content = supporting_docs_engine.flatten_logic_model_to_text(updated_data)
+    version = await engine.publish_version(db, doc.id, current_user.id, {
+        "content": new_content, "structured_data": updated_data, "framework": updated_data.get("framework"),
+        "change_note": f"Regenerated the {body.stage} stage",
+    })
+    await log_action(db, actor_id=current_user.id, action="document.version_published", org_id=doc.org_id,
+                      object_type="document", object_id=doc.id, detail={"version_number": version.version_number, "stage_regenerated": body.stage})
+    return _to_version_out(version)
+
+
+@router.post("/documents/{document_id}/logic-model/switch-framework", response_model=DocumentVersionOut, status_code=201)
+async def switch_logic_model_framework(
+    document_id: str, body: LogicModelSwitchFrameworkRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """Switches a Logic Model between the standard/extended frameworks —
+    Inputs/Activities/Outputs are preserved unchanged; only the outcome-
+    stage(s) that differ between frameworks are regenerated (brief §10/§16).
+    Billed once per new outcome-stage (2 for standard, 3 for extended) at
+    the same doc_logic_model_stage_regen price as a single-stage regen,
+    since that's exactly the AI work being done."""
+    doc, latest, proposal, project_knowledge, company_profile = await _logic_model_edit_context(document_id, current_user, db)
+    if body.framework not in LOGIC_MODEL_STAGE_KEYS:
+        raise HTTPException(status_code=400, detail=f"Unknown framework '{body.framework}'.")
+    if body.framework == latest.framework:
+        raise HTTPException(status_code=400, detail=f"This Logic Model is already using the {body.framework} framework.")
+
+    num_new_stages = len([k for k in LOGIC_MODEL_STAGE_KEYS[body.framework] if k not in LOGIC_MODEL_PRESERVED_ON_SWITCH])
+    total_price_cents = 0
+    try:
+        for _ in range(num_new_stages):
+            txn = await catalog_engine.consume(
+                db, doc.org_id, current_user.id, "doc_logic_model_stage_regen",
+                reference={"document_id": document_id, "framework_switch_to": body.framework},
+            )
+            total_price_cents += txn.price_cents
+    except InsufficientCreditsError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
+
+    updated_data = await supporting_docs_engine.switch_framework(
+        proposal, project_knowledge, company_profile, latest.structured_data, body.framework,
+        db=db, org_id=doc.org_id, user_id=current_user.id, price_cents_charged=total_price_cents,
+    )
+    new_content = supporting_docs_engine.flatten_logic_model_to_text(updated_data)
+    version = await engine.publish_version(db, doc.id, current_user.id, {
+        "content": new_content, "structured_data": updated_data, "framework": updated_data.get("framework"),
+        "change_note": f"Switched to the {body.framework} framework",
+    })
+    await log_action(db, actor_id=current_user.id, action="document.version_published", org_id=doc.org_id,
+                      object_type="document", object_id=doc.id, detail={"version_number": version.version_number, "framework_switch": body.framework})
+    return _to_version_out(version)
 
 
 @router.patch("/documents/{document_id}/archive", response_model=DocumentOut)

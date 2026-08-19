@@ -24,7 +24,7 @@ from database import get_db
 from models.db_models import Proposal, ProposalSection, StoredFile, User
 from models.schemas import DocumentFormat, ExportRequest, ExportResponse, StoredFileOut
 from routers.auth import get_current_user
-from engines.document_output import DocumentOutputEngine
+from engines.document_output import DocumentOutputEngine, ExportBlockedError
 
 router  = APIRouter()
 doc_engine = DocumentOutputEngine()
@@ -62,19 +62,31 @@ async def export_proposal(
     # (see its docstring in models/db_models.py). Attributing proposal
     # exports to an org when the proposal is shared is a reasonable future
     # refinement, not required for this phase.
-    export_info = await doc_engine.export(
-        proposal=proposal,
-        sections=sections,
-        fmt=body.format,
-        db=db,
-        created_by=current_user.id,
-        org_id=None,
-        include_scoring=body.include_scoring_summary,
-        include_reviewer=body.include_reviewer_feedback,
-        include_compliance=body.include_compliance_status,
-        generate_figures=body.generate_figures,
-        format_options=body.format_options,
-    )
+    try:
+        export_info = await doc_engine.export(
+            proposal=proposal,
+            sections=sections,
+            fmt=body.format,
+            db=db,
+            created_by=current_user.id,
+            org_id=None,
+            include_scoring=body.include_scoring_summary,
+            include_reviewer=body.include_reviewer_feedback,
+            include_compliance=body.include_compliance_status,
+            generate_figures=body.generate_figures,
+            format_options=body.format_options,
+            require_clean_export=body.require_clean_export,
+            brand_template_key=body.brand_template_key,
+        )
+    except ExportBlockedError as exc:
+        # Phase 5 export QA gate — nothing was generated or uploaded; the
+        # violations are the whole point of the error response, not just a
+        # message, so the frontend can point the user at exactly what to fix.
+        raise HTTPException(status_code=422, detail={
+            "message": "Export blocked — resolve the issues below and try again, "
+                       "or export without require_clean_export for a working draft.",
+            "compliance_report": exc.report.model_dump(mode="json"),
+        })
     await db.commit()
 
     return ExportResponse(
@@ -83,6 +95,7 @@ async def export_proposal(
         download_url=export_info["download_url"],
         file_size_bytes=export_info["file_size"],
         exported_at=export_info["exported_at"],
+        compliance_report=export_info.get("compliance_report"),
     )
 
 

@@ -207,6 +207,48 @@ def add_page_numbers(doc, opts: FormatOptions = None) -> None:
         _field_run(p, "NUMPAGES")
 
 
+def hex_to_rgbcolor(hex_str: str | None):
+    """Convert a "#rrggbb" hex string (Organization.primary_color /
+    DocumentBrandTemplate.primary_color's stored format, CLARIVA-DOCGEN-
+    SPEC-001 Phase 13) to a docx RGBColor. Returns None for any invalid or
+    missing input — no primary_color set, malformed hex, wrong length —
+    never raises. Callers treat None as "don't override the default title
+    color", same degrade-gracefully convention as every other best-effort
+    formatting helper in this module."""
+    from docx.shared import RGBColor
+    if not hex_str:
+        return None
+    s = hex_str.strip().lstrip("#")
+    if len(s) != 6:
+        return None
+    try:
+        r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    except ValueError:
+        return None
+    return RGBColor(r, g, b)
+
+
+def add_brand_footer_text(doc, text: str, opts: FormatOptions = None) -> None:
+    """CLARIVA-DOCGEN-SPEC-001 Phase 13 — an optional co-brand footer line
+    (DocumentBrandTemplate.footer_text), added as one extra paragraph below
+    the "Page X of Y" line add_page_numbers() already wrote into every
+    section's footer. MUST be called AFTER add_page_numbers() so the new
+    paragraph lands below the page-number line rather than above it — see
+    engines/document_output.py::_export_docx()'s call order. No-op for
+    blank/None text, so callers can always call this unconditionally."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    if not text or not text.strip():
+        return
+    pos = opts.page_num_position if opts else "center"
+    align = WD_ALIGN_PARAGRAPH.RIGHT if pos == "right" else WD_ALIGN_PARAGRAPH.CENTER
+    font = opts.font if opts else FEDERAL_FONT
+    for section in doc.sections:
+        footer = section.footer
+        p = footer.add_paragraph()
+        p.alignment = align
+        _make_run(p, text.strip(), pt=8, font=font)
+
+
 def add_figure_placeholder(doc, caption: str, fig_num: int | str = 1) -> None:
     """
     Insert a styled figure placeholder box (dashed blue border, light blue fill)
@@ -313,13 +355,18 @@ def add_gantt_table(doc, full_content: str, title: str = "Project Schedule") -> 
     projects are grouped into quarters (Q1, Q2, …).
 
     Falls back to a figure placeholder if no phase data is found.
-    """
-    import math
-    from docx.shared import Pt, Inches, RGBColor
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
 
+    This regex-over-prose extraction is the legacy path (render_content()'s
+    [GANTT: title] marker, itself driven by proposal_generator.py's prompt
+    instruction to write phases as the literal string "Phase Name (Months
+    X-Y)"). It is fragile by construction — any deviation in the AI's
+    output (a different dash character, wrapped text, "Q1" instead of
+    "Months") makes the regex match nothing and silently falls back to a
+    placeholder box. See ScheduleBlock (models/schemas.py, Universal
+    Document Block Schema) and render_schedule_table() below for the
+    structured-JSON replacement (CLARIVA-DOCGEN-SPEC-001 Phase 2/3) that
+    fixes this by never re-deriving phase data from a string pattern.
+    """
     # ── Parse phases ─────────────────────────────────────────────────────
     pattern = re.compile(
         r'(?P<name>[A-Za-z][^\n(]{4,70}?)'
@@ -339,6 +386,26 @@ def add_gantt_table(doc, full_content: str, title: str = "Project Schedule") -> 
     if not phases:
         add_figure_placeholder(doc, f"{title} — Gantt Chart (auto-generated from milestone text)", "G")
         return
+
+    render_schedule_table(doc, phases, title)
+
+
+def render_schedule_table(doc, phases: List[Tuple[str, int, int]], title: str = "Project Schedule") -> None:
+    """
+    Render a colour-coded Gantt table from already-known-good (name,
+    start_month, end_month) tuples — no parsing, no regex, no fallback
+    needed because the caller (render_schedule_block() in
+    utils/block_renderer.py, consuming a validated ScheduleBlock) already
+    guarantees well-formed data via Pydantic. This is the actual table-
+    building logic add_gantt_table() above extracts phases for via regex;
+    kept here as the single implementation both paths share so the visual
+    output never drifts between the legacy and structured pipelines.
+    """
+    import math
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
 
     total = max(e for _, _, e in phases)
     use_quarters = total > 12

@@ -56,6 +56,14 @@ _log = logging.getLogger(__name__)
 
 DEFAULT_STARTING_BALANCE = 100.0   # free allotment for a newly created org
 GENERATION_COST = 1.0              # credits per AI proposal-section generation call
+# Phase 6 (CLARIVA-DOCGEN-SPEC-001) — future-tense validator. A read+flag pass
+# over already-generated content, not a full regeneration, so it's priced well
+# below GENERATION_COST — same "lighter call, lighter price" reasoning as the
+# Logic Model Chart feature's stage-regen pricing, just via the flat
+# debit_or_402 pattern (like GENERATION_COST itself) rather than a full
+# service-catalog entry, since there's no subscriber/payg differentiation
+# needed for a utility QA check.
+VALIDATION_COST = 0.25
 LOW_BALANCE_WARNING_PCT = 0.20     # fire credits.balance_low when remaining/reference drops to this
 
 

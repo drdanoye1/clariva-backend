@@ -34,19 +34,60 @@ Design notes (same discipline as engines/scope_of_work_engine.py):
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import openai
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from engines import usage_tracking
 from engines.usage_tracking import usage_from_response
+from models.schemas import (
+    LOGIC_MODEL_PRESERVED_ON_SWITCH, LOGIC_MODEL_STAGE_KEYS, LOGIC_MODEL_STAGE_LABELS,
+    LogicModelExtendedData, LogicModelStandardData,
+)
 
 _log = logging.getLogger(__name__)
+
+
+def _parse_json_response(raw: str) -> Dict[str, Any]:
+    """Strip markdown fences and parse JSON, with a brace-scan fallback —
+    local copy per this codebase's convention (see the near-identical
+    helper in engines/scope_of_work_engine.py, which itself mirrors
+    routers/budget.py::extract_budget_from_file's parsing)."""
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start, end = cleaned.find("{"), cleaned.rfind("}") + 1
+        try:
+            return json.loads(cleaned[start:end])
+        except Exception:
+            raise HTTPException(status_code=500, detail="Could not parse the AI-generated Logic Model. Please try again.")
+
+
+# Logic Model Chart Generator (Development Brief 2026-08-14) — Section 5's
+# terminology/qualifier table, dynamically injected into the generation
+# prompt per stage per Section 14 ("The prompt should dynamically inject
+# the selected framework and its stage definitions"). Keys match
+# LOGIC_MODEL_STAGE_KEYS's stage identifiers exactly.
+_LOGIC_MODEL_STAGE_QUALIFIERS: Dict[str, str] = {
+    "inputs": "Resources, assets, capabilities, funding, people, facilities, partners, data, technology, and other enablers available to the project.",
+    "activities": "Actions, interventions, research, services, implementation tasks, training, development, or other work performed using the inputs.",
+    "outputs": "Direct, immediate, preferably measurable products, services, deliverables, events, prototypes, publications, datasets, or completed work — NOT changes or results, just what gets produced.",
+    "outcomes": "Meaningful short- to medium-term changes in knowledge, capability, behavior, performance, adoption, conditions, or results attributable to the outputs — NOT the products themselves.",
+    "impact": "End-state strategic, scientific, economic, societal, environmental, health, institutional, or system-level transformation the program ultimately seeks to create.",
+    "shortTermOutcomes": "Early changes in awareness, knowledge, skills, access, readiness, capability, engagement, or initial performance — what changes first.",
+    "intermediateOutcomes": "Subsequent changes in behavior, practice, adoption, institutional capability, technology performance, commercialization, scale, or sustained results — what changes next as early outcomes take hold.",
+    "longTermImpact": "End-state strategic, scientific, economic, societal, environmental, health, institutional, or system-level transformation — the enduring difference the program ultimately seeks to create.",
+}
 
 
 SUPPORTING_DOCUMENT_TYPES: Dict[str, Dict[str, str]] = {
@@ -111,14 +152,21 @@ SUPPORTING_DOCUMENT_TYPES: Dict[str, Dict[str, str]] = {
     "logic_model": {
         "label": "Logic Model",
         "category": "Planning",
+        # `focus` below is legacy — kept only so this entry still satisfies
+        # SUPPORTING_DOCUMENT_TYPES' shape (label/category/focus) for any
+        # code path that still reads it generically (e.g. a stray call to
+        # the shared generate() prose method). As of the Logic Model Chart
+        # Generator (Development Brief 2026-08-14), real generation for
+        # this doc_type goes through
+        # SupportingDocumentsEngine.generate_logic_model() below instead —
+        # a structured-JSON, framework-aware path replacing the old
+        # "five short paragraphs" prose instruction this focus text used
+        # to describe (see the brief's §4 for why: paragraphs don't
+        # resemble the conventional Logic Model chart funders expect).
         "focus": (
             "a logic model narrative for this project, walking through the causal chain from "
             "resources to results. Write exactly five short paragraphs, each opening with its stage "
-            "name (Inputs, Activities, Outputs, Outcomes, Impact) so it can later be reformatted into "
-            "a table: Inputs (resources/funding/staff committed), Activities (what will be done), "
-            "Outputs (immediate, countable products of those activities), Outcomes (short/medium-term "
-            "changes for the target population), and Impact (the long-term change the project "
-            "contributes to)."
+            "name (Inputs, Activities, Outputs, Outcomes, Impact)."
         ),
     },
     "me_plan": {
@@ -309,3 +357,298 @@ signature block or letterhead; end with the closing paragraph.
                 price_cents_charged=price_cents_charged, reference={"doc_type": doc_type},
             )
         return content
+
+    async def generate_logic_model(
+        self, proposal: Any, project_knowledge: Optional[Any], company_profile: Dict[str, Any],
+        framework: str = "standard",
+        additional_context: Optional[str] = None,
+        db: Optional[AsyncSession] = None, org_id: Optional[str] = None, user_id: Optional[str] = None,
+        price_cents_charged: int = 0,
+    ) -> Dict[str, Any]:
+        """Logic Model Chart Generator (Development Brief 2026-08-14) —
+        replaces the old five-paragraph prose path used for
+        doc_type=="logic_model" with structured, per-stage JSON matching
+        LogicModelStandardData / LogicModelExtendedData (models/schemas.py
+        §6). Returns a validated dict; the router persists it as
+        DocumentVersion.structured_data and derives `content` via
+        flatten_logic_model_to_text() below for the existing embedding/
+        search/display pipeline (brief §18).
+        """
+        if framework not in LOGIC_MODEL_STAGE_KEYS:
+            framework = "standard"
+        stage_keys = LOGIC_MODEL_STAGE_KEYS[framework]
+
+        stage_rules = "\n".join(
+            f'- {LOGIC_MODEL_STAGE_LABELS[key]} ("{key}"): {_LOGIC_MODEL_STAGE_QUALIFIERS[key]}'
+            for key in stage_keys
+        )
+        json_shape = ", ".join(f'"{key}": ["...", "..."]' for key in stage_keys)
+
+        prompt = f"""
+Generate a Logic Model for this project using the {framework.upper()} framework.
+
+Project title: {getattr(proposal, "title", "")}
+Agency / grant type: {getattr(proposal, "agency", "")} / {getattr(proposal, "grant_type", "")}
+Research focus: {getattr(proposal, "research_focus", "") or "Not yet specified"}
+Innovation description: {getattr(proposal, "innovation_description", "") or "Not yet specified"}
+Objectives: {getattr(project_knowledge, "objectives", None) or "Not yet specified"}
+Need statement: {getattr(project_knowledge, "need_statement", None) or "Not yet specified"}
+{self._profile_block(company_profile)}
+{f"Additional context: {additional_context}" if additional_context else ""}
+
+Stages, in order, and what belongs in each:
+{stage_rules}
+
+Content generation rules (strict):
+- 3-6 bullets per stage.
+- Each bullet is 3-12 words. No narrative paragraphs, no full sentences with a
+  subject and multiple clauses.
+- No repeating the same idea across stages.
+- Do not fabricate numeric targets, dollar amounts, dates, or named individuals
+  that weren't given above — write generally instead.
+- Favor concrete, measurable outputs over vague ones.
+- Each stage should plausibly cause the next: activities should use the
+  inputs, outputs should result from the activities, and so on down the chain.
+- Compress an idea into one shorter bullet rather than splitting it across
+  several bullets.
+
+Respond with ONLY a JSON object shaped exactly like this (no markdown fences,
+no commentary, no extra keys):
+{{"framework": "{framework}", "title": "<short project title for the chart header>", {json_shape}}}
+""".strip()
+
+        model_cls = LogicModelStandardData if framework == "standard" else LogicModelExtendedData
+
+        async def _call():
+            try:
+                response = await self.client.chat.completions.create(
+                    model=settings.OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are an expert grant writer and program evaluator building a structured Logic Model chart. Respond with strict JSON only — no markdown, no commentary, no narrative paragraphs."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.5,
+                    max_tokens=1200,
+                    response_format={"type": "json_object"},
+                )
+            except Exception as exc:
+                raise _ai_error(exc)
+            data = _parse_json_response(response.choices[0].message.content)
+            return data, response
+
+        data, response = await _call()
+        try:
+            validated = model_cls(**data)
+        except ValidationError:
+            # Brief §16: "Attempt one structured regeneration if validation
+            # fails" — never surface malformed JSON to the user.
+            data, response = await _call()
+            try:
+                validated = model_cls(**data)
+            except ValidationError as exc:
+                _log.error("Logic Model generation failed validation twice: %s", exc)
+                raise HTTPException(status_code=500, detail="Could not generate a valid Logic Model. Please try again.")
+
+        if db is not None:
+            prompt_tokens, completion_tokens = usage_from_response(response)
+            await usage_tracking.record_usage(
+                db, org_id=org_id, user_id=user_id, operation="supporting_document:logic_model",
+                model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                price_cents_charged=price_cents_charged, reference={"doc_type": "logic_model", "framework": framework},
+            )
+        return validated.model_dump()
+
+    async def regenerate_stage(
+        self, proposal: Any, project_knowledge: Optional[Any], company_profile: Dict[str, Any],
+        structured_data: Dict[str, Any], stage: str,
+        additional_context: Optional[str] = None,
+        db: Optional[AsyncSession] = None, org_id: Optional[str] = None, user_id: Optional[str] = None,
+        price_cents_charged: int = 0,
+    ) -> Dict[str, Any]:
+        """Regenerates just one stage's bullets in place, leaving every other
+        stage untouched — the brief's editing requirements call for "Regenerate
+        Stage" as a lighter-weight alternative to redrafting the whole chart.
+        Priced far below a full generation (service key
+        doc_logic_model_stage_regen, §20) since only one stage's worth of AI
+        output is produced. Returns the full updated structured_data dict
+        (same framework, same title, only `stage`'s bullets changed)."""
+        framework = structured_data.get("framework", "standard")
+        if framework not in LOGIC_MODEL_STAGE_KEYS:
+            framework = "standard"
+        stage_keys = LOGIC_MODEL_STAGE_KEYS[framework]
+        if stage not in stage_keys:
+            raise HTTPException(status_code=400, detail=f"'{stage}' is not a stage in the {framework} framework.")
+
+        other_stages = "\n".join(
+            f'- {LOGIC_MODEL_STAGE_LABELS[key]}: {"; ".join(structured_data.get(key) or []) or "(empty)"}'
+            for key in stage_keys if key != stage
+        )
+        prompt = f"""
+This project already has a Logic Model ({framework} framework). Regenerate ONLY
+the "{LOGIC_MODEL_STAGE_LABELS[stage]}" stage — every other stage stays exactly
+as it is below, so the new bullets must stay causally consistent with them.
+
+Project title: {getattr(proposal, "title", "")}
+Agency / grant type: {getattr(proposal, "agency", "")} / {getattr(proposal, "grant_type", "")}
+Research focus: {getattr(proposal, "research_focus", "") or "Not yet specified"}
+{self._profile_block(company_profile)}
+{f"Additional context: {additional_context}" if additional_context else ""}
+
+Other stages (do not change these — write "{LOGIC_MODEL_STAGE_LABELS[stage]}" to fit them):
+{other_stages}
+
+What belongs in "{LOGIC_MODEL_STAGE_LABELS[stage]}": {_LOGIC_MODEL_STAGE_QUALIFIERS[stage]}
+
+Content generation rules (strict): 3-6 bullets, each 3-12 words, no narrative
+paragraphs, no repeating ideas already used in the other stages above, no
+fabricated numeric targets, dollar amounts, dates, or names not given above.
+
+Respond with ONLY a JSON object shaped exactly like this (no markdown fences,
+no commentary, no extra keys): {{"{stage}": ["...", "..."]}}
+""".strip()
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert grant writer and program evaluator revising one stage of a structured Logic Model chart. Respond with strict JSON only — no markdown, no commentary."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.6,
+                max_tokens=400,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            raise _ai_error(exc)
+        data = _parse_json_response(response.choices[0].message.content)
+        bullets = data.get(stage)
+        if not isinstance(bullets, list) or not all(isinstance(b, str) for b in bullets):
+            raise HTTPException(status_code=500, detail="Could not regenerate that stage. Please try again.")
+
+        updated = dict(structured_data)
+        updated[stage] = bullets
+
+        if db is not None:
+            prompt_tokens, completion_tokens = usage_from_response(response)
+            await usage_tracking.record_usage(
+                db, org_id=org_id, user_id=user_id, operation="supporting_document:logic_model_stage_regen",
+                model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                price_cents_charged=price_cents_charged, reference={"doc_type": "logic_model", "framework": framework, "stage": stage},
+            )
+        return updated
+
+    async def switch_framework(
+        self, proposal: Any, project_knowledge: Optional[Any], company_profile: Dict[str, Any],
+        structured_data: Dict[str, Any], target_framework: str,
+        additional_context: Optional[str] = None,
+        db: Optional[AsyncSession] = None, org_id: Optional[str] = None, user_id: Optional[str] = None,
+        price_cents_charged: int = 0,
+    ) -> Dict[str, Any]:
+        """Switches a Logic Model between the standard/extended frameworks —
+        Inputs/Activities/Outputs (LOGIC_MODEL_PRESERVED_ON_SWITCH) are kept
+        exactly as-is; only the outcome-stage(s) that differ between the two
+        frameworks are regenerated. Returns a validated structured_data dict
+        for the target framework."""
+        if target_framework not in LOGIC_MODEL_STAGE_KEYS:
+            raise HTTPException(status_code=400, detail=f"Unknown framework '{target_framework}'.")
+        source_framework = structured_data.get("framework", "standard")
+        if target_framework == source_framework:
+            return structured_data
+
+        target_stage_keys = LOGIC_MODEL_STAGE_KEYS[target_framework]
+        new_outcome_stages = [k for k in target_stage_keys if k not in LOGIC_MODEL_PRESERVED_ON_SWITCH]
+
+        preserved_block = "\n".join(
+            f'- {LOGIC_MODEL_STAGE_LABELS[key]}: {"; ".join(structured_data.get(key) or []) or "(empty)"}'
+            for key in LOGIC_MODEL_PRESERVED_ON_SWITCH
+        )
+        stage_rules = "\n".join(
+            f'- {LOGIC_MODEL_STAGE_LABELS[key]} ("{key}"): {_LOGIC_MODEL_STAGE_QUALIFIERS[key]}'
+            for key in new_outcome_stages
+        )
+        json_shape = ", ".join(f'"{key}": ["...", "..."]' for key in new_outcome_stages)
+
+        prompt = f"""
+This project's Logic Model is switching from the {source_framework.upper()} framework
+to the {target_framework.upper()} framework. Inputs, Activities, and Outputs stay
+exactly as they are below — only regenerate the outcome-stage(s) that are new
+to the {target_framework.upper()} framework, staying causally consistent with the
+preserved stages.
+
+Project title: {getattr(proposal, "title", "")}
+{self._profile_block(company_profile)}
+{f"Additional context: {additional_context}" if additional_context else ""}
+
+Preserved stages (do not change these — write the new stage(s) to follow from them):
+{preserved_block}
+
+New outcome-stage(s) to generate, in order, and what belongs in each:
+{stage_rules}
+
+Content generation rules (strict): 3-6 bullets per stage, each 3-12 words, no
+narrative paragraphs, no repeating ideas already used above, no fabricated
+numeric targets, dollar amounts, dates, or names not given above.
+
+Respond with ONLY a JSON object shaped exactly like this (no markdown fences,
+no commentary, no extra keys): {{{json_shape}}}
+""".strip()
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert grant writer and program evaluator restructuring a Logic Model chart between frameworks. Respond with strict JSON only — no markdown, no commentary."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.6,
+                max_tokens=700,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            raise _ai_error(exc)
+        data = _parse_json_response(response.choices[0].message.content)
+
+        new_data: Dict[str, Any] = {"framework": target_framework, "title": structured_data.get("title", "")}
+        for key in LOGIC_MODEL_PRESERVED_ON_SWITCH:
+            new_data[key] = structured_data.get(key) or []
+        for key in new_outcome_stages:
+            bullets = data.get(key)
+            if not isinstance(bullets, list) or not all(isinstance(b, str) for b in bullets):
+                raise HTTPException(status_code=500, detail="Could not switch frameworks. Please try again.")
+            new_data[key] = bullets
+
+        model_cls = LogicModelStandardData if target_framework == "standard" else LogicModelExtendedData
+        try:
+            validated = model_cls(**new_data)
+        except ValidationError as exc:
+            _log.error("Framework switch produced invalid data: %s", exc)
+            raise HTTPException(status_code=500, detail="Could not switch frameworks. Please try again.")
+
+        if db is not None:
+            prompt_tokens, completion_tokens = usage_from_response(response)
+            await usage_tracking.record_usage(
+                db, org_id=org_id, user_id=user_id, operation="supporting_document:logic_model_framework_switch",
+                model=settings.OPENAI_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                price_cents_charged=price_cents_charged, reference={"doc_type": "logic_model", "from": source_framework, "to": target_framework},
+            )
+        return validated.model_dump()
+
+    def flatten_logic_model_to_text(self, structured_data: Dict[str, Any]) -> str:
+        """Derives the flattened `content` field DocumentLibraryEngine's
+        embedding/search/display pipeline expects, from structured_data
+        (brief §18: "content remains the source document_library_engine.py
+        embeds/searches/displays by default"). Plain text, one stage per
+        block, bullets prefixed with a dash so it still reads sensibly
+        outside the chart UI — e.g. in search result snippets or a
+        legacy/no-JS export path.
+        """
+        framework = structured_data.get("framework", "standard")
+        stage_keys = LOGIC_MODEL_STAGE_KEYS.get(framework, LOGIC_MODEL_STAGE_KEYS["standard"])
+        lines = [structured_data.get("title", "").strip(), ""]
+        for key in stage_keys:
+            label = LOGIC_MODEL_STAGE_LABELS.get(key, key)
+            lines.append(f"{label}:")
+            for bullet in (structured_data.get(key) or []):
+                lines.append(f"- {bullet}")
+            lines.append("")
+        return "\n".join(lines).strip()
