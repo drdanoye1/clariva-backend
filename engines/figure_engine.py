@@ -64,6 +64,7 @@ Design notes (same discipline as the other Phase-numbered engines):
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -101,7 +102,13 @@ _DEFAULT_CONCEPT_DISCLOSURE = (
 )
 _IMAGE_GEN_MODEL = "gpt-image-1"
 _IMAGE_GEN_SIZE = "1024x1024"
-_IMAGE_GEN_QUALITY = "high"
+# "medium", not "high" — gpt-image-1's "high" quality routinely takes
+# 30s+ per image, and Heroku's router hard-kills any request past 30s
+# (H12 "Request timeout") regardless of dyno size; that's not
+# configurable from the app side. Figure 2 can request up to two panels
+# generated in the same request/response cycle (see generate_figure_2()'s
+# asyncio.gather below), so headroom matters more than peak quality here.
+_IMAGE_GEN_QUALITY = "medium"
 _VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected", "needs_regeneration"}
 
 
@@ -768,12 +775,25 @@ Respond with a single JSON object only, with these exact keys: view_type, visual
         # §19 Stage 1 — Visual Generation. Best-effort: an image failure
         # still leaves the structured brief above saved (degrade
         # gracefully), same as Figure 1's render/upload try/except.
+        #
+        # 2026-08-20 fix (round 3): with gpt-image-1 working (rounds 1/2
+        # above), a real "perspective_sectional" Figure 2 (2 panels) still
+        # failed — this time with a Heroku H12 "Request timeout" (hard
+        # 30s router cap, not something app code can raise). Generating
+        # Panel A then Panel B sequentially, each a real gpt-image-1 call
+        # after the text-brief chat completion already ran, added up to
+        # more than 30s end to end. Fixed by generating both panels
+        # concurrently via asyncio.gather rather than one after another
+        # — cuts the image-generation portion roughly in half for the
+        # 2-panel case, combined with the quality="medium" change above.
         image_prompt_a = f"Professional engineering visualization, {resolved_visual_style.replace('_', ' ')} style. {panels[0]['description']}"
-        panel_a_bytes = await self._generate_image(image_prompt_a)
-        panel_b_bytes = None
+        image_tasks = [self._generate_image(image_prompt_a)]
         if len(panels) > 1:
             image_prompt_b = f"Professional engineering visualization, {resolved_visual_style.replace('_', ' ')} style. {panels[1]['description']}"
-            panel_b_bytes = await self._generate_image(image_prompt_b)
+            image_tasks.append(self._generate_image(image_prompt_b))
+        image_results = await asyncio.gather(*image_tasks)
+        panel_a_bytes = image_results[0]
+        panel_b_bytes = image_results[1] if len(image_results) > 1 else None
 
         image_generation_succeeded = panel_a_bytes is not None
         figure.generation_metadata = {
