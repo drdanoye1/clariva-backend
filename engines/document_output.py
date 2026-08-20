@@ -159,20 +159,32 @@ class DocumentOutputEngine:
         safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in proposal.title[:40])
         filename = f"{safe_title}_{timestamp}.{fmt}"
 
-        # Pre-generate figures for DOCX/PDF when requested
+        # Pre-generate figures for DOCX/PDF when requested. Two entirely
+        # independent figure sources are merged here: the legacy
+        # marker-scan path (_generate_figures() — regex-matches literal
+        # [FIGURE N: ...] text and calls DALL-E directly) and the Phase
+        # 9-12 AI Figure Generation Engine's human-APPROVED figures
+        # (_fetch_approved_engine_figures() — see that method's docstring
+        # for why this wiring didn't exist until now). Both degrade to
+        # empty dicts on any failure; a figure problem must never break
+        # the rest of the export.
         figures: Dict[str, bytes] = {}
+        engine_figures_by_section: Dict[str, List[Dict[str, Any]]] = {}
         if generate_figures and fmt in ("docx", "pdf"):
             figures = await self._generate_figures(proposal, sections)
+            engine_figures_by_section = await self._fetch_approved_engine_figures(db, proposal.id)
 
         buffer = io.BytesIO()
         if fmt == "txt":
             self._export_txt(buffer, proposal, sections)
         elif fmt == "docx":
             self._export_docx(buffer, proposal, sections, figures=figures, opts=opts,
-                               brand=resolved_brand, logo_bytes=logo_bytes)
+                               brand=resolved_brand, logo_bytes=logo_bytes,
+                               engine_figures_by_section=engine_figures_by_section)
         elif fmt == "pdf":
             await self._export_pdf_via_docx(buffer, proposal, sections, figures=figures, opts=opts,
-                                             brand=resolved_brand, logo_bytes=logo_bytes)
+                                             brand=resolved_brand, logo_bytes=logo_bytes,
+                                             engine_figures_by_section=engine_figures_by_section)
         else:
             raise ValueError(f"Unsupported format: {fmt}")
 
@@ -252,6 +264,65 @@ class DocumentOutputEngine:
 
         return figures
 
+    async def _fetch_approved_engine_figures(
+        self, db: AsyncSession, proposal_id: str,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """The AI Figure Generation Engine (engines/figure_engine.py,
+        Phases 9-12 — Figure 1 functional/process diagrams, Figure 2
+        technical/physical illustrations, cross-figure QA, human
+        annotation/approval) stores its output completely independently
+        of section generation, keyed by (proposal_id, source_section).
+        Nothing in this export pipeline ever consumed that data until
+        now — this is the wiring: pull each section's HUMAN-APPROVED
+        (§22 — "no AI-generated illustration becomes final without user
+        review") figures and download their already-rendered/stored
+        images from R2, so _export_docx() can insert them as real images
+        right after that section's own content. Entirely separate from
+        the legacy marker-scan _generate_figures() above, which only
+        understands literal [FIGURE N: ...] text markers and has no
+        knowledge of this engine's structured figure data.
+
+        Best-effort per figure, same "a figure problem must never break
+        the rest of the export" discipline as _generate_figures(): an
+        approved figure with no stored_file_id (rendering/upload failed
+        at generation time — see figure_engine.py's own "degrade
+        gracefully" note) or whose R2 object can't be downloaded right
+        now is skipped, not fatal."""
+        from sqlalchemy import select as _select
+        from engines.figure_engine import FigureEngine
+        from models.db_models import StoredFile
+
+        by_section = await FigureEngine().get_approved_figures_by_section(db, proposal_id)
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for section_id, figs in by_section.items():
+            items: List[Dict[str, Any]] = []
+            for fig in figs:
+                if not fig.stored_file_id:
+                    continue
+                try:
+                    key_result = await db.execute(
+                        _select(StoredFile.storage_key).where(StoredFile.id == fig.stored_file_id)
+                    )
+                    storage_key = key_result.scalar_one_or_none()
+                    if not storage_key:
+                        continue
+                    image_bytes = await storage.download_bytes(storage_key)
+                except Exception:
+                    _log.warning(
+                        "Could not fetch approved figure %s image for export "
+                        "(proposal %s, section %r) — skipping.",
+                        fig.figure_number, proposal_id, section_id, exc_info=True,
+                    )
+                    continue
+                items.append({
+                    "figure_number": fig.figure_number,
+                    "caption": fig.caption or f"Figure {fig.figure_number}",
+                    "image_bytes": image_bytes,
+                })
+            if items:
+                out[section_id] = items
+        return out
+
     # ── TXT ───────────────────────────────────────────────────────────────────
 
     def _export_txt(self, buffer: io.BytesIO, proposal: Any, sections: List[Any]) -> None:
@@ -292,7 +363,8 @@ class DocumentOutputEngine:
 
     def _export_docx(self, buffer: io.BytesIO, proposal: Any, sections: List[Any],
                      figures: Dict[str, bytes] = {}, opts=None,
-                     brand: Any = None, logo_bytes: Optional[bytes] = None) -> None:
+                     brand: Any = None, logo_bytes: Optional[bytes] = None,
+                     engine_figures_by_section: Dict[str, List[Dict[str, Any]]] = {}) -> None:
         """`brand` is a DocumentBrandTemplateResolvedOut (or None — every
         field below degrades to today's unbranded rendering when it is).
         Phase 13 additions, in document order: an optional logo image
@@ -310,7 +382,7 @@ class DocumentOutputEngine:
             from utils.doc_utils import (
                 apply_federal_margins, add_federal_heading, add_body_para,
                 add_page_numbers, add_brand_footer_text, hex_to_rgbcolor,
-                render_content, _make_run, _para_spacing,
+                render_content, add_figure_image, _make_run, _para_spacing,
                 FEDERAL_FONT, H1_PT,
             )
 
@@ -400,11 +472,32 @@ class DocumentOutputEngine:
             # break someone's proposal export.
             from utils.block_renderer import render_structured_content
 
+            # opts.section_numbering ("Auto section numbering (1. / 1.1 /
+            # 1.1.1)" in the export UI) was previously read into
+            # FormatOptions but never actually consulted anywhere in this
+            # loop — add_federal_heading() has no numbering logic of its
+            # own, and the only place a numbering prefix WAS computed
+            # (doc_utils.py::render_content()'s _num_prefix() closure) only
+            # ever fires for legacy ## markdown sub-headings inside a
+            # section's raw text, never for the top-level section headings
+            # every export actually shows. Since neither the structured
+            # block renderer nor the legacy renderer emits H2/H3
+            # sub-headings for a proposal section (sections are flat at the
+            # document level — see block_renderer.py's block set, which has
+            # no heading block type), sequential top-level numbering
+            # (1., 2., 3., ...) is the correct and complete fix here.
+            section_num = 0
+
             for sec in sections:
                 structured = getattr(sec, "structured_content", None)
                 if not sec.content and not structured:
                     continue
-                add_federal_heading(doc, sec.title, level=1, opts=opts)
+                section_num += 1
+                heading_text = (
+                    f"{section_num}. {sec.title}"
+                    if opts and opts.section_numbering else sec.title
+                )
+                add_federal_heading(doc, heading_text, level=1, opts=opts)
                 rendered = False
                 if structured:
                     try:
@@ -419,6 +512,16 @@ class DocumentOutputEngine:
                         )
                 if not rendered and sec.content:
                     render_content(doc, sec.content, figures=figures, opts=opts)
+
+                # ── Phase 9-12 approved AI figures for this section ─────────
+                # See _fetch_approved_engine_figures()'s docstring — these
+                # are a completely separate source from the `figures` dict
+                # above (which only ever holds legacy marker-scan images),
+                # inserted after the section's own rendered content so a
+                # figure never lands mid-paragraph.
+                section_key = getattr(sec, "section_id", None)
+                for item in engine_figures_by_section.get(section_key, []):
+                    add_figure_image(doc, item["caption"], item["figure_number"], item["image_bytes"])
 
             # ── Page numbers ──────────────────────────────────────────────────
             add_page_numbers(doc, opts=opts)
@@ -438,6 +541,7 @@ class DocumentOutputEngine:
         self, buffer: io.BytesIO, proposal: Any, sections: List[Any],
         figures: Dict[str, bytes] = {}, opts=None,
         brand: Any = None, logo_bytes: Optional[bytes] = None,
+        engine_figures_by_section: Dict[str, List[Dict[str, Any]]] = {},
     ) -> None:
         """Word/PDF Report Generation Development Specification
         (CLARIVA-DOCGEN-SPEC-001), Phase 8 — PDF is now "print the DOCX
@@ -461,7 +565,8 @@ class DocumentOutputEngine:
 
         docx_buffer = io.BytesIO()
         self._export_docx(docx_buffer, proposal, sections, figures=figures, opts=opts,
-                           brand=brand, logo_bytes=logo_bytes)
+                           brand=brand, logo_bytes=logo_bytes,
+                           engine_figures_by_section=engine_figures_by_section)
         docx_bytes = docx_buffer.getvalue()
 
         # _export_docx() itself silently falls back to TXT when python-docx

@@ -37,10 +37,12 @@ from __future__ import annotations
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import storage
 from database import get_db
-from models.db_models import User
+from models.db_models import StoredFile, User
 from models.schemas import (
     Figure1GenerateRequest, Figure2GenerateRequest, FigureAnnotationUpdateRequest,
     FigureApprovalUpdateRequest, ProposalFigureOut, ProposalFigureSetOut,
@@ -56,6 +58,40 @@ from engines.service_catalog_engine import ServiceCatalogEngine
 router = APIRouter()
 engine = FigureEngine()
 catalog_engine = ServiceCatalogEngine()
+
+
+async def _resolve_download_url(db: AsyncSession, figure) -> Optional[str]:
+    """download_url isn't an ORM column (ProposalFigureOut's docstring) —
+    resolve it as a time-limited presigned R2 URL, same convention as
+    StoredFileOut.download_url in routers/documents.py. A plain
+    column-only SELECT for storage_key (not figure.stored_file
+    relationship traversal) avoids any risk of the exact MissingGreenlet
+    class of bug engines/figure_engine.py's own fixes address — see this
+    codebase's session notes on that."""
+    if not figure.stored_file_id:
+        return None
+    result = await db.execute(select(StoredFile.storage_key).where(StoredFile.id == figure.stored_file_id))
+    storage_key = result.scalar_one_or_none()
+    if not storage_key:
+        return None
+    return await storage.get_download_url(storage_key, filename=f"figure_{figure.figure_number}.png")
+
+
+async def _figure_out(db: AsyncSession, figure) -> ProposalFigureOut:
+    out = ProposalFigureOut.model_validate(figure)
+    out.download_url = await _resolve_download_url(db, figure)
+    return out
+
+
+async def _figure_set_out(db: AsyncSession, fset) -> ProposalFigureSetOut:
+    """`fset.figures` must already be eager-loaded (selectinload) by the
+    caller's query — see figure_engine.py's list_figure_sets()/
+    get_figure_set_or_404() — so this zip() never touches the lazy
+    relationship itself, only the already-loaded Python list."""
+    out = ProposalFigureSetOut.model_validate(fset)
+    for fig_out, fig_row in zip(out.figures, fset.figures):
+        fig_out.download_url = await _resolve_download_url(db, fig_row)
+    return out
 
 
 async def _charge(org_id: Optional[str], user_id: str, db: AsyncSession, service_key: str, reference: dict) -> int:
@@ -77,7 +113,8 @@ async def list_figure_sets(
     proposal_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
 ):
     await _get_proposal_or_404(proposal_id, current_user.id, db)
-    return await engine.list_figure_sets(db, proposal_id)
+    fsets = await engine.list_figure_sets(db, proposal_id)
+    return [await _figure_set_out(db, fset) for fset in fsets]
 
 
 @router.get("/{proposal_id}/figures/{figure_set_id}", response_model=ProposalFigureSetOut)
@@ -86,7 +123,8 @@ async def get_figure_set(
     db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
 ):
     await _get_proposal_or_404(proposal_id, current_user.id, db)
-    return await engine.get_figure_set_or_404(db, figure_set_id, proposal_id)
+    fset = await engine.get_figure_set_or_404(db, figure_set_id, proposal_id)
+    return await _figure_set_out(db, fset)
 
 
 @router.post("/{proposal_id}/figures/plan", response_model=ProposalFigureSetOut)
@@ -104,10 +142,11 @@ async def plan_visual_communication(
         org_id, current_user.id, db, "figure_visual_plan",
         reference={"proposal_id": proposal_id, "source_section": body.source_section},
     )
-    return await engine.plan_visual_communication(
+    fset = await engine.plan_visual_communication(
         db, proposal, body.source_section,
         org_id=org_id, user_id=current_user.id, price_cents_charged=price_cents,
     )
+    return await _figure_set_out(db, fset)
 
 
 @router.post("/{proposal_id}/figures/{figure_set_id}/figure-1", response_model=ProposalFigureOut)
@@ -126,12 +165,13 @@ async def generate_figure_1(
         org_id, current_user.id, db, "figure_1_generation",
         reference={"proposal_id": proposal_id, "figure_set_id": figure_set_id},
     )
-    return await engine.generate_figure_1(
+    figure = await engine.generate_figure_1(
         db, figure_set, proposal,
         diagram_family=body.diagram_family, layout=body.layout,
         detail_level=body.detail_level, visual_style=body.visual_style,
         org_id=org_id, user_id=current_user.id, price_cents_charged=price_cents,
     )
+    return await _figure_out(db, figure)
 
 
 @router.post("/{proposal_id}/figures/{figure_set_id}/figure-2", response_model=ProposalFigureOut)
@@ -153,11 +193,12 @@ async def generate_figure_2(
         org_id, current_user.id, db, "figure_2_generation",
         reference={"proposal_id": proposal_id, "figure_set_id": figure_set_id},
     )
-    return await engine.generate_figure_2(
+    figure = await engine.generate_figure_2(
         db, figure_set, proposal, figure_1,
         view_type=body.view_type, visual_style=body.visual_style,
         org_id=org_id, user_id=current_user.id, price_cents_charged=price_cents,
     )
+    return await _figure_out(db, figure)
 
 
 @router.post("/{proposal_id}/figures/{figure_set_id}/qa", response_model=List[ProposalFigureOut])
@@ -179,10 +220,11 @@ async def run_cross_figure_qa(
         org_id, current_user.id, db, "figure_qa_check",
         reference={"proposal_id": proposal_id, "figure_set_id": figure_set_id},
     )
-    return await engine.run_cross_figure_qa(
+    updated_figures = await engine.run_cross_figure_qa(
         db, figure_set, proposal, figure_1,
         org_id=org_id, user_id=current_user.id, price_cents_charged=price_cents,
     )
+    return [await _figure_out(db, f) for f in updated_figures]
 
 
 @router.patch("/{proposal_id}/figures/{figure_set_id}/figures/{figure_number}/annotations", response_model=ProposalFigureOut)
@@ -206,11 +248,12 @@ async def update_figure_annotations(
     # the "confirmed" fallback — discarding the caller's actual choice.
     # mode="json" serializes the enum to its plain string value instead.
     callouts = [c.model_dump(mode="json") for c in body.callouts] if body.callouts is not None else None
-    return await engine.update_annotations(
+    updated = await engine.update_annotations(
         db, figure,
         caption=body.caption, alt_text=body.alt_text,
         concept_disclosure=body.concept_disclosure, callouts=callouts,
     )
+    return await _figure_out(db, updated)
 
 
 @router.post("/{proposal_id}/figures/{figure_set_id}/figures/{figure_number}/approval", response_model=ProposalFigureOut)
@@ -225,4 +268,5 @@ async def update_figure_approval(
     await _get_proposal_or_404(proposal_id, current_user.id, db)
     await engine.get_figure_set_or_404(db, figure_set_id, proposal_id)
     figure = await engine.get_figure_or_404(db, figure_set_id, figure_number)
-    return await engine.set_approval_status(db, figure, body.status.value)
+    updated = await engine.set_approval_status(db, figure, body.status.value)
+    return await _figure_out(db, updated)

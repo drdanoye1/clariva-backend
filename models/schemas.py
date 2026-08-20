@@ -304,6 +304,16 @@ class SectionGenerateRequest(BaseModel):
     section_id: str
     additional_context: Optional[str] = None
     regenerate: bool = False
+    # User-facing "target words/pages" control on the Regenerate button —
+    # engines/proposal_generator.py::generate_section() has always accepted
+    # target_words, but nothing on this request ever passed it through
+    # until now. 0/None means "use this section's normal default length"
+    # (engine's own WORD_TARGETS lookup), never a request to generate zero
+    # words. Loosely bounded (not tightly validated against agency page
+    # limits here) since a user may deliberately want a short draft to
+    # iterate on; the compliance engine still flags anything that ends up
+    # over an agency's real page limit independently of this field.
+    target_words: Optional[int] = Field(default=None, ge=50, le=5000)
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
@@ -1467,6 +1477,12 @@ class ProposalFigureOut(BaseModel):
     qa_report: Optional[Dict[str, Any]] = None
     generation_metadata: Optional[Dict[str, Any]] = None
     stored_file_id: Optional[str] = None
+    # Not an ORM column — resolved and set explicitly by routers/figures.py
+    # (a time-limited presigned R2 URL, same "resolve on demand, never
+    # persist a URL" convention as StoredFileOut.download_url in
+    # routers/documents.py). from_attributes=True's model_validate(row)
+    # leaves this None; callers must set it afterward.
+    download_url: Optional[str] = None
 
     created_at: datetime
     updated_at: Optional[datetime] = None

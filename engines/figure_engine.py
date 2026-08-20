@@ -277,9 +277,21 @@ class FigureEngine:
         self, db: AsyncSession, proposal_id: str, source_section: str, user_id: Optional[str] = None,
     ) -> ProposalFigureSet:
         """One figureSet per (proposal, source_section) — spec §23's own
-        example id ("technical_approach_visual_set") is section-scoped."""
+        example id ("technical_approach_visual_set") is section-scoped.
+        Eager-loads `figures` on the existing-row branch (same
+        MissingGreenlet reasoning as list_figure_sets()/get_figure_set_
+        or_404() above) — callers (e.g. plan_visual_communication(),
+        whose result flows straight back out through
+        response_model=ProposalFigureSetOut) must never receive an
+        object whose `figures` collection isn't already loaded. The
+        newly-created branch below needs no such eager-load: a
+        just-constructed ORM object's collection relationships are
+        already tracked as loaded-empty by SQLAlchemy's unit of work,
+        with no SELECT required to read them."""
         result = await db.execute(
-            select(ProposalFigureSet).where(
+            select(ProposalFigureSet)
+            .options(selectinload(ProposalFigureSet.figures))
+            .where(
                 ProposalFigureSet.proposal_id == proposal_id,
                 ProposalFigureSet.source_section == source_section,
             )
@@ -311,6 +323,36 @@ class FigureEngine:
             .order_by(ProposalFigureSet.created_at)
         )
         return list(result.scalars().all())
+
+    async def get_approved_figures_by_section(
+        self, db: AsyncSession, proposal_id: str,
+    ) -> Dict[str, List[ProposalFigure]]:
+        """Export-time consumer (engines/document_output.py) — the ONLY
+        approved (human-reviewed, §22) figures for a proposal, grouped by
+        the section they belong to (ProposalFigureSet.source_section,
+        which is ProposalSection.section_id — see get_or_create_figure_
+        set()'s docstring). A figure that's still "pending", "rejected",
+        or "needs_regeneration" is deliberately excluded: §22's governing
+        principle is that no AI-generated illustration becomes part of
+        the final document without a human approving it first, and
+        export is exactly the "becomes part of the final document"
+        moment that principle protects. Figures within a section are
+        ordered by figure_number so Figure 1 always renders before
+        Figure 2."""
+        result = await db.execute(
+            select(ProposalFigureSet)
+            .options(selectinload(ProposalFigureSet.figures))
+            .where(ProposalFigureSet.proposal_id == proposal_id)
+        )
+        by_section: Dict[str, List[ProposalFigure]] = {}
+        for fset in result.scalars().all():
+            approved = sorted(
+                (f for f in fset.figures if f.approval_status == "approved"),
+                key=lambda f: f.figure_number,
+            )
+            if approved:
+                by_section[fset.source_section] = approved
+        return by_section
 
     async def get_figure_set_or_404(self, db: AsyncSession, figure_set_id: str, proposal_id: str) -> ProposalFigureSet:
         # Same MissingGreenlet reasoning as list_figure_sets() above — this

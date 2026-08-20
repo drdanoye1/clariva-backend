@@ -397,6 +397,7 @@ async def generate_section(
         company_profile=company_profile,
         additional_context=body.additional_context,
         agency_override=resolved_profile,
+        target_words=body.target_words or 0,
     )
 
     section.content            = generated["content"]

@@ -109,6 +109,24 @@ async def get_download_url(storage_key: str, filename: Optional[str] = None, exp
     )
 
 
+async def download_bytes(storage_key: str) -> bytes:
+    """Downloads and returns the raw object bytes for a storage key —
+    for callers that need the file's actual content in-process (e.g.
+    embedding an approved AI-generated figure image into a DOCX export
+    being built right now), not just a link to hand the browser. Unlike
+    get_download_url() (the browser fetches directly from R2), this
+    proxies the bytes through this app because the caller needs to
+    compose them into another file before anything is returned to the
+    client. Infrequent, small (single figure PNGs), so the extra hop
+    through this dyno is not the throughput concern it would be for bulk
+    downloads."""
+    client = _get_client()
+    obj = await asyncio.to_thread(
+        client.get_object, Bucket=settings.R2_BUCKET_NAME, Key=storage_key,
+    )
+    return await asyncio.to_thread(obj["Body"].read)
+
+
 async def delete_file(storage_key: str) -> None:
     """For future retention/cleanup jobs (scoping doc Section 3.4/Phase F)
     and user-initiated deletion flows."""
