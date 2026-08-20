@@ -434,7 +434,25 @@ Respond with a single JSON object only, with these exact keys:
             price_cents_charged=price_cents_charged,
             reference={"proposal_id": proposal.id, "figure_set_id": fset.id},
         )
-        return fset
+        # MissingGreenlet fix (same bug class as list_figure_sets()/
+        # get_figure_set_or_404() above): the flush() just above updates
+        # fset.visual_communication_plan and, via the row's onupdate=
+        # func.now(), expires fset.updated_at server-side — and, for a
+        # freshly-INSERTed fset (the get_or_create_figure_set() "new"
+        # branch), can leave `figures` needing a fresh load too. Either
+        # attribute being touched during routers/figures.py's later,
+        # un-awaited ProposalFigureSetOut.model_validate(fset) call raises
+        # MissingGreenlet — there is no active greenlet by then. Re-fetch
+        # with the same eager-load used everywhere else in this file
+        # rather than a bare db.refresh(), which doesn't reload
+        # relationships unless every relationship name is explicitly
+        # listed — this is the one call site guaranteed correct either way.
+        result = await db.execute(
+            select(ProposalFigureSet)
+            .options(selectinload(ProposalFigureSet.figures))
+            .where(ProposalFigureSet.id == fset.id)
+        )
+        return result.scalar_one()
 
     # ── §4-§8, §25 — Figure 1 functional/process diagram ────────────────────
 
@@ -586,6 +604,13 @@ The caption must follow this pattern: "Figure 1. Functional workflow of [subject
             price_cents_charged=price_cents_charged,
             reference={"proposal_id": proposal.id, "figure_set_id": figure_set.id, "figure_id": figure.id},
         )
+        # Same MissingGreenlet fix as update_annotations()/set_approval_
+        # status() below: the flush()es above (via ProposalFigure.updated_at's
+        # onupdate=func.now()) leave `figure` with an expired column that
+        # routers/figures.py's later, un-awaited ProposalFigureOut.
+        # model_validate(figure) call would otherwise try to lazy-load
+        # outside any active greenlet.
+        await db.refresh(figure)
         return figure
 
     # ── §9-§16, §19, §25 — Figure 2 technical/physical illustration ────────
@@ -778,6 +803,9 @@ Respond with a single JSON object only, with these exact keys: view_type, visual
             price_cents_charged=price_cents_charged,
             reference={"proposal_id": proposal.id, "figure_set_id": figure_set.id, "figure_id": figure.id},
         )
+        # Same MissingGreenlet fix as generate_figure_1()/update_annotations()
+        # above — see those comments for the full explanation.
+        await db.refresh(figure)
         return figure
 
     # ── §20/§22 — human annotation edits + approval-status state machine ────
@@ -964,4 +992,8 @@ Set figure_2_qa and cross_figure_qa to null if Figure 2 has not been generated y
             price_cents_charged=price_cents_charged,
             reference={"proposal_id": proposal.id, "figure_set_id": figure_set.id},
         )
+        # Same MissingGreenlet fix as generate_figure_1()/generate_figure_2()
+        # above, applied to every figure this call touched (one or two).
+        for f in updated:
+            await db.refresh(f)
         return updated
