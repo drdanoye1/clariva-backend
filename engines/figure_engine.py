@@ -72,6 +72,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import httpx
 import openai
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -619,20 +620,36 @@ The caption must follow this pattern: "Figure 1. Functional workflow of [subject
         """§19 Stage 1 — Visual Generation. Returns PNG bytes, or None on
         any failure (rate limit, content-policy rejection, network error)
         — degrade gracefully, same convention as Figure 1's render/upload
-        try/except. Uses response_format="b64_json" (not the default URL
-        response) so this never needs a second network round-trip to fetch
-        the image, unlike engines/image_gen.py's legacy generate_dalle_image
-        helper — one fewer failure point for a call this codebase already
-        treats as best-effort."""
+        try/except.
+
+        2026-08-20 fix: this used to pass response_format="b64_json" to
+        avoid a second network round-trip to fetch the image. OpenAI's
+        images.generate endpoint started rejecting that parameter outright
+        (`400 Unknown parameter: 'response_format'`) for this account/
+        project even with model="dall-e-3" explicitly set — every single
+        Figure 2 generation was failing this call and silently degrading
+        to "no image" (per the try/except above), which is why Figure 2
+        was consistently showing "No image" despite otherwise succeeding.
+        Fix: stop sending response_format at all and handle whichever
+        shape the API actually returns — b64_json if present, otherwise
+        download the url response — so this keeps working regardless of
+        which response shape this account's image endpoint serves."""
         try:
             response = await self.client.images.generate(
                 model=_IMAGE_GEN_MODEL, prompt=prompt[:4000], size=_IMAGE_GEN_SIZE,
-                quality="standard", n=1, response_format="b64_json",
+                quality="standard", n=1,
             )
-            b64_data = response.data[0].b64_json
-            if not b64_data:
-                return None
-            return base64.b64decode(b64_data)
+            item = response.data[0]
+            b64_data = getattr(item, "b64_json", None)
+            if b64_data:
+                return base64.b64decode(b64_data)
+            image_url = getattr(item, "url", None)
+            if image_url:
+                async with httpx.AsyncClient(timeout=30.0) as http_client:
+                    img_response = await http_client.get(image_url)
+                    img_response.raise_for_status()
+                    return img_response.content
+            return None
         except Exception as exc:
             _log.warning("Figure 2 image generation failed: %s", exc, exc_info=True)
             return None
