@@ -99,8 +99,9 @@ _DEFAULT_CONCEPT_DISCLOSURE = (
     "Conceptual illustration; final configuration will be determined during "
     "design and prototype development."
 )
-_IMAGE_GEN_MODEL = "dall-e-3"
+_IMAGE_GEN_MODEL = "gpt-image-1"
 _IMAGE_GEN_SIZE = "1024x1024"
+_IMAGE_GEN_QUALITY = "high"
 _VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected", "needs_regeneration"}
 
 
@@ -622,22 +623,27 @@ The caption must follow this pattern: "Figure 1. Functional workflow of [subject
         — degrade gracefully, same convention as Figure 1's render/upload
         try/except.
 
-        2026-08-20 fix: this used to pass response_format="b64_json" to
-        avoid a second network round-trip to fetch the image. OpenAI's
-        images.generate endpoint started rejecting that parameter outright
-        (`400 Unknown parameter: 'response_format'`) for this account/
-        project even with model="dall-e-3" explicitly set — every single
-        Figure 2 generation was failing this call and silently degrading
-        to "no image" (per the try/except above), which is why Figure 2
-        was consistently showing "No image" despite otherwise succeeding.
-        Fix: stop sending response_format at all and handle whichever
-        shape the API actually returns — b64_json if present, otherwise
-        download the url response — so this keeps working regardless of
-        which response shape this account's image endpoint serves."""
+        2026-08-20 fix (round 1): this used to pass response_format=
+        "b64_json" to avoid a second network round-trip to fetch the
+        image, and used model="dall-e-3". That failed with `400 Unknown
+        parameter: 'response_format'`. Fixed to stop sending
+        response_format and handle whichever shape the API returns
+        (b64_json if present, otherwise download the url).
+
+        2026-08-20 fix (round 2): with response_format removed, the very
+        next real generation attempt failed differently — `400 The model
+        'dall-e-3' does not exist.` This account's OpenAI project no
+        longer has dall-e-3 access at all; its available image model is
+        gpt-image-1, which also explains round 1's error (gpt-image-1
+        doesn't accept response_format and always returns b64_json
+        directly — the two failures were the same root cause surfacing in
+        two steps). Switched _IMAGE_GEN_MODEL to "gpt-image-1" and
+        quality to gpt-image-1's own scale ("low"/"medium"/"high"/"auto"
+        — dall-e-3's "standard"/"hd" values are invalid for this model)."""
         try:
             response = await self.client.images.generate(
                 model=_IMAGE_GEN_MODEL, prompt=prompt[:4000], size=_IMAGE_GEN_SIZE,
-                quality="standard", n=1,
+                quality=_IMAGE_GEN_QUALITY, n=1,
             )
             item = response.data[0]
             b64_data = getattr(item, "b64_json", None)
